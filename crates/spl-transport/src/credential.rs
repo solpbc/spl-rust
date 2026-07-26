@@ -29,16 +29,6 @@ impl From<&Endpoint> for EndpointAddr {
     }
 }
 
-impl EndpointAddr {
-    /// Convert this serializable address to the pure wire endpoint type.
-    pub fn to_endpoint(&self) -> Endpoint {
-        Endpoint {
-            host: self.host.clone(),
-            port: self.port,
-        }
-    }
-}
-
 /// Signed pairing identity and the addresses used to reach its journal.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Credential {
@@ -127,41 +117,35 @@ mod tests {
 
     #[test]
     fn generated_csr_carries_matching_public_key_spki_der() {
-        let generated = generate_csr("Desktop").unwrap();
-        let key = KeyPair::from_pem(&generated.key_pem).unwrap();
-
-        assert_eq!(
-            key.public_key_der(),
-            generated.public_key_spki_der.as_slice()
-        );
+        let g = generate_csr("solstone-windows-test").unwrap();
+        assert!(g.csr_pem.contains("BEGIN CERTIFICATE REQUEST"));
+        assert!(g.key_pem.contains("BEGIN PRIVATE KEY"));
+        let key = KeyPair::from_pem(&g.key_pem).unwrap();
+        assert_eq!(g.public_key_spki_der, key.public_key_der());
     }
 
     #[test]
     fn local_endpoints_helper_maps_valid_entries_and_skips_invalid() {
         let value = serde_json::json!([
-            {"ip": "10.0.0.5", "port": 7657, "scope": "lan"},
-            {"ip": "fd00::5", "port": 7658},
-            {"ip": "missing-port"},
-            {"port": 7657},
-            {"ip": "zero", "port": 0},
-            {"ip": "too-large", "port": 65536},
-            "not-an-object"
+            {"ip": "10.0.0.2", "port": 7657, "scope": "lan"},
+            {"ip": "10.0.0.3", "port": 0, "scope": "lan"},
+            {"ip": "10.0.0.4", "port": 70000, "scope": "lan"},
+            {"ip": 42, "port": 7657},
+            {"host": "10.0.0.5", "port": 7657},
+            "bad"
         ]);
-
         assert_eq!(
             endpoint_addrs_from_local_endpoints(Some(&value)),
-            vec![
-                EndpointAddr {
-                    host: "10.0.0.5".into(),
-                    port: 7657,
-                },
-                EndpointAddr {
-                    host: "fd00::5".into(),
-                    port: 7658,
-                },
-            ]
+            vec![EndpointAddr {
+                host: "10.0.0.2".into(),
+                port: 7657
+            }]
         );
         assert!(endpoint_addrs_from_local_endpoints(None).is_empty());
+        assert!(
+            endpoint_addrs_from_local_endpoints(Some(&serde_json::json!({"ip": "10.0.0.2"})))
+                .is_empty()
+        );
     }
 
     fn credential() -> Credential {

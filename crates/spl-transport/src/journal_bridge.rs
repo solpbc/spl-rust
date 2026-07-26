@@ -78,7 +78,7 @@ impl JournalBridgeHandle {
         self.contacted.load(Ordering::Relaxed)
     }
 
-    /// Return the one-use bootstrap URL carrying the local capability.
+    /// Return the bootstrap URL carrying the capability compared on every request.
     pub fn bootstrap_url(&self) -> String {
         format!(
             "http://127.0.0.1:{}{}?cap={}",
@@ -121,7 +121,7 @@ pub async fn start(config: JournalBridgeConfig) -> Result<JournalBridgeHandle, B
     } = config;
     let mut journal_hosts = Vec::with_capacity(endpoint_hosts.len() + 1);
     // No `spl.local` occurrence exists in the vendored `.proto-ref/` mirror;
-    // preserve the source's conventional transport host inline for this lift.
+    // it remains the conventional hostname for transport redirect rewriting.
     journal_hosts.push("spl.local".to_string());
     journal_hosts.extend(endpoint_hosts);
     let carrier = Arc::new(MuxCarrier::new(opener));

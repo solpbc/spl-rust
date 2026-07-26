@@ -25,7 +25,7 @@ use crate::TransportError;
 
 /// The fixed TLS server name. Hostname is not validated (CA-fp pin is the trust
 /// anchor); this is a stable placeholder so SNI/name handling is deterministic.
-pub const PINNED_SERVER_NAME: &str = "spl.local";
+pub(crate) const PINNED_SERVER_NAME: &str = "spl.local";
 
 /// A rustls verifier that pins the journal CA fingerprint prefix and still
 /// verifies the handshake signature against the presented leaf.
@@ -178,7 +178,7 @@ pub fn pairing_config(ca_fp_prefix: &[u8]) -> Result<ClientConfig, TransportErro
 /// # Errors
 ///
 /// Returns a TLS configuration error when rustls rejects the provider setup.
-pub fn trust_all_pairing_config() -> Result<ClientConfig, TransportError> {
+pub(crate) fn trust_all_pairing_config() -> Result<ClientConfig, TransportError> {
     let provider = provider();
     let verifier = Arc::new(TrustAllPairingVerifier {
         provider: provider.clone(),
@@ -199,7 +199,7 @@ pub fn trust_all_pairing_config() -> Result<ClientConfig, TransportError> {
 ///
 /// Returns a TLS configuration error when the provider, certificate chain, or
 /// private key is invalid.
-pub fn mtls_config(
+pub(crate) fn mtls_config(
     ca_fp_prefix: &[u8],
     client_cert_chain: Vec<CertificateDer<'static>>,
     client_key: PrivateKeyDer<'static>,
@@ -236,7 +236,7 @@ pub fn parse_certs(pem: &str) -> Result<Vec<CertificateDer<'static>>, TransportE
 /// # Errors
 ///
 /// Returns a TLS error when the private-key PEM is invalid.
-pub fn parse_private_key(pem: &str) -> Result<PrivateKeyDer<'static>, TransportError> {
+pub(crate) fn parse_private_key(pem: &str) -> Result<PrivateKeyDer<'static>, TransportError> {
     PrivateKeyDer::from_pem_slice(pem.as_bytes())
         .map_err(|e| TransportError::Tls(format!("bad private key PEM: {e}")))
 }
@@ -250,6 +250,6 @@ pub fn parse_private_key(pem: &str) -> Result<PrivateKeyDer<'static>, TransportE
     clippy::expect_used,
     reason = "the compile-time spl.local constant is a valid DNS name by construction"
 )]
-pub fn pinned_server_name() -> ServerName<'static> {
+pub(crate) fn pinned_server_name() -> ServerName<'static> {
     ServerName::try_from(PINNED_SERVER_NAME).expect("spl.local is a valid DNS name")
 }

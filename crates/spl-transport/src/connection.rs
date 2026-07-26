@@ -32,13 +32,13 @@ use crate::tls::pinned_server_name;
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// Upper bound on outbound writes. A stalled write means the peer is dead or no
-/// longer draining; fail fast and let the coordinator's backoff retry.
+/// longer draining; fail fast and leave retry policy to the caller.
 const WRITE_TIMEOUT: Duration = Duration::from_secs(30);
 /// Upper bound on a single inbound read while uploading/awaiting the response.
 /// The journal returns upload credit as it consumes request DATA, and this client
 /// returns response credit as it decodes DATA; a 60 s stall is therefore a dead
-/// or wedged peer, not flow-control back-pressure. Fail fast and let the
-/// coordinator's backoff retry.
+/// or wedged peer, not flow-control back-pressure. Fail fast and leave retry
+/// policy to the caller.
 #[expect(
     clippy::duration_suboptimal_units,
     reason = "the copied transport timeout remains expressed in protocol-facing seconds"

@@ -167,7 +167,7 @@ pub enum TransportError {
     Rejected {
         /// HTTP response status.
         status: u16,
-        /// Response summary retained for presentation, never logging.
+        /// Response detail retained for presentation; it may contain raw peer text and must never be logged.
         body: String,
     },
     /// Relay data-plane failure.
@@ -188,6 +188,8 @@ pub enum TransportError {
     #[error("not paired")]
     NotPaired,
     /// Local offset lookup failed.
+    ///
+    /// Consumers construct this variant; it is not raised inside this crate.
     #[error("local offset lookup failed")]
     LocalOffset,
 }

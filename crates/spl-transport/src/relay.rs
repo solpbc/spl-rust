@@ -37,8 +37,8 @@ use crate::connection::run_request_over_stream;
 use crate::tls::pinned_server_name;
 use crate::{RelayError, TransportError};
 
-/// Inner mTLS progress bound for AC6. This is not a presence-hold wait; a live
-/// relay path should produce the journal's TLS response well before this.
+/// Inner mTLS progress bound. This is not a presence-hold wait; a live relay
+/// path should produce the journal's TLS response well before this.
 pub(crate) const RELAY_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
 /// Outer relay dial bound. This mirrors the direct TCP connect hygiene and is
 /// separate from the typed inner-handshake stalled outcome.
@@ -369,7 +369,7 @@ fn build_pair_dial_request(url: &str, rk_hex: &str) -> Result<Request, Transport
 ///
 /// Returns a typed pair-window rejection or a TLS, URL, timeout, or WebSocket
 /// error.
-pub async fn dial_pair_relay_ws(
+pub(crate) async fn dial_pair_relay_ws(
     url: &str,
     rk_hex: &str,
     outer: Arc<ClientConfig>,
@@ -421,7 +421,7 @@ pub async fn request_once_over_ws(
 /// # Errors
 ///
 /// Returns an inner TLS, mux, HTTP, timeout, or typed relay error.
-pub async fn request_once_over_ws_with_peer_leaf(
+pub(crate) async fn request_once_over_ws_with_peer_leaf(
     ws: WebSocketStream<MaybeTlsStream<TcpStream>>,
     inner_config: Arc<ClientConfig>,
     handshake_timeout: Duration,

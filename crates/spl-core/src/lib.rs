@@ -63,3 +63,39 @@ pub const DEFAULT_DIRECT_PORT: u16 = 7657;
 ///
 /// Protocol: [`.proto-ref/pairing.md`, “mobile posts the CSR to the pair URL”](../../../.proto-ref/pairing.md#5-mobile-posts-the-csr-to-the-pair-url).
 pub const PAIR_PATH: &str = "/app/network/pair";
+
+/// Request body for nonce-authorized direct or relay pairing.
+///
+/// Protocol: [`.proto-ref/pairing.md`, §5 “mobile posts the CSR to the pair URL”](../../../.proto-ref/pairing.md#5-mobile-posts-the-csr-to-the-pair-url).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct PairRequest {
+    /// PEM-encoded certificate-signing request for the generated device key.
+    pub csr: String,
+    /// Human-facing label to place in the signed device certificate.
+    pub device_label: String,
+}
+
+/// Successful response from the pairing request.
+///
+/// Protocol: [`.proto-ref/pairing.md`, §7 “home returns cert + chain + home attestation”](../../../.proto-ref/pairing.md#7-home-returns-cert--chain--home-attestation).
+/// The §7 example body omits `fingerprint` and `local_endpoints`, while the client
+/// requires the former to verify that the returned certificate matches the response.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct PairResponse {
+    /// PEM-encoded device certificate signed from the submitted CSR.
+    pub client_cert: String,
+    /// PEM-encoded CA certificate chain trusted for subsequent sessions.
+    pub ca_chain: Vec<String>,
+    /// Stable identifier of the paired home instance.
+    pub instance_id: String,
+    /// Human-facing label of the paired home.
+    pub home_label: String,
+    /// Required `sha256:<hex>` fingerprint of the returned device certificate.
+    pub fingerprint: String,
+    /// Short-lived home attestation used for relay enrollment, when supplied.
+    #[serde(default)]
+    pub home_attestation: Option<String>,
+    /// Journal-advertised LAN endpoints, retained in their extensible JSON shape.
+    #[serde(default)]
+    pub local_endpoints: Option<serde_json::Value>,
+}

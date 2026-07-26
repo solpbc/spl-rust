@@ -43,11 +43,19 @@ pub fn decode_unverified_claims(token: &str) -> Option<JwtClaims> {
 
 /// Whether the current time is past four-fifths of a positive token lifetime.
 pub fn should_refresh(claims: &JwtClaims, now_secs: i64) -> bool {
-    let ttl = claims.exp - claims.iat;
+    let Some(ttl) = claims.exp.checked_sub(claims.iat) else {
+        return false;
+    };
     if ttl <= 0 {
         return false;
     }
-    now_secs > claims.iat + ttl * 4 / 5
+    let Some(scaled_ttl) = ttl.checked_mul(4) else {
+        return false;
+    };
+    let Some(refresh_at) = claims.iat.checked_add(scaled_ttl / 5) else {
+        return false;
+    };
+    now_secs > refresh_at
 }
 
 #[cfg(test)]
@@ -108,5 +116,35 @@ mod tests {
     fn non_positive_ttl_does_not_refresh() {
         assert!(!should_refresh(&JwtClaims { iat: 200, exp: 200 }, 300));
         assert!(!should_refresh(&JwtClaims { iat: 201, exp: 200 }, 300));
+    }
+
+    #[test]
+    fn extreme_and_degenerate_claims_are_total() {
+        let cases = [
+            (
+                JwtClaims {
+                    iat: i64::MIN,
+                    exp: i64::MAX,
+                },
+                0,
+                false,
+            ),
+            (
+                JwtClaims {
+                    iat: 0,
+                    exp: i64::MAX,
+                },
+                0,
+                false,
+            ),
+            (JwtClaims { iat: 200, exp: 100 }, 150, false),
+            (JwtClaims { iat: 100, exp: 100 }, 100, false),
+            (JwtClaims { iat: 100, exp: 200 }, i64::MIN, false),
+            (JwtClaims { iat: 100, exp: 200 }, i64::MAX, true),
+        ];
+
+        for (claims, now_secs, expected) in cases {
+            assert_eq!(should_refresh(&claims, now_secs), expected);
+        }
     }
 }

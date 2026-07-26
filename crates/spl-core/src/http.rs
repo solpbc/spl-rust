@@ -353,11 +353,17 @@ pub fn dechunk(raw: &[u8]) -> Result<Vec<u8>, HttpError> {
         if size == 0 {
             return Ok(out);
         }
-        if index + size > raw.len() {
+        let Some(data_end) = index.checked_add(size) else {
+            return Err(HttpError::BadChunkedBody("truncated chunk".into()));
+        };
+        if data_end > raw.len() {
             return Err(HttpError::BadChunkedBody("truncated chunk".into()));
         }
-        out.extend_from_slice(&raw[index..index + size]);
-        index += size + 2; // skip the chunk data + trailing CRLF
+        if raw.len() - data_end < 2 || &raw[data_end..data_end + 2] != b"\r\n" {
+            return Err(HttpError::BadChunkedBody("missing chunk terminator".into()));
+        }
+        out.extend_from_slice(&raw[index..data_end]);
+        index = data_end + 2;
     }
     Err(HttpError::BadChunkedBody("missing terminal chunk".into()))
 }
@@ -426,6 +432,16 @@ mod tests {
             parse_response(raw).unwrap_err(),
             HttpError::BadChunkedBody("missing terminal chunk".into())
         );
+    }
+
+    #[test]
+    fn dechunk_rejects_missing_or_invalid_chunk_terminator() {
+        for raw in [&b"4\r\nWikiXX0\r\n\r\n"[..], &b"4\r\nWiki"[..]] {
+            assert_eq!(
+                dechunk(raw).unwrap_err(),
+                HttpError::BadChunkedBody("missing chunk terminator".into())
+            );
+        }
     }
 
     #[test]

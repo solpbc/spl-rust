@@ -31,3 +31,35 @@
 //! the consuming product, not here.
 
 #![forbid(unsafe_code)]
+#![cfg_attr(
+    test,
+    expect(
+        clippy::byte_char_slices,
+        clippy::format_push_string,
+        clippy::needless_pass_by_value,
+        clippy::panic,
+        clippy::similar_names,
+        clippy::unreadable_literal,
+        clippy::unwrap_used,
+        reason = "copied wire tests favor direct fixtures and assertions over production error handling"
+    )
+)]
+
+pub mod bridge;
+pub mod ca;
+pub mod crockford;
+pub mod frame;
+pub mod http;
+pub mod jwt;
+pub mod mux;
+pub mod pairlink;
+pub mod relay;
+pub mod relay_window;
+
+/// Default TCP port for direct-network pairing endpoints.
+pub const DEFAULT_DIRECT_PORT: u16 = 7657;
+
+/// HTTP path for the nonce-authorized direct pairing request.
+///
+/// Protocol: [`.proto-ref/pairing.md`, “mobile posts the CSR to the pair URL”](../../../.proto-ref/pairing.md#5-mobile-posts-the-csr-to-the-pair-url).
+pub const PAIR_PATH: &str = "/app/network/pair";

@@ -1,0 +1,1628 @@
+{
+  "spdx_license_identifier": "AGPL-3.0-only",
+  "schema_version": 1,
+  "protocol_revision": "92b54d057d445d60b06b0fbe6f0c6b14120148ff",
+  "vectors": [
+    {
+      "id": "direct.admission.rfc1918-10.below",
+      "evidence": "regression",
+      "citations": [
+        {
+          "document": ".proto-ref/pairing.md",
+          "clause": "Verifies every candidate address is in the explicit direct-pair allow-list"
+        }
+      ],
+      "operation": "parse_pair_link",
+      "input": {
+        "encoding": "blob_hex",
+        "value": "040109ffffff1b9ea1b2c3d4e5f607181122334455667788deadbeefcafebabe0123456789abcdef"
+      },
+      "expected": {
+        "result": "error",
+        "error": {
+          "kind": "disallowed_direct_ipv4",
+          "address": "9.255.255.255"
+        }
+      }
+    },
+    {
+      "id": "direct.admission.rfc1918-10.lower",
+      "evidence": "regression",
+      "citations": [
+        {
+          "document": ".proto-ref/pairing.md",
+          "clause": "Verifies every candidate address is in the explicit direct-pair allow-list"
+        }
+      ],
+      "operation": "parse_pair_link",
+      "input": {
+        "encoding": "blob_hex",
+        "value": "04010a0000001b9ea1b2c3d4e5f607181122334455667788deadbeefcafebabe0123456789abcdef"
+      },
+      "expected": {
+        "result": "direct",
+        "candidates": [
+          {
+            "host": "10.0.0.0",
+            "port": 7070
+          }
+        ],
+        "nonce_hex": "a1b2c3d4e5f607181122334455667788",
+        "ca_fp_hex": "deadbeefcafebabe0123456789abcdef"
+      }
+    },
+    {
+      "id": "direct.admission.rfc1918-10.upper",
+      "evidence": "regression",
+      "citations": [
+        {
+          "document": ".proto-ref/pairing.md",
+          "clause": "Verifies every candidate address is in the explicit direct-pair allow-list"
+        }
+      ],
+      "operation": "parse_pair_link",
+      "input": {
+        "encoding": "blob_hex",
+        "value": "04010affffff1b9ea1b2c3d4e5f607181122334455667788deadbeefcafebabe0123456789abcdef"
+      },
+      "expected": {
+        "result": "direct",
+        "candidates": [
+          {
+            "host": "10.255.255.255",
+            "port": 7070
+          }
+        ],
+        "nonce_hex": "a1b2c3d4e5f607181122334455667788",
+        "ca_fp_hex": "deadbeefcafebabe0123456789abcdef"
+      }
+    },
+    {
+      "id": "direct.admission.rfc1918-10.above",
+      "evidence": "regression",
+      "citations": [
+        {
+          "document": ".proto-ref/pairing.md",
+          "clause": "Verifies every candidate address is in the explicit direct-pair allow-list"
+        }
+      ],
+      "operation": "parse_pair_link",
+      "input": {
+        "encoding": "blob_hex",
+        "value": "04010b0000001b9ea1b2c3d4e5f607181122334455667788deadbeefcafebabe0123456789abcdef"
+      },
+      "expected": {
+        "result": "error",
+        "error": {
+          "kind": "disallowed_direct_ipv4",
+          "address": "11.0.0.0"
+        }
+      }
+    },
+    {
+      "id": "direct.admission.rfc6598.below",
+      "evidence": "regression",
+      "citations": [
+        {
+          "document": ".proto-ref/pairing.md",
+          "clause": "Verifies every candidate address is in the explicit direct-pair allow-list"
+        }
+      ],
+      "operation": "parse_pair_link",
+      "input": {
+        "encoding": "blob_hex",
+        "value": "0401643fffff1b9ea1b2c3d4e5f607181122334455667788deadbeefcafebabe0123456789abcdef"
+      },
+      "expected": {
+        "result": "error",
+        "error": {
+          "kind": "disallowed_direct_ipv4",
+          "address": "100.63.255.255"
+        }
+      }
+    },
+    {
+      "id": "direct.admission.rfc6598.lower",
+      "evidence": "regression",
+      "citations": [
+        {
+          "document": ".proto-ref/pairing.md",
+          "clause": "Verifies every candidate address is in the explicit direct-pair allow-list"
+        }
+      ],
+      "operation": "parse_pair_link",
+      "input": {
+        "encoding": "blob_hex",
+        "value": "0401644000001b9ea1b2c3d4e5f607181122334455667788deadbeefcafebabe0123456789abcdef"
+      },
+      "expected": {
+        "result": "direct",
+        "candidates": [
+          {
+            "host": "100.64.0.0",
+            "port": 7070
+          }
+        ],
+        "nonce_hex": "a1b2c3d4e5f607181122334455667788",
+        "ca_fp_hex": "deadbeefcafebabe0123456789abcdef"
+      }
+    },
+    {
+      "id": "direct.admission.rfc6598.upper",
+      "evidence": "regression",
+      "citations": [
+        {
+          "document": ".proto-ref/pairing.md",
+          "clause": "Verifies every candidate address is in the explicit direct-pair allow-list"
+        }
+      ],
+      "operation": "parse_pair_link",
+      "input": {
+        "encoding": "blob_hex",
+        "value": "0401647fffff1b9ea1b2c3d4e5f607181122334455667788deadbeefcafebabe0123456789abcdef"
+      },
+      "expected": {
+        "result": "direct",
+        "candidates": [
+          {
+            "host": "100.127.255.255",
+            "port": 7070
+          }
+        ],
+        "nonce_hex": "a1b2c3d4e5f607181122334455667788",
+        "ca_fp_hex": "deadbeefcafebabe0123456789abcdef"
+      }
+    },
+    {
+      "id": "direct.admission.rfc6598.above",
+      "evidence": "regression",
+      "citations": [
+        {
+          "document": ".proto-ref/pairing.md",
+          "clause": "Verifies every candidate address is in the explicit direct-pair allow-list"
+        }
+      ],
+      "operation": "parse_pair_link",
+      "input": {
+        "encoding": "blob_hex",
+        "value": "0401648000001b9ea1b2c3d4e5f607181122334455667788deadbeefcafebabe0123456789abcdef"
+      },
+      "expected": {
+        "result": "error",
+        "error": {
+          "kind": "disallowed_direct_ipv4",
+          "address": "100.128.0.0"
+        }
+      }
+    },
+    {
+      "id": "direct.admission.loopback.below",
+      "evidence": "regression",
+      "citations": [
+        {
+          "document": ".proto-ref/pairing.md",
+          "clause": "Verifies every candidate address is in the explicit direct-pair allow-list"
+        }
+      ],
+      "operation": "parse_pair_link",
+      "input": {
+        "encoding": "blob_hex",
+        "value": "04017effffff1b9ea1b2c3d4e5f607181122334455667788deadbeefcafebabe0123456789abcdef"
+      },
+      "expected": {
+        "result": "error",
+        "error": {
+          "kind": "disallowed_direct_ipv4",
+          "address": "126.255.255.255"
+        }
+      }
+    },
+    {
+      "id": "direct.admission.loopback.lower",
+      "evidence": "regression",
+      "citations": [
+        {
+          "document": ".proto-ref/pairing.md",
+          "clause": "Verifies every candidate address is in the explicit direct-pair allow-list"
+        }
+      ],
+      "operation": "parse_pair_link",
+      "input": {
+        "encoding": "blob_hex",
+        "value": "04017f0000001b9ea1b2c3d4e5f607181122334455667788deadbeefcafebabe0123456789abcdef"
+      },
+      "expected": {
+        "result": "direct",
+        "candidates": [
+          {
+            "host": "127.0.0.0",
+            "port": 7070
+          }
+        ],
+        "nonce_hex": "a1b2c3d4e5f607181122334455667788",
+        "ca_fp_hex": "deadbeefcafebabe0123456789abcdef"
+      }
+    },
+    {
+      "id": "direct.admission.loopback.upper",
+      "evidence": "regression",
+      "citations": [
+        {
+          "document": ".proto-ref/pairing.md",
+          "clause": "Verifies every candidate address is in the explicit direct-pair allow-list"
+        }
+      ],
+      "operation": "parse_pair_link",
+      "input": {
+        "encoding": "blob_hex",
+        "value": "04017fffffff1b9ea1b2c3d4e5f607181122334455667788deadbeefcafebabe0123456789abcdef"
+      },
+      "expected": {
+        "result": "direct",
+        "candidates": [
+          {
+            "host": "127.255.255.255",
+            "port": 7070
+          }
+        ],
+        "nonce_hex": "a1b2c3d4e5f607181122334455667788",
+        "ca_fp_hex": "deadbeefcafebabe0123456789abcdef"
+      }
+    },
+    {
+      "id": "direct.admission.loopback.above",
+      "evidence": "regression",
+      "citations": [
+        {
+          "document": ".proto-ref/pairing.md",
+          "clause": "Verifies every candidate address is in the explicit direct-pair allow-list"
+        }
+      ],
+      "operation": "parse_pair_link",
+      "input": {
+        "encoding": "blob_hex",
+        "value": "0401800000001b9ea1b2c3d4e5f607181122334455667788deadbeefcafebabe0123456789abcdef"
+      },
+      "expected": {
+        "result": "error",
+        "error": {
+          "kind": "disallowed_direct_ipv4",
+          "address": "128.0.0.0"
+        }
+      }
+    },
+    {
+      "id": "direct.admission.link-local.below",
+      "evidence": "regression",
+      "citations": [
+        {
+          "document": ".proto-ref/pairing.md",
+          "clause": "Verifies every candidate address is in the explicit direct-pair allow-list"
+        }
+      ],
+      "operation": "parse_pair_link",
+      "input": {
+        "encoding": "blob_hex",
+        "value": "0401a9fdffff1b9ea1b2c3d4e5f607181122334455667788deadbeefcafebabe0123456789abcdef"
+      },
+      "expected": {
+        "result": "error",
+        "error": {
+          "kind": "disallowed_direct_ipv4",
+          "address": "169.253.255.255"
+        }
+      }
+    },
+    {
+      "id": "direct.admission.link-local.lower",
+      "evidence": "regression",
+      "citations": [
+        {
+          "document": ".proto-ref/pairing.md",
+          "clause": "Verifies every candidate address is in the explicit direct-pair allow-list"
+        }
+      ],
+      "operation": "parse_pair_link",
+      "input": {
+        "encoding": "blob_hex",
+        "value": "0401a9fe00001b9ea1b2c3d4e5f607181122334455667788deadbeefcafebabe0123456789abcdef"
+      },
+      "expected": {
+        "result": "direct",
+        "candidates": [
+          {
+            "host": "169.254.0.0",
+            "port": 7070
+          }
+        ],
+        "nonce_hex": "a1b2c3d4e5f607181122334455667788",
+        "ca_fp_hex": "deadbeefcafebabe0123456789abcdef"
+      }
+    },
+    {
+      "id": "direct.admission.link-local.upper",
+      "evidence": "regression",
+      "citations": [
+        {
+          "document": ".proto-ref/pairing.md",
+          "clause": "Verifies every candidate address is in the explicit direct-pair allow-list"
+        }
+      ],
+      "operation": "parse_pair_link",
+      "input": {
+        "encoding": "blob_hex",
+        "value": "0401a9feffff1b9ea1b2c3d4e5f607181122334455667788deadbeefcafebabe0123456789abcdef"
+      },
+      "expected": {
+        "result": "direct",
+        "candidates": [
+          {
+            "host": "169.254.255.255",
+            "port": 7070
+          }
+        ],
+        "nonce_hex": "a1b2c3d4e5f607181122334455667788",
+        "ca_fp_hex": "deadbeefcafebabe0123456789abcdef"
+      }
+    },
+    {
+      "id": "direct.admission.link-local.above",
+      "evidence": "regression",
+      "citations": [
+        {
+          "document": ".proto-ref/pairing.md",
+          "clause": "Verifies every candidate address is in the explicit direct-pair allow-list"
+        }
+      ],
+      "operation": "parse_pair_link",
+      "input": {
+        "encoding": "blob_hex",
+        "value": "0401a9ff00001b9ea1b2c3d4e5f607181122334455667788deadbeefcafebabe0123456789abcdef"
+      },
+      "expected": {
+        "result": "error",
+        "error": {
+          "kind": "disallowed_direct_ipv4",
+          "address": "169.255.0.0"
+        }
+      }
+    },
+    {
+      "id": "direct.admission.rfc1918-172.below",
+      "evidence": "regression",
+      "citations": [
+        {
+          "document": ".proto-ref/pairing.md",
+          "clause": "Verifies every candidate address is in the explicit direct-pair allow-list"
+        }
+      ],
+      "operation": "parse_pair_link",
+      "input": {
+        "encoding": "blob_hex",
+        "value": "0401ac0fffff1b9ea1b2c3d4e5f607181122334455667788deadbeefcafebabe0123456789abcdef"
+      },
+      "expected": {
+        "result": "error",
+        "error": {
+          "kind": "disallowed_direct_ipv4",
+          "address": "172.15.255.255"
+        }
+      }
+    },
+    {
+      "id": "direct.admission.rfc1918-172.lower",
+      "evidence": "regression",
+      "citations": [
+        {
+          "document": ".proto-ref/pairing.md",
+          "clause": "Verifies every candidate address is in the explicit direct-pair allow-list"
+        }
+      ],
+      "operation": "parse_pair_link",
+      "input": {
+        "encoding": "blob_hex",
+        "value": "0401ac1000001b9ea1b2c3d4e5f607181122334455667788deadbeefcafebabe0123456789abcdef"
+      },
+      "expected": {
+        "result": "direct",
+        "candidates": [
+          {
+            "host": "172.16.0.0",
+            "port": 7070
+          }
+        ],
+        "nonce_hex": "a1b2c3d4e5f607181122334455667788",
+        "ca_fp_hex": "deadbeefcafebabe0123456789abcdef"
+      }
+    },
+    {
+      "id": "direct.admission.rfc1918-172.upper",
+      "evidence": "regression",
+      "citations": [
+        {
+          "document": ".proto-ref/pairing.md",
+          "clause": "Verifies every candidate address is in the explicit direct-pair allow-list"
+        }
+      ],
+      "operation": "parse_pair_link",
+      "input": {
+        "encoding": "blob_hex",
+        "value": "0401ac1fffff1b9ea1b2c3d4e5f607181122334455667788deadbeefcafebabe0123456789abcdef"
+      },
+      "expected": {
+        "result": "direct",
+        "candidates": [
+          {
+            "host": "172.31.255.255",
+            "port": 7070
+          }
+        ],
+        "nonce_hex": "a1b2c3d4e5f607181122334455667788",
+        "ca_fp_hex": "deadbeefcafebabe0123456789abcdef"
+      }
+    },
+    {
+      "id": "direct.admission.rfc1918-172.above",
+      "evidence": "regression",
+      "citations": [
+        {
+          "document": ".proto-ref/pairing.md",
+          "clause": "Verifies every candidate address is in the explicit direct-pair allow-list"
+        }
+      ],
+      "operation": "parse_pair_link",
+      "input": {
+        "encoding": "blob_hex",
+        "value": "0401ac2000001b9ea1b2c3d4e5f607181122334455667788deadbeefcafebabe0123456789abcdef"
+      },
+      "expected": {
+        "result": "error",
+        "error": {
+          "kind": "disallowed_direct_ipv4",
+          "address": "172.32.0.0"
+        }
+      }
+    },
+    {
+      "id": "direct.admission.rfc1918-192.below",
+      "evidence": "regression",
+      "citations": [
+        {
+          "document": ".proto-ref/pairing.md",
+          "clause": "Verifies every candidate address is in the explicit direct-pair allow-list"
+        }
+      ],
+      "operation": "parse_pair_link",
+      "input": {
+        "encoding": "blob_hex",
+        "value": "0401c0a7ffff1b9ea1b2c3d4e5f607181122334455667788deadbeefcafebabe0123456789abcdef"
+      },
+      "expected": {
+        "result": "error",
+        "error": {
+          "kind": "disallowed_direct_ipv4",
+          "address": "192.167.255.255"
+        }
+      }
+    },
+    {
+      "id": "direct.admission.rfc1918-192.lower",
+      "evidence": "regression",
+      "citations": [
+        {
+          "document": ".proto-ref/pairing.md",
+          "clause": "Verifies every candidate address is in the explicit direct-pair allow-list"
+        }
+      ],
+      "operation": "parse_pair_link",
+      "input": {
+        "encoding": "blob_hex",
+        "value": "0401c0a800001b9ea1b2c3d4e5f607181122334455667788deadbeefcafebabe0123456789abcdef"
+      },
+      "expected": {
+        "result": "direct",
+        "candidates": [
+          {
+            "host": "192.168.0.0",
+            "port": 7070
+          }
+        ],
+        "nonce_hex": "a1b2c3d4e5f607181122334455667788",
+        "ca_fp_hex": "deadbeefcafebabe0123456789abcdef"
+      }
+    },
+    {
+      "id": "direct.admission.rfc1918-192.upper",
+      "evidence": "regression",
+      "citations": [
+        {
+          "document": ".proto-ref/pairing.md",
+          "clause": "Verifies every candidate address is in the explicit direct-pair allow-list"
+        }
+      ],
+      "operation": "parse_pair_link",
+      "input": {
+        "encoding": "blob_hex",
+        "value": "0401c0a8ffff1b9ea1b2c3d4e5f607181122334455667788deadbeefcafebabe0123456789abcdef"
+      },
+      "expected": {
+        "result": "direct",
+        "candidates": [
+          {
+            "host": "192.168.255.255",
+            "port": 7070
+          }
+        ],
+        "nonce_hex": "a1b2c3d4e5f607181122334455667788",
+        "ca_fp_hex": "deadbeefcafebabe0123456789abcdef"
+      }
+    },
+    {
+      "id": "direct.admission.rfc1918-192.above",
+      "evidence": "regression",
+      "citations": [
+        {
+          "document": ".proto-ref/pairing.md",
+          "clause": "Verifies every candidate address is in the explicit direct-pair allow-list"
+        }
+      ],
+      "operation": "parse_pair_link",
+      "input": {
+        "encoding": "blob_hex",
+        "value": "0401c0a900001b9ea1b2c3d4e5f607181122334455667788deadbeefcafebabe0123456789abcdef"
+      },
+      "expected": {
+        "result": "error",
+        "error": {
+          "kind": "disallowed_direct_ipv4",
+          "address": "192.169.0.0"
+        }
+      }
+    },
+    {
+      "id": "direct.admission.link-local.example",
+      "evidence": "regression",
+      "citations": [
+        {
+          "document": ".proto-ref/pairing.md",
+          "clause": "Address-admission conformance cases (normative policy vectors):"
+        }
+      ],
+      "operation": "parse_pair_link",
+      "input": {
+        "encoding": "blob_hex",
+        "value": "0401a9fe00011b9ea1b2c3d4e5f607181122334455667788deadbeefcafebabe0123456789abcdef"
+      },
+      "expected": {
+        "result": "direct",
+        "candidates": [
+          {
+            "host": "169.254.0.1",
+            "port": 7070
+          }
+        ],
+        "nonce_hex": "a1b2c3d4e5f607181122334455667788",
+        "ca_fp_hex": "deadbeefcafebabe0123456789abcdef"
+      }
+    },
+    {
+      "id": "pair.v04.canonical.decode",
+      "evidence": "published_fixture",
+      "citations": [
+        {
+          "document": ".proto-ref/pairing.md",
+          "clause": "Direct form conformance vector uses fixed inputs"
+        }
+      ],
+      "operation": "decode_crockford",
+      "input": "0G0W000258DSX8DJRFAEBXG7308J4CT4ANK7F26YNPZEZJQYQAZ028T5CY4TQKFF",
+      "expected_hex": "0401c000022a1b9ea1b2c3d4e5f607181122334455667788deadbeefcafebabe0123456789abcdef"
+    },
+    {
+      "id": "pair.v04.canonical.admission",
+      "evidence": "published_fixture",
+      "citations": [
+        {
+          "document": ".proto-ref/pairing.md",
+          "clause": "canonical direct vector `192.0.2.42`"
+        }
+      ],
+      "operation": "parse_pair_link",
+      "input": {
+        "encoding": "link",
+        "value": "https://go.solstone.app/p#0G0W000258DSX8DJRFAEBXG7308J4CT4ANK7F26YNPZEZJQYQAZ028T5CY4TQKFF"
+      },
+      "expected": {
+        "result": "error",
+        "error": {
+          "kind": "disallowed_direct_ipv4",
+          "address": "192.0.2.42"
+        }
+      }
+    },
+    {
+      "id": "pair.v04.truncated.0",
+      "evidence": "regression",
+      "citations": [
+        {
+          "document": ".proto-ref/pairing.md",
+          "clause": "Direct form, version `0x04` (40 bytes):"
+        }
+      ],
+      "operation": "parse_pair_link",
+      "input": {
+        "encoding": "blob_hex",
+        "value": ""
+      },
+      "expected": {
+        "result": "error",
+        "error": {
+          "kind": "truncated",
+          "expected": 1,
+          "got": 0
+        }
+      }
+    },
+    {
+      "id": "pair.v04.truncated.1",
+      "evidence": "regression",
+      "citations": [
+        {
+          "document": ".proto-ref/pairing.md",
+          "clause": "Direct form, version `0x04` (40 bytes):"
+        }
+      ],
+      "operation": "parse_pair_link",
+      "input": {
+        "encoding": "blob_hex",
+        "value": "04"
+      },
+      "expected": {
+        "result": "error",
+        "error": {
+          "kind": "truncated",
+          "expected": 40,
+          "got": 1
+        }
+      }
+    },
+    {
+      "id": "pair.v04.truncated.2",
+      "evidence": "regression",
+      "citations": [
+        {
+          "document": ".proto-ref/pairing.md",
+          "clause": "Direct form, version `0x04` (40 bytes):"
+        }
+      ],
+      "operation": "parse_pair_link",
+      "input": {
+        "encoding": "blob_hex",
+        "value": "0401"
+      },
+      "expected": {
+        "result": "error",
+        "error": {
+          "kind": "truncated",
+          "expected": 40,
+          "got": 2
+        }
+      }
+    },
+    {
+      "id": "pair.v04.truncated.6",
+      "evidence": "regression",
+      "citations": [
+        {
+          "document": ".proto-ref/pairing.md",
+          "clause": "Direct form, version `0x04` (40 bytes):"
+        }
+      ],
+      "operation": "parse_pair_link",
+      "input": {
+        "encoding": "blob_hex",
+        "value": "0401c000022a"
+      },
+      "expected": {
+        "result": "error",
+        "error": {
+          "kind": "truncated",
+          "expected": 40,
+          "got": 6
+        }
+      }
+    },
+    {
+      "id": "pair.v04.truncated.8",
+      "evidence": "regression",
+      "citations": [
+        {
+          "document": ".proto-ref/pairing.md",
+          "clause": "Direct form, version `0x04` (40 bytes):"
+        }
+      ],
+      "operation": "parse_pair_link",
+      "input": {
+        "encoding": "blob_hex",
+        "value": "0401c000022a1b9e"
+      },
+      "expected": {
+        "result": "error",
+        "error": {
+          "kind": "truncated",
+          "expected": 40,
+          "got": 8
+        }
+      }
+    },
+    {
+      "id": "pair.v04.truncated.24",
+      "evidence": "regression",
+      "citations": [
+        {
+          "document": ".proto-ref/pairing.md",
+          "clause": "Direct form, version `0x04` (40 bytes):"
+        }
+      ],
+      "operation": "parse_pair_link",
+      "input": {
+        "encoding": "blob_hex",
+        "value": "0401c000022a1b9ea1b2c3d4e5f607181122334455667788"
+      },
+      "expected": {
+        "result": "error",
+        "error": {
+          "kind": "truncated",
+          "expected": 40,
+          "got": 24
+        }
+      }
+    },
+    {
+      "id": "pair.v04.truncated.39",
+      "evidence": "regression",
+      "citations": [
+        {
+          "document": ".proto-ref/pairing.md",
+          "clause": "Direct form, version `0x04` (40 bytes):"
+        }
+      ],
+      "operation": "parse_pair_link",
+      "input": {
+        "encoding": "blob_hex",
+        "value": "0401c000022a1b9ea1b2c3d4e5f607181122334455667788deadbeefcafebabe0123456789abcd"
+      },
+      "expected": {
+        "result": "error",
+        "error": {
+          "kind": "truncated",
+          "expected": 40,
+          "got": 39
+        }
+      }
+    },
+    {
+      "id": "pair.v04.unsupported-address-tag",
+      "evidence": "regression",
+      "citations": [
+        {
+          "document": ".proto-ref/pairing.md",
+          "clause": "`0x01` = IPv4"
+        }
+      ],
+      "operation": "parse_pair_link",
+      "input": {
+        "encoding": "blob_hex",
+        "value": "04020a0000011b9ea1b2c3d4e5f607181122334455667788deadbeefcafebabe0123456789abcdef"
+      },
+      "expected": {
+        "result": "error",
+        "error": {
+          "kind": "unsupported_address_type",
+          "address_type": 2
+        }
+      }
+    },
+    {
+      "id": "pair.v05.count.1",
+      "evidence": "regression",
+      "citations": [
+        {
+          "document": ".proto-ref/pairing.md",
+          "clause": "Candidate-count conformance cases:"
+        }
+      ],
+      "operation": "parse_pair_link",
+      "input": {
+        "encoding": "blob_hex",
+        "value": "0501011b9ec0a8010aa1b2c3d4e5f607181122334455667788deadbeefcafebabe0123456789abcdef"
+      },
+      "expected": {
+        "result": "direct",
+        "candidates": [
+          {
+            "host": "192.168.1.10",
+            "port": 7070
+          }
+        ],
+        "nonce_hex": "a1b2c3d4e5f607181122334455667788",
+        "ca_fp_hex": "deadbeefcafebabe0123456789abcdef"
+      }
+    },
+    {
+      "id": "pair.v05.count.2",
+      "evidence": "regression",
+      "citations": [
+        {
+          "document": ".proto-ref/pairing.md",
+          "clause": "Candidate-count conformance cases:"
+        }
+      ],
+      "operation": "parse_pair_link",
+      "input": {
+        "encoding": "blob_hex",
+        "value": "0501021b9ec0a8010a64400005a1b2c3d4e5f607181122334455667788deadbeefcafebabe0123456789abcdef"
+      },
+      "expected": {
+        "result": "direct",
+        "candidates": [
+          {
+            "host": "192.168.1.10",
+            "port": 7070
+          },
+          {
+            "host": "100.64.0.5",
+            "port": 7070
+          }
+        ],
+        "nonce_hex": "a1b2c3d4e5f607181122334455667788",
+        "ca_fp_hex": "deadbeefcafebabe0123456789abcdef"
+      }
+    },
+    {
+      "id": "pair.v05.count.3",
+      "evidence": "regression",
+      "citations": [
+        {
+          "document": ".proto-ref/pairing.md",
+          "clause": "Candidate-count conformance cases:"
+        }
+      ],
+      "operation": "parse_pair_link",
+      "input": {
+        "encoding": "blob_hex",
+        "value": "0501031b9ec0a8010a644000050a000001a1b2c3d4e5f607181122334455667788deadbeefcafebabe0123456789abcdef"
+      },
+      "expected": {
+        "result": "direct",
+        "candidates": [
+          {
+            "host": "192.168.1.10",
+            "port": 7070
+          },
+          {
+            "host": "100.64.0.5",
+            "port": 7070
+          },
+          {
+            "host": "10.0.0.1",
+            "port": 7070
+          }
+        ],
+        "nonce_hex": "a1b2c3d4e5f607181122334455667788",
+        "ca_fp_hex": "deadbeefcafebabe0123456789abcdef"
+      }
+    },
+    {
+      "id": "pair.v05.count.4",
+      "evidence": "regression",
+      "citations": [
+        {
+          "document": ".proto-ref/pairing.md",
+          "clause": "Candidate-count conformance cases:"
+        }
+      ],
+      "operation": "parse_pair_link",
+      "input": {
+        "encoding": "blob_hex",
+        "value": "0501041b9ec0a8010a644000050a0000017f000001a1b2c3d4e5f607181122334455667788deadbeefcafebabe0123456789abcdef"
+      },
+      "expected": {
+        "result": "direct",
+        "candidates": [
+          {
+            "host": "192.168.1.10",
+            "port": 7070
+          },
+          {
+            "host": "100.64.0.5",
+            "port": 7070
+          },
+          {
+            "host": "10.0.0.1",
+            "port": 7070
+          },
+          {
+            "host": "127.0.0.1",
+            "port": 7070
+          }
+        ],
+        "nonce_hex": "a1b2c3d4e5f607181122334455667788",
+        "ca_fp_hex": "deadbeefcafebabe0123456789abcdef"
+      }
+    },
+    {
+      "id": "pair.v05.count.0.refuse",
+      "evidence": "regression",
+      "citations": [
+        {
+          "document": ".proto-ref/pairing.md",
+          "clause": "Candidate-count conformance cases:"
+        }
+      ],
+      "operation": "parse_pair_link",
+      "input": {
+        "encoding": "blob_hex",
+        "value": "050100"
+      },
+      "expected": {
+        "result": "error",
+        "error": {
+          "kind": "invalid_candidate_count",
+          "count": 0
+        }
+      }
+    },
+    {
+      "id": "pair.v05.count.5.refuse",
+      "evidence": "regression",
+      "citations": [
+        {
+          "document": ".proto-ref/pairing.md",
+          "clause": "Candidate-count conformance cases:"
+        }
+      ],
+      "operation": "parse_pair_link",
+      "input": {
+        "encoding": "blob_hex",
+        "value": "050105"
+      },
+      "expected": {
+        "result": "error",
+        "error": {
+          "kind": "invalid_candidate_count",
+          "count": 5
+        }
+      }
+    },
+    {
+      "id": "pair.v05.count.255.refuse",
+      "evidence": "regression",
+      "citations": [
+        {
+          "document": ".proto-ref/pairing.md",
+          "clause": "Candidate-count conformance cases:"
+        }
+      ],
+      "operation": "parse_pair_link",
+      "input": {
+        "encoding": "blob_hex",
+        "value": "0501ff"
+      },
+      "expected": {
+        "result": "error",
+        "error": {
+          "kind": "invalid_candidate_count",
+          "count": 255
+        }
+      }
+    },
+    {
+      "id": "pair.v05.truncated.1",
+      "evidence": "regression",
+      "citations": [
+        {
+          "document": ".proto-ref/pairing.md",
+          "clause": "Total length is `5 + 4·count + 32`"
+        }
+      ],
+      "operation": "parse_pair_link",
+      "input": {
+        "encoding": "blob_hex",
+        "value": "05"
+      },
+      "expected": {
+        "result": "error",
+        "error": {
+          "kind": "truncated",
+          "expected": 3,
+          "got": 1
+        }
+      }
+    },
+    {
+      "id": "pair.v05.truncated.2",
+      "evidence": "regression",
+      "citations": [
+        {
+          "document": ".proto-ref/pairing.md",
+          "clause": "Total length is `5 + 4·count + 32`"
+        }
+      ],
+      "operation": "parse_pair_link",
+      "input": {
+        "encoding": "blob_hex",
+        "value": "0501"
+      },
+      "expected": {
+        "result": "error",
+        "error": {
+          "kind": "truncated",
+          "expected": 3,
+          "got": 2
+        }
+      }
+    },
+    {
+      "id": "pair.v05.truncated.3",
+      "evidence": "regression",
+      "citations": [
+        {
+          "document": ".proto-ref/pairing.md",
+          "clause": "Total length is `5 + 4·count + 32`"
+        }
+      ],
+      "operation": "parse_pair_link",
+      "input": {
+        "encoding": "blob_hex",
+        "value": "050102"
+      },
+      "expected": {
+        "result": "error",
+        "error": {
+          "kind": "truncated",
+          "expected": 5,
+          "got": 3
+        }
+      }
+    },
+    {
+      "id": "pair.v05.truncated.4",
+      "evidence": "regression",
+      "citations": [
+        {
+          "document": ".proto-ref/pairing.md",
+          "clause": "Total length is `5 + 4·count + 32`"
+        }
+      ],
+      "operation": "parse_pair_link",
+      "input": {
+        "encoding": "blob_hex",
+        "value": "0501021b"
+      },
+      "expected": {
+        "result": "error",
+        "error": {
+          "kind": "truncated",
+          "expected": 5,
+          "got": 4
+        }
+      }
+    },
+    {
+      "id": "pair.v05.truncated.5",
+      "evidence": "regression",
+      "citations": [
+        {
+          "document": ".proto-ref/pairing.md",
+          "clause": "Total length is `5 + 4·count + 32`"
+        }
+      ],
+      "operation": "parse_pair_link",
+      "input": {
+        "encoding": "blob_hex",
+        "value": "0501021b9e"
+      },
+      "expected": {
+        "result": "error",
+        "error": {
+          "kind": "truncated",
+          "expected": 45,
+          "got": 5
+        }
+      }
+    },
+    {
+      "id": "pair.v05.truncated.8",
+      "evidence": "regression",
+      "citations": [
+        {
+          "document": ".proto-ref/pairing.md",
+          "clause": "Total length is `5 + 4·count + 32`"
+        }
+      ],
+      "operation": "parse_pair_link",
+      "input": {
+        "encoding": "blob_hex",
+        "value": "0501021b9ec0a801"
+      },
+      "expected": {
+        "result": "error",
+        "error": {
+          "kind": "truncated",
+          "expected": 45,
+          "got": 8
+        }
+      }
+    },
+    {
+      "id": "pair.v05.truncated.12",
+      "evidence": "regression",
+      "citations": [
+        {
+          "document": ".proto-ref/pairing.md",
+          "clause": "Total length is `5 + 4·count + 32`"
+        }
+      ],
+      "operation": "parse_pair_link",
+      "input": {
+        "encoding": "blob_hex",
+        "value": "0501021b9ec0a8010a644000"
+      },
+      "expected": {
+        "result": "error",
+        "error": {
+          "kind": "truncated",
+          "expected": 45,
+          "got": 12
+        }
+      }
+    },
+    {
+      "id": "pair.v05.truncated.44",
+      "evidence": "regression",
+      "citations": [
+        {
+          "document": ".proto-ref/pairing.md",
+          "clause": "Total length is `5 + 4·count + 32`"
+        }
+      ],
+      "operation": "parse_pair_link",
+      "input": {
+        "encoding": "blob_hex",
+        "value": "0501021b9ec0a8010a64400005a1b2c3d4e5f607181122334455667788deadbeefcafebabe0123456789abcd"
+      },
+      "expected": {
+        "result": "error",
+        "error": {
+          "kind": "truncated",
+          "expected": 45,
+          "got": 44
+        }
+      }
+    },
+    {
+      "id": "pair.v05.unsupported-address-tag",
+      "evidence": "regression",
+      "citations": [
+        {
+          "document": ".proto-ref/pairing.md",
+          "clause": "`0x01` = IPv4"
+        }
+      ],
+      "operation": "parse_pair_link",
+      "input": {
+        "encoding": "blob_hex",
+        "value": "0502021b9ec0a8010a64400005a1b2c3d4e5f607181122334455667788deadbeefcafebabe0123456789abcdef"
+      },
+      "expected": {
+        "result": "error",
+        "error": {
+          "kind": "unsupported_address_type",
+          "address_type": 2
+        }
+      }
+    },
+    {
+      "id": "pair.v05.admission.all-allowed",
+      "evidence": "regression",
+      "citations": [
+        {
+          "document": ".proto-ref/pairing.md",
+          "clause": "`0x05`: `192.168.1.10`, `100.64.0.5`"
+        }
+      ],
+      "operation": "parse_pair_link",
+      "input": {
+        "encoding": "blob_hex",
+        "value": "0501021b9ec0a8010a64400005a1b2c3d4e5f607181122334455667788deadbeefcafebabe0123456789abcdef"
+      },
+      "expected": {
+        "result": "direct",
+        "candidates": [
+          {
+            "host": "192.168.1.10",
+            "port": 7070
+          },
+          {
+            "host": "100.64.0.5",
+            "port": 7070
+          }
+        ],
+        "nonce_hex": "a1b2c3d4e5f607181122334455667788",
+        "ca_fp_hex": "deadbeefcafebabe0123456789abcdef"
+      }
+    },
+    {
+      "id": "pair.v05.admission.mixed-refused",
+      "evidence": "regression",
+      "citations": [
+        {
+          "document": ".proto-ref/pairing.md",
+          "clause": "`0x05`: `192.168.1.10`, `192.0.2.42`"
+        }
+      ],
+      "operation": "parse_pair_link",
+      "input": {
+        "encoding": "blob_hex",
+        "value": "0501021b9ec0a8010ac000022aa1b2c3d4e5f607181122334455667788deadbeefcafebabe0123456789abcdef"
+      },
+      "expected": {
+        "result": "error",
+        "error": {
+          "kind": "disallowed_direct_ipv4",
+          "address": "192.0.2.42"
+        }
+      }
+    },
+    {
+      "id": "pair.v05.duplicate.coalesced",
+      "evidence": "regression",
+      "citations": [
+        {
+          "document": ".proto-ref/pairing.md",
+          "clause": "coalescing exact duplicate host/port endpoints"
+        }
+      ],
+      "operation": "parse_pair_link",
+      "input": {
+        "encoding": "blob_hex",
+        "value": "0501021b9e0a0000010a000001a1b2c3d4e5f607181122334455667788deadbeefcafebabe0123456789abcdef"
+      },
+      "expected": {
+        "result": "direct",
+        "candidates": [
+          {
+            "host": "10.0.0.1",
+            "port": 7070
+          }
+        ],
+        "nonce_hex": "a1b2c3d4e5f607181122334455667788",
+        "ca_fp_hex": "deadbeefcafebabe0123456789abcdef"
+      }
+    },
+    {
+      "id": "pair.v05.duplicate.disallowed",
+      "evidence": "regression",
+      "citations": [
+        {
+          "document": ".proto-ref/pairing.md",
+          "clause": "a link with any public-address candidate is refused as a whole"
+        }
+      ],
+      "operation": "parse_pair_link",
+      "input": {
+        "encoding": "blob_hex",
+        "value": "0501021b9ec000022ac000022aa1b2c3d4e5f607181122334455667788deadbeefcafebabe0123456789abcdef"
+      },
+      "expected": {
+        "result": "error",
+        "error": {
+          "kind": "disallowed_direct_ipv4",
+          "address": "192.0.2.42"
+        }
+      }
+    },
+    {
+      "id": "pair.v05.duplicate.count-five-refused",
+      "evidence": "regression",
+      "citations": [
+        {
+          "document": ".proto-ref/pairing.md",
+          "clause": "count is outside `1...4` is malformed"
+        }
+      ],
+      "operation": "parse_pair_link",
+      "input": {
+        "encoding": "blob_hex",
+        "value": "050105"
+      },
+      "expected": {
+        "result": "error",
+        "error": {
+          "kind": "invalid_candidate_count",
+          "count": 5
+        }
+      }
+    },
+    {
+      "id": "pair.v05.disallowed-member.first",
+      "evidence": "regression",
+      "citations": [
+        {
+          "document": ".proto-ref/pairing.md",
+          "clause": "a link with any public-address candidate is refused as a whole"
+        }
+      ],
+      "operation": "parse_pair_link",
+      "input": {
+        "encoding": "blob_hex",
+        "value": "0501031b9ec000022a0a0000017f000001a1b2c3d4e5f607181122334455667788deadbeefcafebabe0123456789abcdef"
+      },
+      "expected": {
+        "result": "error",
+        "error": {
+          "kind": "disallowed_direct_ipv4",
+          "address": "192.0.2.42"
+        }
+      }
+    },
+    {
+      "id": "pair.v05.disallowed-member.middle",
+      "evidence": "regression",
+      "citations": [
+        {
+          "document": ".proto-ref/pairing.md",
+          "clause": "a link with any public-address candidate is refused as a whole"
+        }
+      ],
+      "operation": "parse_pair_link",
+      "input": {
+        "encoding": "blob_hex",
+        "value": "0501031b9e0a000001c000022a7f000001a1b2c3d4e5f607181122334455667788deadbeefcafebabe0123456789abcdef"
+      },
+      "expected": {
+        "result": "error",
+        "error": {
+          "kind": "disallowed_direct_ipv4",
+          "address": "192.0.2.42"
+        }
+      }
+    },
+    {
+      "id": "pair.v05.disallowed-member.last",
+      "evidence": "regression",
+      "citations": [
+        {
+          "document": ".proto-ref/pairing.md",
+          "clause": "a link with any public-address candidate is refused as a whole"
+        }
+      ],
+      "operation": "parse_pair_link",
+      "input": {
+        "encoding": "blob_hex",
+        "value": "0501031b9e0a0000017f000001c000022aa1b2c3d4e5f607181122334455667788deadbeefcafebabe0123456789abcdef"
+      },
+      "expected": {
+        "result": "error",
+        "error": {
+          "kind": "disallowed_direct_ipv4",
+          "address": "192.0.2.42"
+        }
+      }
+    },
+    {
+      "id": "pair.v06.default.published",
+      "evidence": "published_fixture",
+      "citations": [
+        {
+          "document": ".proto-ref/pair-window.md",
+          "clause": "Default relay (`relay_origin = None`, selector `0x00`):"
+        }
+      ],
+      "operation": "parse_pair_link",
+      "input": {
+        "encoding": "link",
+        "value": "https://go.solstone.app/p#0R0J6HB7H6NWVVR1VTPVXVYAZTXBW0938NKRKAYDXW00"
+      },
+      "expected": {
+        "result": "relay",
+        "secret_hex": "0123456789abcdef",
+        "ca_fp_spki_hex": "deadbeefcafebabe0123456789abcdef",
+        "relay_origin": "https://link.solstone.app"
+      }
+    },
+    {
+      "id": "pair.v06.custom.published",
+      "evidence": "published_fixture",
+      "citations": [
+        {
+          "document": ".proto-ref/pair-window.md",
+          "clause": "Custom relay (`relay_origin = https://relay.example`):"
+        }
+      ],
+      "operation": "parse_pair_link",
+      "input": {
+        "encoding": "link",
+        "value": "https://go.solstone.app/p#0R0J6HB7H6NWVVR1VTPVXVYAZTXBW0938NKRKAYDXWAPGX3ME1SKMBSFE9JPRRBS5SJQGRBDE1P6A"
+      },
+      "expected": {
+        "result": "relay",
+        "secret_hex": "0123456789abcdef",
+        "ca_fp_spki_hex": "deadbeefcafebabe0123456789abcdef",
+        "relay_origin": "https://relay.example"
+      }
+    },
+    {
+      "id": "relay.rk.published",
+      "evidence": "published_fixture",
+      "citations": [
+        {
+          "document": ".proto-ref/pair-window.md",
+          "clause": "RK (L=16)    = e34481a4cde647ba9c9fb29a59e18271"
+        }
+      ],
+      "operation": "derive_relay_key",
+      "secret_hex": "0123456789abcdef",
+      "expected_hex": "e34481a4cde647ba9c9fb29a59e18271"
+    },
+    {
+      "id": "pair.v06.truncated.1",
+      "evidence": "regression",
+      "citations": [
+        {
+          "document": ".proto-ref/pair-window.md",
+          "clause": "Base size **27 bytes**"
+        }
+      ],
+      "operation": "parse_pair_link",
+      "input": {
+        "encoding": "blob_hex",
+        "value": "06"
+      },
+      "expected": {
+        "result": "error",
+        "error": {
+          "kind": "truncated",
+          "expected": 27,
+          "got": 1
+        }
+      }
+    },
+    {
+      "id": "pair.v06.truncated.9",
+      "evidence": "regression",
+      "citations": [
+        {
+          "document": ".proto-ref/pair-window.md",
+          "clause": "Base size **27 bytes**"
+        }
+      ],
+      "operation": "parse_pair_link",
+      "input": {
+        "encoding": "blob_hex",
+        "value": "060123456789abcdef"
+      },
+      "expected": {
+        "result": "error",
+        "error": {
+          "kind": "truncated",
+          "expected": 27,
+          "got": 9
+        }
+      }
+    },
+    {
+      "id": "pair.v06.truncated.10",
+      "evidence": "regression",
+      "citations": [
+        {
+          "document": ".proto-ref/pair-window.md",
+          "clause": "Base size **27 bytes**"
+        }
+      ],
+      "operation": "parse_pair_link",
+      "input": {
+        "encoding": "blob_hex",
+        "value": "060123456789abcdef01"
+      },
+      "expected": {
+        "result": "error",
+        "error": {
+          "kind": "truncated",
+          "expected": 27,
+          "got": 10
+        }
+      }
+    },
+    {
+      "id": "pair.v06.truncated.26",
+      "evidence": "regression",
+      "citations": [
+        {
+          "document": ".proto-ref/pair-window.md",
+          "clause": "Base size **27 bytes**"
+        }
+      ],
+      "operation": "parse_pair_link",
+      "input": {
+        "encoding": "blob_hex",
+        "value": "060123456789abcdef01deadbeefcafebabe0123456789abcdef"
+      },
+      "expected": {
+        "result": "error",
+        "error": {
+          "kind": "truncated",
+          "expected": 27,
+          "got": 26
+        }
+      }
+    },
+    {
+      "id": "pair.v06.unknown-ca-tag",
+      "evidence": "regression",
+      "citations": [
+        {
+          "document": ".proto-ref/pair-window.md",
+          "clause": "ca_fp_tag | `0x01` = SHA-256 over CA DER SPKI"
+        }
+      ],
+      "operation": "parse_pair_link",
+      "input": {
+        "encoding": "blob_hex",
+        "value": "060123456789abcdef02deadbeefcafebabe0123456789abcdef00"
+      },
+      "expected": {
+        "result": "error",
+        "error": {
+          "kind": "unknown_ca_fp_tag",
+          "tag": 2
+        }
+      }
+    },
+    {
+      "id": "pair.v06.custom-origin-truncated",
+      "evidence": "regression",
+      "citations": [
+        {
+          "document": ".proto-ref/pair-window.md",
+          "clause": "`N` (`1..255`) = custom origin byte length"
+        }
+      ],
+      "operation": "parse_pair_link",
+      "input": {
+        "encoding": "blob_hex",
+        "value": "060123456789abcdef01deadbeefcafebabe0123456789abcdef1568747470733a2f2f72656c61792e6578616d706c"
+      },
+      "expected": {
+        "result": "error",
+        "error": {
+          "kind": "truncated",
+          "expected": 48,
+          "got": 47
+        }
+      }
+    },
+    {
+      "id": "pair.v06.custom-origin-invalid-utf8",
+      "evidence": "regression",
+      "citations": [
+        {
+          "document": ".proto-ref/pair-window.md",
+          "clause": "relay_origin | UTF-8 bytes of the custom origin"
+        }
+      ],
+      "operation": "parse_pair_link",
+      "input": {
+        "encoding": "blob_hex",
+        "value": "060123456789abcdef01deadbeefcafebabe0123456789abcdef01ff"
+      },
+      "expected": {
+        "result": "error",
+        "error": {
+          "kind": "bad_relay_origin"
+        }
+      }
+    }
+  ]
+}

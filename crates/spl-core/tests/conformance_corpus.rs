@@ -12,6 +12,7 @@ use std::error::Error;
 use std::fs;
 use std::path::{Component, Path};
 
+/// Regeneration/determinism drift check; explicitly not a protocol-conformance gate.
 #[test]
 fn committed_corpus_is_deterministic() -> Result<(), Box<dyn Error>> {
     let committed = fs::read_to_string(corpus_generator::corpus_path())?;
@@ -100,6 +101,11 @@ fn citations_resolve_to_exact_vendored_clauses() -> Result<(), Box<dyn Error>> {
             vector.id
         );
         for citation in &vector.citations {
+            assert!(
+                !citation.clause.trim().is_empty(),
+                "empty clause marker for {}",
+                vector.id
+            );
             let relative = Path::new(&citation.document);
             assert!(relative.is_relative(), "absolute citation in {}", vector.id);
             assert!(

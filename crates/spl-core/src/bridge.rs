@@ -9,18 +9,22 @@ use crate::http;
 pub const BOOTSTRAP_ROUTE: &str = "/_bridge/bootstrap";
 
 /// Consumer-selected names used by the pure loopback bridge transforms.
-///
-/// Header names must be lowercase, matching the invariant established by
-/// [`parse_request_head`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BridgeNames {
-    /// Name of the cookie carrying the loopback capability.
+    /// Name of the cookie carrying the loopback capability. It must match the
+    /// name used to set that cookie; a mismatch makes authorization reject it.
     pub capability_cookie_name: String,
     /// Prefix applied to upstream cookie names before returning them locally.
+    /// It must be nonempty: an empty prefix forwards every non-capability
+    /// request cookie upstream and returns response cookies without namespacing.
     pub upstream_cookie_prefix: String,
-    /// Header name reserved for consumer-specific caller authentication.
+    /// Header name reserved for consumer-specific caller authentication. It
+    /// must be lowercase; any other case cannot match normalized request names
+    /// and therefore bypasses caller-auth rejection for this header.
     pub observer_header_name: String,
-    /// Header name reserved for the consumer's protocol version.
+    /// Header name reserved for the consumer's protocol version. It must be
+    /// lowercase; any other case cannot match normalized request names and
+    /// therefore bypasses caller-auth rejection for this header.
     pub protocol_version_header_name: String,
 }
 

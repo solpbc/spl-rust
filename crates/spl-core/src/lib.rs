@@ -15,11 +15,11 @@
 //!
 //! # Authority
 //!
-//! The wire is specified by the [`proto/` documents in solpbc/spl][proto], and
-//! those documents — together with the conformance-vector corpus generated from
-//! them — are authoritative over this code. When this crate and the protocol
-//! disagree, the protocol is right. Never invent wire behavior here; raise the
-//! gap against the protocol instead.
+//! The [`proto/` documents in solpbc/spl][proto] are authoritative over this
+//! code. Published-fixture vectors provide independent conformance evidence;
+//! the rest of the corpus pins current implementation behavior for regression
+//! detection. When this crate and the protocol disagree, the protocol is right.
+//! Never invent wire behavior here; raise the gap against the protocol instead.
 //!
 //! [proto]: https://github.com/solpbc/spl/tree/main/proto
 //!

@@ -1,0 +1,56 @@
+{
+  "bundle_schema_identity": "spl.pair-link-definition-bundle.schema.v1",
+  "bundle_semver": "1.1.1",
+  "files": [
+    {
+      "path": "definition.json",
+      "sha256": "dcc47aade990c33bfc629a392657685e3c285fb5fd25126a15d9b2f0a591d063"
+    },
+    {
+      "path": "definition.schema.json",
+      "sha256": "5ed476e9966f681ab6dfa5fb6bdc69142fed976d3bdd32216254fd61cce99f5d"
+    },
+    {
+      "path": "vectors.json",
+      "sha256": "24d21777ee45e77fef7669965a875d0db60f700650c3d8e19065c2a4f77dcb22"
+    },
+    {
+      "path": "vectors.schema.json",
+      "sha256": "3293f26b5d36f3a70d7178e230186bfae619e6d9e817157e1680fad7a51d6a66"
+    }
+  ],
+  "generator_identity": "spl.proto.definition.generate.v1",
+  "generator_inputs": [
+    {
+      "id": "definition.authored_source",
+      "path": "proto/definition/definition.toml",
+      "role": "authored_source",
+      "sha256": "956462f638abc3bb25af86e8134546385ad081dca702f1418c0d28e99551a3a5"
+    },
+    {
+      "id": "definition.conformance_corpus",
+      "path": "proto/definition/vectors.json",
+      "role": "conformance_corpus",
+      "sha256": "24d21777ee45e77fef7669965a875d0db60f700650c3d8e19065c2a4f77dcb22"
+    },
+    {
+      "id": "definition.generator",
+      "path": "proto/definition/generate.py",
+      "role": "generator",
+      "sha256": "531f031cb04d991fa9c5d09e11564441517532ca109a15a686e1ffe810ec1639"
+    },
+    {
+      "id": "source.pair_window",
+      "path": "proto/pair-window.md",
+      "role": "normative_source_document",
+      "sha256": "990e9bc902175c486544bdf0442c53e2fb31c24e59ae41787efb5f8188b01f58"
+    },
+    {
+      "id": "source.pairing",
+      "path": "proto/pairing.md",
+      "role": "normative_source_document",
+      "sha256": "214f0779a1f08c733bc4094cbbc3b29d5167ec8ab5df1491a2ed60d482ee61d4"
+    }
+  ],
+  "schema_dialect_uri": "https://json-schema.org/draft/2020-12/schema"
+}

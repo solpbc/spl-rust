@@ -1,0 +1,28 @@
+{
+  "spdx_license_identifier": "AGPL-3.0-only",
+  "adoption_schema_version": 1,
+  "consumer_identifier": "solpbc/spl-rust",
+  "authority_repository": "https://github.com/solpbc/spl",
+  "authority_commit": "2682ea2aeb589c87b5153a54576c61daff6eef7c",
+  "bundle_semver": "1.1.1",
+  "authority_manifest_path": "proto/definition/bundle/manifest.json",
+  "authority_manifest_sha256": "a5eee1cdd45bed91c0adb08c1030ae327f3587312cab23a0af6ac59155635b6f",
+  "bundle_files": [
+    {
+      "path": "definition.json",
+      "sha256": "dcc47aade990c33bfc629a392657685e3c285fb5fd25126a15d9b2f0a591d063"
+    },
+    {
+      "path": "definition.schema.json",
+      "sha256": "5ed476e9966f681ab6dfa5fb6bdc69142fed976d3bdd32216254fd61cce99f5d"
+    },
+    {
+      "path": "vectors.json",
+      "sha256": "24d21777ee45e77fef7669965a875d0db60f700650c3d8e19065c2a4f77dcb22"
+    },
+    {
+      "path": "vectors.schema.json",
+      "sha256": "3293f26b5d36f3a70d7178e230186bfae619e6d9e817157e1680fad7a51d6a66"
+    }
+  ]
+}

@@ -4,17 +4,34 @@
 # ci is the pre-commit gate and must be green before any commit.
 
 CARGO ?= cargo
+# A non-interactive shell (a CI runner, an agent session, a bare `make` over ssh)
+# does not source the shell profile that puts rustup's shims on PATH, so `cargo`
+# is simply absent and every target dies with a bare "No such file or directory".
+# Put the toolchain bin dir on PATH here rather than relying on the caller's
+# environment. Mirrors the sibling solstone-linux Makefile.
+CARGO_HOME ?= $(HOME)/.cargo
+CARGO_BIN_DIR := $(CARGO_HOME)/bin
+export PATH := $(CARGO_BIN_DIR):$(PATH)
 
-.PHONY: install test ci fmt-check clippy deny targets size format clean
+.PHONY: install test ci preflight fmt-check clippy deny targets size format clean
 
-install:
+# Fail with a repair instruction rather than a bare ENOENT from whichever target
+# happened to run first.
+preflight:
+	@command -v $(CARGO) >/dev/null 2>&1 || { \
+		echo "error: cargo not found on PATH or in $(CARGO_BIN_DIR)" >&2; \
+		echo "repair: install Rust via https://rustup.rs, or set CARGO_HOME to your toolchain root" >&2; \
+		exit 1; \
+	}
+
+install: preflight
 	@$(CARGO) fetch
 
 test:
 	@$(CARGO) test --workspace --all-targets
 
 # The full gate. Every step is fail-closed; none may be skipped to get green.
-ci: fmt-check clippy test deny targets
+ci: preflight fmt-check clippy test deny targets
 
 fmt-check:
 	@$(CARGO) fmt --all --check

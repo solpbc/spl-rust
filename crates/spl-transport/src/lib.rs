@@ -25,5 +25,293 @@
 //! DPAPI-sealed blob, or a permission-guarded file are all product decisions.
 //! Service lifecycles, retry supervision policy, and application wire types
 //! (observer ingest, linked-system provisioning) likewise belong to the consumer.
+//!
+//! # Public seams
+//!
+//! [`client::TransportClient`] owns direct-or-relay carrier establishment and
+//! accepts an optional [`client::TokenPersistHook`] for consumer-owned,
+//! best-effort relay-token persistence. [`journal_bridge::CarrierOpener`] lets a
+//! consumer combine that transport with its own authentication-header policy
+//! without exposing the carrier implementation.
 
 #![forbid(unsafe_code)]
+#![cfg_attr(
+    test,
+    expect(
+        clippy::collapsible_if,
+        clippy::expect_used,
+        clippy::large_futures,
+        clippy::match_wildcard_for_single_variants,
+        clippy::panic,
+        clippy::semicolon_if_nothing_returned,
+        clippy::similar_names,
+        clippy::unwrap_used,
+        reason = "copied transport tests use direct fixture assertions while production paths remain fallible"
+    )
+)]
+
+pub mod client;
+pub mod connection;
+pub mod credential;
+pub mod journal_bridge;
+mod journal_bridge_carrier;
+pub mod pairing;
+pub mod relay;
+pub(crate) mod relay_http;
+pub mod relay_pairing;
+pub mod relay_token;
+pub(crate) mod spki_pin;
+pub mod tls;
+
+use std::fmt;
+
+use spl_core::http::HttpError;
+use spl_core::mux::MuxError;
+use thiserror::Error;
+
+/// Typed relay upgrade and close outcomes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RelayError {
+    /// Upgrade HTTP 503; retryable.
+    HomeOffline,
+    /// Upgrade HTTP 401 or close 4401; refresh may recover it.
+    Unauthorized,
+    /// Upgrade HTTP 402 or close 4402; terminal.
+    Unpaid,
+    /// Upgrade HTTP 404; terminal.
+    UnknownInstance,
+    /// Pair-dial HTTP 401; the journal pairing window is closed or expired.
+    PairWindowClosed,
+    /// Close 1009; retryable.
+    Overflow,
+    /// Close 1006/1012 or abnormal drop; retryable by reconnecting.
+    Abnormal,
+    /// Any other unexpected upgrade HTTP status; terminal.
+    UpgradeRejected,
+    /// Inner-handshake or first-byte timeout; retryable.
+    Stalled,
+}
+
+impl fmt::Display for RelayError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let message = match self {
+            Self::HomeOffline => "home offline",
+            Self::Unauthorized => "unauthorized",
+            Self::Unpaid => "unpaid",
+            Self::UnknownInstance => "unknown instance",
+            Self::PairWindowClosed => {
+                "the pairing window is closed or expired — regenerate the link on your journal"
+            }
+            Self::Overflow => "overflow",
+            Self::Abnormal => "abnormal close",
+            Self::UpgradeRejected => "upgrade rejected",
+            Self::Stalled => "stalled",
+        };
+        formatter.write_str(message)
+    }
+}
+
+/// Relay control-plane operation rejected by the server.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RelayControlEndpoint {
+    /// Device enrollment after relay pairing.
+    EnrollDevice,
+    /// Existing device-token refresh.
+    TokenRefresh,
+}
+
+impl RelayControlEndpoint {
+    fn code(self) -> &'static str {
+        match self {
+            Self::EnrollDevice => "enroll_device",
+            Self::TokenRefresh => "refresh",
+        }
+    }
+}
+
+impl fmt::Display for RelayControlEndpoint {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.code())
+    }
+}
+
+/// Errors from SPL connection, TLS, relay, pairing, and HTTP transport.
+#[derive(Debug, Error)]
+pub enum TransportError {
+    /// Socket or stream I/O failed.
+    #[error("io error: {0}")]
+    Io(#[from] std::io::Error),
+    /// TLS configuration or handshake failed.
+    #[error("tls error: {0}")]
+    Tls(String),
+    /// Cryptographic material or verification failed.
+    #[error("crypto error: {0}")]
+    Crypto(String),
+    /// SPL multiplexer framing failed.
+    #[error("mux error: {0}")]
+    Mux(#[from] MuxError),
+    /// HTTP-over-SPL parsing failed.
+    #[error("http error: {0}")]
+    Http(#[from] HttpError),
+    /// JSON serialization or deserialization failed.
+    #[error("json error: {0}")]
+    Json(#[from] serde_json::Error),
+    /// Pair-link parsing or admission failed.
+    #[error("pair-link error: {0}")]
+    PairLink(String),
+    /// Pairing ceremony validation failed.
+    #[error("pairing failed: {0}")]
+    Pairing(String),
+    /// The application endpoint rejected a request.
+    #[error("server rejected request: HTTP {status} {body}")]
+    Rejected {
+        /// HTTP response status.
+        status: u16,
+        /// Response summary retained for presentation, never logging.
+        body: String,
+    },
+    /// Relay data-plane failure.
+    #[error("relay error: {0}")]
+    Relay(RelayError),
+    /// Relay control-plane request was rejected.
+    #[error("relay control {endpoint} rejected request: HTTP {status}")]
+    RelayControlRejected {
+        /// Control operation that was rejected.
+        endpoint: RelayControlEndpoint,
+        /// HTTP response status.
+        status: u16,
+    },
+    /// No direct or relay endpoint is available.
+    #[error("no reachable journal endpoint")]
+    NoEndpoint,
+    /// Consumer authentication has not been configured.
+    #[error("not paired")]
+    NotPaired,
+    /// Local offset lookup failed.
+    #[error("local offset lookup failed")]
+    LocalOffset,
+}
+
+/// Return a stable, secret-free diagnostic code for a transport error.
+pub fn transport_error_code(error: &TransportError) -> String {
+    match error {
+        TransportError::Io(_) => "io".to_string(),
+        TransportError::Tls(_) => "tls".to_string(),
+        TransportError::Crypto(_) => "crypto".to_string(),
+        TransportError::Mux(_) => "mux".to_string(),
+        TransportError::Http(_) => "http".to_string(),
+        TransportError::Json(_) => "json".to_string(),
+        TransportError::PairLink(_) => "pair_link".to_string(),
+        TransportError::Pairing(_) => "pairing".to_string(),
+        TransportError::Rejected { status, body: _ } => format!("http_{status}"),
+        TransportError::Relay(relay) => match relay {
+            RelayError::HomeOffline => "relay_home_offline",
+            RelayError::Unauthorized => "relay_unauthorized",
+            RelayError::Unpaid => "relay_unpaid",
+            RelayError::UnknownInstance => "relay_unknown_instance",
+            RelayError::PairWindowClosed => "relay_pair_window_closed",
+            RelayError::Overflow => "relay_overflow",
+            RelayError::Abnormal => "relay_abnormal",
+            RelayError::UpgradeRejected => "relay_upgrade_rejected",
+            RelayError::Stalled => "relay_stalled",
+        }
+        .to_string(),
+        TransportError::RelayControlRejected { endpoint, status } => {
+            format!("relay_{}_http_{status}", endpoint.code())
+        }
+        TransportError::NoEndpoint => "no_endpoint".to_string(),
+        TransportError::NotPaired => "not_paired".to_string(),
+        TransportError::LocalOffset => "local_offset".to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn transport_error_code_maps_every_variant_without_inner_detail() {
+        let json_error = serde_json::from_str::<serde_json::Value>("{").unwrap_err();
+        let cases = [
+            (
+                TransportError::Io(std::io::Error::other("C:\\Users\\me\\seg.mp4")),
+                "io",
+            ),
+            (TransportError::Tls("10.0.0.5:7657".into()), "tls"),
+            (TransportError::Crypto("fingerprint abc".into()), "crypto"),
+            (TransportError::Mux(MuxError::Incomplete), "mux"),
+            (
+                TransportError::Http(HttpError::BadStatusLine("HTTP/1.1 SECRET".into())),
+                "http",
+            ),
+            (TransportError::Json(json_error), "json"),
+            (TransportError::PairLink("token=abc".into()), "pair_link"),
+            (TransportError::Pairing("sha256:abc".into()), "pairing"),
+            (
+                TransportError::Rejected {
+                    status: 503,
+                    body: "SECRET https://x/y?token=abc C:\\Users\\me\\seg.mp4".into(),
+                },
+                "http_503",
+            ),
+            (
+                TransportError::Relay(RelayError::HomeOffline),
+                "relay_home_offline",
+            ),
+            (
+                TransportError::Relay(RelayError::Unauthorized),
+                "relay_unauthorized",
+            ),
+            (TransportError::Relay(RelayError::Unpaid), "relay_unpaid"),
+            (
+                TransportError::Relay(RelayError::UnknownInstance),
+                "relay_unknown_instance",
+            ),
+            (
+                TransportError::Relay(RelayError::PairWindowClosed),
+                "relay_pair_window_closed",
+            ),
+            (
+                TransportError::Relay(RelayError::Overflow),
+                "relay_overflow",
+            ),
+            (
+                TransportError::Relay(RelayError::Abnormal),
+                "relay_abnormal",
+            ),
+            (
+                TransportError::Relay(RelayError::UpgradeRejected),
+                "relay_upgrade_rejected",
+            ),
+            (TransportError::Relay(RelayError::Stalled), "relay_stalled"),
+            (
+                TransportError::RelayControlRejected {
+                    endpoint: RelayControlEndpoint::EnrollDevice,
+                    status: 409,
+                },
+                "relay_enroll_device_http_409",
+            ),
+            (
+                TransportError::RelayControlRejected {
+                    endpoint: RelayControlEndpoint::TokenRefresh,
+                    status: 404,
+                },
+                "relay_refresh_http_404",
+            ),
+            (TransportError::NoEndpoint, "no_endpoint"),
+            (TransportError::NotPaired, "not_paired"),
+            (TransportError::LocalOffset, "local_offset"),
+        ];
+
+        for (error, expected) in cases {
+            let code = transport_error_code(&error);
+            assert_eq!(code, expected);
+            assert!(!code.contains("SECRET"));
+            assert!(!code.contains("token"));
+            assert!(!code.contains("Users"));
+            assert!(!code.contains("https://"));
+            assert!(!code.contains("sha256:"));
+            assert!(!code.contains("10.0.0.5"));
+        }
+    }
+}

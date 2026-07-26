@@ -40,6 +40,7 @@ spl-core = { path = "crates/spl-core", version = "0.1.0" }
 # consumer, no aws-lc-rs C toolchain in the graph); the smaller binary is a
 # consequence, not the reason.
 base64 = { version = "0.22", default-features = false, features = ["std"] }
+futures-util = { version = "0.3", default-features = false, features = ["sink"] }
 hkdf = "0.12"
 rcgen = { version = "0.13", default-features = false, features = ["ring", "pem"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }

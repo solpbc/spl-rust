@@ -1,0 +1,19 @@
+[package]
+name = "spl-core"
+description = "Pure SPL (solstone private link) wire protocol: pair-link parsing and direct-address admission, mux framing and flow control, HTTP-over-SPL, CA-fingerprint pinning, and the pair-window/journal-identity derivations. No I/O, no platform dependency, host-testable."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+base64 = { workspace = true }
+hkdf = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+thiserror = { workspace = true }

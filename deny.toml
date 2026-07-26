@@ -1,0 +1,74 @@
+[licenses]
+# Protects Rust crates from unreviewed license drift while allowing approved licenses.
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "Unicode-3.0",
+    "AGPL-3.0-only",
+    # via webpki-roots (the Mozilla CA bundle; permissive data license). Already
+    # allowed on the same rationale in the shipping Windows client — the fleet
+    # baseline, not a new interpretation.
+    "CDLA-Permissive-2.0",
+]
+
+[bans]
+# Protects against third-party wildcard requirements while allowing unpublished
+# internal path crates, and bans Python runtime bindings.
+wildcards = "deny"
+allow-wildcard-paths = true
+multiple-versions = "warn"
+
+# ── The data covenant, encoded ───────────────────────────────────────────────
+# solstone never ships analytics, telemetry, behavioral tracking, crash
+# reporting, or phone-home. Prose in a guide is not a gate; these crates are
+# banned at the dependency-graph level so a *transitive* pull-in fails `make ci`
+# rather than reaching a shipped product. Mirrors the shipping Windows client's
+# list — keep the two aligned.
+deny = [
+    # Python runtime bindings — this library never links an interpreter.
+    { name = "pyo3" },
+    { name = "pyo3-ffi" },
+    { name = "cpython" },
+    # crash reporters / error-tracking SaaS
+    { name = "sentry" },
+    { name = "sentry-core" },
+    { name = "sentry-types" },
+    { name = "rollbar" },
+    { name = "bugsnag" },
+    { name = "honeycomb" },
+    # product / behavioral analytics SDKs
+    { name = "segment" },
+    { name = "analytics" },
+    { name = "amplitude" },
+    { name = "mixpanel" },
+    { name = "posthog" },
+    { name = "posthog-rs" },
+    { name = "rudderanalytics" },
+    { name = "google-analytics" },
+    { name = "ga4" },
+    { name = "datadog" },
+    { name = "datadog-apm" },
+    { name = "opentelemetry-datadog" },
+    { name = "newrelic" },
+    { name = "appcenter" },
+]
+
+[graph]
+# Every target a consuming product ships on. A dependency that does not resolve
+# for one of these is a break discovered here, not at adoption time.
+targets = [
+    "x86_64-unknown-linux-gnu",
+    "aarch64-unknown-linux-gnu",
+    "aarch64-apple-darwin",
+    "x86_64-pc-windows-msvc",
+]
+
+[sources]
+# Protects Rust dependencies from unapproved registries.
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

@@ -1,0 +1,30 @@
+[package]
+name = "spl-transport"
+description = "SPL client transport: CA-fingerprint-pinned mutual TLS over a direct LAN dial or a WebSocket relay, the mux carrier, and the local loopback proxy. Drives spl-core's pure wire over rustls; cross-platform and host-testable."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+spl-core = { workspace = true }
+base64 = { workspace = true }
+rcgen = { workspace = true }
+rustls = { workspace = true }
+rustls-webpki = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["net", "io-util", "rt", "macros", "time", "sync"] }
+tokio-rustls = { workspace = true }
+tokio-tungstenite = { workspace = true }
+tracing = { workspace = true }
+webpki-roots = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "io-util", "time", "sync", "test-util"] }
+rcgen = { workspace = true, features = ["x509-parser"] }

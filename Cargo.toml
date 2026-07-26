@@ -1,0 +1,49 @@
+[workspace]
+members = ["crates/spl-core", "crates/spl-transport"]
+resolver = "3"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+# The MSRV floor is the LOWEST consuming product's toolchain, not the newest
+# available one. Raising it silently breaks a consumer's build.
+rust-version = "1.95"
+license = "AGPL-3.0-only"
+repository = "https://github.com/solpbc/spl-rust"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+future_incompatible = { level = "deny", priority = -1 }
+missing_docs = "warn"
+
+[workspace.lints.clippy]
+all = { level = "deny", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+dbg_macro = "deny"
+todo = "deny"
+unimplemented = "deny"
+panic = "warn"
+unwrap_used = "warn"
+expect_used = "warn"
+
+[workspace.dependencies]
+spl-core = { path = "crates/spl-core", version = "0.1.0" }
+# Crypto/transport pins mirror the configuration the shipping Windows client
+# already runs: the `ring` provider with default features off. This is a
+# correctness-and-review-surface choice first (one audited provider across every
+# consumer, no aws-lc-rs C toolchain in the graph); the smaller binary is a
+# consequence, not the reason.
+base64 = { version = "0.22", default-features = false, features = ["std"] }
+hkdf = "0.12"
+rcgen = { version = "0.13", default-features = false, features = ["ring", "pem"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+rustls-webpki = { version = "0.103", default-features = false, features = ["ring", "std"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+thiserror = "2"
+tokio = { version = "1", default-features = false }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
+tokio-tungstenite = { version = "0.26", default-features = false, features = ["connect", "__rustls-tls"] }
+tracing = "0.1"
+webpki-roots = "1"

@@ -1,0 +1,9 @@
+/target
+**/*.rs.bk
+*.pdb
+
+# Libraries do not commit a lockfile; consumers own resolution.
+Cargo.lock
+
+# local
+.env

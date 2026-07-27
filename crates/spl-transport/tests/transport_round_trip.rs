@@ -28,7 +28,7 @@ use rcgen::{
 };
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use rustls::{ClientConfig, ServerConfig};
-use spl_core::bridge::BridgeNames;
+use spl_core::bridge::{BridgeNames, RequestHeaderPolicy};
 use spl_core::frame::{
     FLAG_CLOSE, FLAG_DATA, FLAG_RESET, FLAG_WINDOW, Frame, FrameDecoder, RESET_CANCEL,
 };
@@ -39,7 +39,9 @@ use spl_transport::TransportError;
 use spl_transport::client::{DialedCarrier, TransportClient};
 use spl_transport::connection::request_once;
 use spl_transport::credential::{Credential, EndpointAddr};
-use spl_transport::journal_bridge::{self, CarrierOpener, JournalBridgeConfig};
+use spl_transport::journal_bridge::{
+    self, BridgePolicy, CapabilityGate, CarrierOpener, JournalBridgeConfig,
+};
 use spl_transport::pairing::{
     DirectPairPrepareFuture, DirectPairSendFuture, DirectPairingSeam, PreparedDirectPairConnection,
 };
@@ -414,6 +416,13 @@ fn neutral_bridge_names() -> BridgeNames {
 }
 
 async fn start_bridge(credential: Credential) -> journal_bridge::JournalBridgeHandle {
+    start_bridge_with_policy(credential, BridgePolicy::default()).await
+}
+
+async fn start_bridge_with_policy(
+    credential: Credential,
+    policy: BridgePolicy,
+) -> journal_bridge::JournalBridgeHandle {
     let endpoint_hosts = credential
         .endpoints
         .iter()
@@ -424,6 +433,7 @@ async fn start_bridge(credential: Credential) -> journal_bridge::JournalBridgeHa
         opener: Arc::new(TestOpener { client }),
         bridge_names: neutral_bridge_names(),
         endpoint_hosts,
+        policy,
     })
     .await
     .unwrap()
@@ -432,6 +442,7 @@ async fn start_bridge(credential: Credential) -> journal_bridge::JournalBridgeHa
 fn capability_from(handle: &journal_bridge::JournalBridgeHandle) -> String {
     handle
         .bootstrap_url()
+        .expect("default bridge has capability")
         .split_once("cap=")
         .map(|(_, cap)| cap.to_string())
         .unwrap()
@@ -548,11 +559,23 @@ impl PersistentBridgeServer {
     }
 
     fn send_sse_head(&self, stream_id: u32) {
-        self.send_frame(
+        self.send_stream_head(
             stream_id,
-            FLAG_DATA,
-            b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\r\n",
+            "200 OK",
+            &[("Content-Type", "text/event-stream")],
         );
+    }
+
+    fn send_stream_head(&self, stream_id: u32, status: &str, headers: &[(&str, &str)]) {
+        let mut response = format!("HTTP/1.1 {status}\r\n");
+        for (name, value) in headers {
+            response.push_str(name);
+            response.push_str(": ");
+            response.push_str(value);
+            response.push_str("\r\n");
+        }
+        response.push_str("\r\n");
+        self.send_frame(stream_id, FLAG_DATA, response.as_bytes());
     }
 
     fn send_body(&self, stream_id: u32, body: &[u8]) {
@@ -589,6 +612,12 @@ impl PersistentBridgeServer {
 
 async fn start_bridge_with_persistent_server()
 -> (journal_bridge::JournalBridgeHandle, PersistentBridgeServer) {
+    start_bridge_with_persistent_server_policy(BridgePolicy::default()).await
+}
+
+async fn start_bridge_with_persistent_server_policy(
+    policy: BridgePolicy,
+) -> (journal_bridge::JournalBridgeHandle, PersistentBridgeServer) {
     let (cert, key) = self_signed();
     let pin = spl_core::ca::sha256(cert.as_ref())[..16].to_vec();
     let acceptor = TlsAcceptor::from(Arc::new(server_config(cert, key)));
@@ -665,7 +694,7 @@ async fn start_bridge_with_persistent_server()
             }
         }
     });
-    let handle = start_bridge(transport_credential(pin, upstream_port)).await;
+    let handle = start_bridge_with_policy(transport_credential(pin, upstream_port), policy).await;
     (
         handle,
         PersistentBridgeServer {
@@ -689,6 +718,30 @@ async fn raw_bridge_request(
     let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", port))
         .await
         .unwrap();
+    write_bridge_request(
+        &mut stream,
+        method,
+        target,
+        host,
+        cookie,
+        extra_headers,
+        body,
+    )
+    .await;
+    let mut response = Vec::new();
+    stream.read_to_end(&mut response).await.unwrap();
+    response
+}
+
+async fn write_bridge_request(
+    stream: &mut tokio::net::TcpStream,
+    method: &str,
+    target: &str,
+    host: Option<String>,
+    cookie: Option<String>,
+    extra_headers: &[(&str, &str)],
+    body: &[u8],
+) {
     let mut request = format!("{method} {target} HTTP/1.1\r\n");
     if let Some(host) = host {
         request.push_str("Host: ");
@@ -717,9 +770,54 @@ async fn raw_bridge_request(
         stream.write_all(body).await.unwrap();
     }
     stream.flush().await.unwrap();
-    let mut response = Vec::new();
-    stream.read_to_end(&mut response).await.unwrap();
-    response
+}
+
+struct PartialBridgeResponse {
+    stream: tokio::net::TcpStream,
+    received: Vec<u8>,
+}
+
+async fn partial_bridge_request(
+    port: u16,
+    method: &str,
+    target: &str,
+    host: Option<String>,
+    body: &[u8],
+    first_marker: &[u8],
+) -> PartialBridgeResponse {
+    const RESPONSE_BOUND: usize = 64 * 1024;
+
+    let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", port))
+        .await
+        .unwrap();
+    write_bridge_request(&mut stream, method, target, host, None, &[], body).await;
+
+    let mut received = Vec::new();
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let head_arrived = received.windows(4).any(|window| window == b"\r\n\r\n");
+            let marker_arrived = received
+                .windows(first_marker.len())
+                .any(|window| window == first_marker);
+            if head_arrived && marker_arrived {
+                break;
+            }
+            assert!(
+                received.len() < RESPONSE_BOUND,
+                "partial response exceeded read bound"
+            );
+            let mut buf = [0u8; 256];
+            let remaining = RESPONSE_BOUND - received.len();
+            let read_bound = remaining.min(buf.len());
+            let read = stream.read(&mut buf[..read_bound]).await.unwrap();
+            assert!(read > 0, "response closed before first streamed chunk");
+            received.extend_from_slice(&buf[..read]);
+        }
+    })
+    .await
+    .expect("timed out waiting for first streamed response chunk");
+
+    PartialBridgeResponse { stream, received }
 }
 
 fn loopback_host(port: u16) -> String {
@@ -1220,6 +1318,176 @@ async fn journal_bridge_authority_rejects_before_upstream() {
 }
 
 #[tokio::test]
+async fn journal_bridge_disabled_gate_forwards_without_cookie_and_allows_put() {
+    let policy = BridgePolicy {
+        capability_gate: CapabilityGate::Disabled,
+        ..BridgePolicy::default()
+    };
+    let (handle, mut server) = start_bridge_with_persistent_server_policy(policy).await;
+    assert_eq!(handle.bootstrap_url(), None);
+    let port = handle.port();
+    let response = tokio::spawn(raw_bridge_request(
+        port,
+        "PUT",
+        "/objects/7",
+        Some(loopback_host(port)),
+        None,
+        &[],
+        b"replacement",
+    ));
+
+    let request = server.next_request().await;
+    let request_text = String::from_utf8_lossy(&request.bytes);
+    assert!(request_text.starts_with("PUT /objects/7 HTTP/1.1\r\n"));
+    assert!(request_text.ends_with("\r\n\r\nreplacement"));
+    server.send_http(request.stream_id, "200 OK", b"updated");
+
+    let response = response.await.unwrap();
+    assert_eq!(response_status(&response), 200);
+    assert_eq!(response_body(&response), "updated");
+    handle.shutdown_and_wait().await;
+    server.abort();
+}
+
+#[tokio::test]
+async fn journal_bridge_disabled_gate_forwards_bootstrap_path_upstream() {
+    let policy = BridgePolicy {
+        capability_gate: CapabilityGate::Disabled,
+        ..BridgePolicy::default()
+    };
+    let (handle, mut server) = start_bridge_with_persistent_server_policy(policy).await;
+    let port = handle.port();
+    let target = format!("{}?cap=unused", spl_core::bridge::BOOTSTRAP_ROUTE);
+    let host = loopback_host(port);
+    let response = tokio::spawn(async move {
+        raw_bridge_request(port, "GET", &target, Some(host), None, &[], b"").await
+    });
+
+    let request = server.next_request().await;
+    assert!(
+        String::from_utf8_lossy(&request.bytes).starts_with(&format!(
+            "GET {}?cap=unused HTTP/1.1\r\n",
+            spl_core::bridge::BOOTSTRAP_ROUTE
+        ))
+    );
+    server.send_http(request.stream_id, "404 Not Found", b"upstream route");
+
+    let response = response.await.unwrap();
+    assert_eq!(response_status(&response), 404);
+    assert_eq!(response_body(&response), "upstream route");
+    handle.shutdown_and_wait().await;
+    server.abort();
+}
+
+#[tokio::test]
+async fn journal_bridge_disabled_gate_still_rejects_wrong_host() {
+    let policy = BridgePolicy {
+        capability_gate: CapabilityGate::Disabled,
+        ..BridgePolicy::default()
+    };
+    let (handle, server) = start_bridge_with_persistent_server_policy(policy).await;
+    let port = handle.port();
+
+    let response = raw_bridge_request(
+        port,
+        "DELETE",
+        "/objects/7",
+        Some(loopback_host(port ^ 1)),
+        None,
+        &[],
+        b"",
+    )
+    .await;
+
+    assert_eq!(response_status(&response), 403);
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    assert_eq!(server.accepted_carriers(), 0);
+    handle.shutdown_and_wait().await;
+    server.abort();
+}
+
+#[tokio::test]
+async fn journal_bridge_custom_request_body_bound_rejects_oversize_body() {
+    let policy = BridgePolicy {
+        capability_gate: CapabilityGate::Disabled,
+        max_request_body_bytes: 3,
+        ..BridgePolicy::default()
+    };
+    let (handle, server) = start_bridge_with_persistent_server_policy(policy).await;
+    let port = handle.port();
+
+    let response = raw_bridge_request(
+        port,
+        "POST",
+        "/objects",
+        Some(loopback_host(port)),
+        None,
+        &[],
+        b"four",
+    )
+    .await;
+
+    assert!(response.is_empty());
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    assert_eq!(server.accepted_carriers(), 0);
+    handle.shutdown_and_wait().await;
+    server.abort();
+}
+
+#[tokio::test]
+async fn journal_bridge_forward_all_forwards_custom_and_strips_reserved_headers() {
+    let policy = BridgePolicy {
+        capability_gate: CapabilityGate::Disabled,
+        request_headers: RequestHeaderPolicy::ForwardAll,
+        ..BridgePolicy::default()
+    };
+    let (handle, mut server) = start_bridge_with_persistent_server_policy(policy).await;
+    let port = handle.port();
+    let response = tokio::spawn(raw_bridge_request(
+        port,
+        "PATCH",
+        "/objects/7",
+        Some(loopback_host(port)),
+        None,
+        &[
+            ("X-Custom-Request", "forward me"),
+            ("Authorization", "Bearer caller"),
+            (TEST_OBSERVER_HEADER_NAME, "caller"),
+            (TEST_PROTOCOL_HEADER_NAME, "caller"),
+            ("Connection", "keep-alive"),
+        ],
+        b"patch",
+    ));
+
+    let request = server.next_request().await;
+    let request_text = String::from_utf8_lossy(&request.bytes).to_ascii_lowercase();
+    assert!(request_text.contains("x-custom-request: forward me\r\n"));
+    assert_eq!(request_text.matches("authorization:").count(), 1);
+    assert_eq!(
+        request_text
+            .matches(&format!("{TEST_OBSERVER_HEADER_NAME}:"))
+            .count(),
+        1
+    );
+    assert_eq!(
+        request_text
+            .matches(&format!("{TEST_PROTOCOL_HEADER_NAME}:"))
+            .count(),
+        1
+    );
+    assert_eq!(request_text.matches("host:").count(), 1);
+    assert!(request_text.contains("host: spl.local\r\n"));
+    assert_eq!(request_text.matches("content-length:").count(), 1);
+    assert!(!request_text.contains("connection:"));
+    server.send_http(request.stream_id, "204 No Content", b"");
+
+    let response = response.await.unwrap();
+    assert_eq!(response_status(&response), 204);
+    handle.shutdown_and_wait().await;
+    server.abort();
+}
+
+#[tokio::test]
 async fn journal_bridge_buffered_pass_through_injects_auth_and_strips_local_headers() {
     let (handle, upstream) = start_bridge_with_response("200 OK", b"bridge ok").await;
     let port = handle.port();
@@ -1337,6 +1605,108 @@ async fn journal_bridge_sse_streams_without_local_framing_headers() {
 
     let _ = upstream.await.unwrap();
     handle.shutdown_and_wait().await;
+}
+
+#[tokio::test]
+async fn journal_bridge_selected_stream_arrives_incrementally() {
+    let policy = BridgePolicy {
+        capability_gate: CapabilityGate::Disabled,
+        stream_response: Arc::new(|head| head.path() == "/downloads/archive"),
+        ..BridgePolicy::default()
+    };
+    let (handle, mut server) = start_bridge_with_persistent_server_policy(policy).await;
+    let port = handle.port();
+    let client = tokio::spawn(partial_bridge_request(
+        port,
+        "PUT",
+        "/downloads/archive",
+        Some(loopback_host(port)),
+        b"upload request",
+        b"first chunk",
+    ));
+
+    let request = server.next_request().await;
+    let request_text = String::from_utf8_lossy(&request.bytes);
+    assert!(request_text.starts_with("PUT /downloads/archive HTTP/1.1\r\n"));
+    assert!(request_text.ends_with("\r\n\r\nupload request"));
+    server.send_stream_head(
+        request.stream_id,
+        "200 OK",
+        &[("Content-Type", "application/octet-stream")],
+    );
+    server.send_body(request.stream_id, b"first chunk");
+
+    let mut partial = client.await.unwrap();
+    assert!(response_body(&partial.received).contains("first chunk"));
+
+    let mut probe = [0u8; 256];
+    let early_second = tokio::time::timeout(
+        std::time::Duration::from_millis(100),
+        partial.stream.read(&mut probe),
+    )
+    .await;
+    assert!(
+        early_second.is_err(),
+        "second response chunk arrived before the upstream sent it"
+    );
+
+    server.send_body(request.stream_id, b"second chunk");
+    server.close_stream(request.stream_id);
+    let mut remaining = Vec::new();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        partial.stream.read_to_end(&mut remaining),
+    )
+    .await
+    .expect("timed out waiting for streamed response close")
+    .unwrap();
+    partial.received.extend_from_slice(&remaining);
+    assert_eq!(response_body(&partial.received), "first chunksecond chunk");
+
+    handle.shutdown_and_wait().await;
+    server.abort();
+}
+
+#[tokio::test]
+async fn journal_bridge_selected_streaming_head_preserves_length_without_body() {
+    let policy = BridgePolicy {
+        capability_gate: CapabilityGate::Disabled,
+        stream_response: Arc::new(|head| head.method == "HEAD"),
+        ..BridgePolicy::default()
+    };
+    let (handle, mut server) = start_bridge_with_persistent_server_policy(policy).await;
+    let port = handle.port();
+    let response = tokio::spawn(raw_bridge_request(
+        port,
+        "HEAD",
+        "/downloads/archive",
+        Some(loopback_host(port)),
+        None,
+        &[],
+        b"",
+    ));
+
+    let request = server.next_request().await;
+    assert!(
+        String::from_utf8_lossy(&request.bytes).starts_with("HEAD /downloads/archive HTTP/1.1\r\n")
+    );
+    server.send_stream_head(
+        request.stream_id,
+        "200 OK",
+        &[
+            ("Content-Type", "application/octet-stream"),
+            ("Content-Length", "42"),
+        ],
+    );
+    server.send_body(request.stream_id, b"not written locally");
+    server.close_stream(request.stream_id);
+
+    let response = response.await.unwrap();
+    assert_eq!(response_status(&response), 200);
+    assert_eq!(response_body(&response), "");
+    assert!(response_head(&response).contains("content-length: 42"));
+    handle.shutdown_and_wait().await;
+    server.abort();
 }
 
 #[tokio::test]

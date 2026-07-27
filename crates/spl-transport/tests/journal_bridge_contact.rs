@@ -16,7 +16,7 @@ use std::time::Duration;
 use spl_core::bridge::BridgeNames;
 use spl_transport::TransportError;
 use spl_transport::client::DialedCarrier;
-use spl_transport::journal_bridge::{self, CarrierOpener, JournalBridgeConfig};
+use spl_transport::journal_bridge::{self, BridgePolicy, CarrierOpener, JournalBridgeConfig};
 
 struct InertOpener;
 
@@ -50,6 +50,7 @@ async fn contacted_flips_on_first_accept_before_http_parse() {
         opener: Arc::new(InertOpener),
         bridge_names: neutral_bridge_names(),
         endpoint_hosts: vec!["127.0.0.1".into()],
+        policy: BridgePolicy::default(),
     })
     .await
     .expect("bridge start");
@@ -80,4 +81,38 @@ async fn contacted_flips_on_first_accept_before_http_parse() {
 
     drop(stream);
     handle.begin_shutdown();
+}
+
+#[tokio::test]
+async fn fixed_port_binds_only_ipv4_loopback() {
+    let probe = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .expect("reserve fixed port");
+    let port = probe.local_addr().expect("probe address").port();
+    drop(probe);
+
+    let policy = BridgePolicy {
+        port,
+        ..BridgePolicy::default()
+    };
+    let handle = journal_bridge::start(JournalBridgeConfig {
+        opener: Arc::new(InertOpener),
+        bridge_names: neutral_bridge_names(),
+        endpoint_hosts: vec!["127.0.0.1".into()],
+        policy,
+    })
+    .await
+    .expect("bridge start");
+
+    assert_eq!(handle.port(), port);
+    let stream = tokio::net::TcpStream::connect(("127.0.0.1", port))
+        .await
+        .expect("connect to fixed bridge port");
+    assert_eq!(
+        stream.peer_addr().expect("bridge peer address"),
+        std::net::SocketAddr::from(([127, 0, 0, 1], port))
+    );
+
+    drop(stream);
+    handle.shutdown_and_wait().await;
 }

@@ -34,7 +34,7 @@ use spl_core::http::HttpResponse;
 use spl_core::mux::INITIAL_WINDOW;
 use spl_transport::client::{DialedCarrier, TokenPersistHook, TransportClient};
 use spl_transport::credential::{Credential, EndpointAddr};
-use spl_transport::journal_bridge::{self, CarrierOpener, JournalBridgeConfig};
+use spl_transport::journal_bridge::{self, BridgePolicy, CarrierOpener, JournalBridgeConfig};
 use spl_transport::relay::{dial_relay_ws, request_once_over_ws, request_once_relay};
 use spl_transport::tls::pairing_config;
 use spl_transport::{RelayError, TransportError, transport_error_code};
@@ -210,6 +210,7 @@ async fn start_relay_bridge(
         opener: Arc::new(TestOpener { client }),
         bridge_names: neutral_bridge_names(),
         endpoint_hosts: vec!["127.0.0.1".into()],
+        policy: BridgePolicy::default(),
     })
     .await
     .unwrap()
@@ -218,6 +219,7 @@ async fn start_relay_bridge(
 fn capability_from(handle: &journal_bridge::JournalBridgeHandle) -> String {
     handle
         .bootstrap_url()
+        .expect("default bridge has capability")
         .split_once("cap=")
         .map(|(_, cap)| cap.to_string())
         .unwrap()

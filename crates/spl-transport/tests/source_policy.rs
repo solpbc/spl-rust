@@ -35,6 +35,33 @@ fn library_sources_exclude_consumer_crates() -> Result<(), Box<dyn Error>> {
 }
 
 #[test]
+fn tcp_listener_binds_use_literal_ipv4_loopback() -> Result<(), Box<dyn Error>> {
+    let source_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let needle = "TcpListener::bind(";
+    let expected = "(\"127.0.0.1\"";
+    let mut occurrence_count = 0;
+
+    for path in rust_sources(&source_root)? {
+        let source = fs::read_to_string(&path)?;
+        for (index, _) in source.match_indices(needle) {
+            occurrence_count += 1;
+            let following = &source[index + needle.len()..];
+            assert!(
+                following.starts_with(expected),
+                "TCP listener bind must use literal IPv4 loopback in {}",
+                path.display()
+            );
+        }
+    }
+
+    assert!(
+        occurrence_count > 0,
+        "expected at least one TCP listener bind in transport sources"
+    );
+    Ok(())
+}
+
+#[test]
 fn manifest_paths_remain_inside_workspace() -> Result<(), Box<dyn Error>> {
     let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
     let workspace_root = fs::canonicalize(manifest_dir.join("../.."))?;

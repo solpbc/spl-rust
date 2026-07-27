@@ -28,17 +28,6 @@ pub struct BridgeNames {
     pub protocol_version_header_name: String,
 }
 
-const REQUEST_ALLOWLIST: &[&str] = &[
-    "accept",
-    "accept-language",
-    "content-type",
-    "cache-control",
-    "if-none-match",
-    "if-modified-since",
-    "range",
-    "user-agent",
-];
-
 const HOP_BY_HOP: &[&str] = &[
     "connection",
     "keep-alive",
@@ -49,6 +38,15 @@ const HOP_BY_HOP: &[&str] = &[
     "transfer-encoding",
     "upgrade",
 ];
+
+/// Policy for selecting non-cookie request headers to forward upstream.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RequestHeaderPolicy {
+    /// Forward only headers whose names match one of the supplied names.
+    Allow(Vec<String>),
+    /// Forward every header except those reserved by the bridge.
+    ForwardAll,
+}
 
 /// Parsed request-line and headers used by bridge authorization and rewrites.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -192,19 +190,63 @@ pub fn authorize(
     port: u16,
     names: &BridgeNames,
 ) -> Result<(), RejectReason> {
+    check_loopback_host(head, port)?;
+    check_method(head)?;
+    check_caller_auth(head, names)?;
+    check_capability_cookie(head, expected_cap, names)
+}
+
+/// Require the exact IPv4 loopback host and listener port.
+///
+/// # Errors
+///
+/// Returns [`RejectReason::BadHost`] when the first `Host` header does not
+/// exactly match `127.0.0.1:{port}`.
+pub fn check_loopback_host(head: &RequestHead, port: u16) -> Result<(), RejectReason> {
     let expected_host = format!("127.0.0.1:{port}");
     if head.host() != Some(expected_host.as_str()) {
         return Err(RejectReason::BadHost);
     }
+    Ok(())
+}
 
+/// Require a method supported by the capability-gated bridge.
+///
+/// # Errors
+///
+/// Returns [`RejectReason::BadMethod`] unless the method is `GET`, `HEAD`, or
+/// `POST`.
+pub fn check_method(head: &RequestHead) -> Result<(), RejectReason> {
     if !matches!(head.method.as_str(), "GET" | "HEAD" | "POST") {
         return Err(RejectReason::BadMethod);
     }
+    Ok(())
+}
 
+/// Reject caller-owned authentication headers at the bridge boundary.
+///
+/// # Errors
+///
+/// Returns [`RejectReason::CallerAuth`] when a caller supplies
+/// `Authorization` or either configured reserved header.
+pub fn check_caller_auth(head: &RequestHead, names: &BridgeNames) -> Result<(), RejectReason> {
     if head.has_caller_auth(names) {
         return Err(RejectReason::CallerAuth);
     }
+    Ok(())
+}
 
+/// Require the configured capability cookie using constant-time comparison.
+///
+/// # Errors
+///
+/// Returns [`RejectReason::BadCapability`] when the capability cookie is
+/// absent or does not match.
+pub fn check_capability_cookie(
+    head: &RequestHead,
+    expected_cap: &[u8],
+    names: &BridgeNames,
+) -> Result<(), RejectReason> {
     match head.cookie(&names.capability_cookie_name) {
         Some(cap) if ct_eq(cap.as_bytes(), expected_cap) => Ok(()),
         _ => Err(RejectReason::BadCapability),
@@ -223,7 +265,11 @@ pub fn ct_eq(a: &[u8], b: &[u8]) -> bool {
 }
 
 /// Select request headers safe to forward and restore configured upstream cookies.
-pub fn upstream_request_headers(head: &RequestHead, names: &BridgeNames) -> Vec<(String, String)> {
+pub fn upstream_request_headers(
+    head: &RequestHead,
+    names: &BridgeNames,
+    policy: &RequestHeaderPolicy,
+) -> Vec<(String, String)> {
     let mut out = Vec::new();
     for (name, value) in &head.headers {
         if name == "cookie" {
@@ -232,11 +278,31 @@ pub fn upstream_request_headers(head: &RequestHead, names: &BridgeNames) -> Vec<
             }
             continue;
         }
-        if REQUEST_ALLOWLIST.contains(&name.as_str()) {
+        if is_reserved_request_header(name, names) {
+            continue;
+        }
+        let allowed = match policy {
+            RequestHeaderPolicy::Allow(names) => names
+                .iter()
+                .any(|allowed| name.eq_ignore_ascii_case(allowed)),
+            RequestHeaderPolicy::ForwardAll => true,
+        };
+        if allowed {
             out.push((name.clone(), value.clone()));
         }
     }
     out
+}
+
+fn is_reserved_request_header(name: &str, names: &BridgeNames) -> bool {
+    name.eq_ignore_ascii_case("authorization")
+        || name.eq_ignore_ascii_case(&names.observer_header_name)
+        || name.eq_ignore_ascii_case(&names.protocol_version_header_name)
+        || name.eq_ignore_ascii_case("host")
+        || name.eq_ignore_ascii_case("content-length")
+        || HOP_BY_HOP
+            .iter()
+            .any(|reserved| name.eq_ignore_ascii_case(reserved))
 }
 
 fn upstream_cookie_header(value: &str, names: &BridgeNames) -> Option<String> {
@@ -663,7 +729,20 @@ mod tests {
             ],
         );
 
-        let headers = upstream_request_headers(&head, &names);
+        let headers = upstream_request_headers(
+            &head,
+            &names,
+            &RequestHeaderPolicy::Allow(vec![
+                "accept".to_string(),
+                "accept-language".to_string(),
+                "content-type".to_string(),
+                "cache-control".to_string(),
+                "if-none-match".to_string(),
+                "if-modified-since".to_string(),
+                "range".to_string(),
+                "user-agent".to_string(),
+            ]),
+        );
 
         assert!(headers.contains(&("accept".to_string(), "text/html".to_string())));
         assert!(headers.contains(&("accept-language".to_string(), "en-US".to_string())));
@@ -700,9 +779,67 @@ mod tests {
             &[("Cookie", "__journal_cap=secret")],
         );
 
-        let headers = upstream_request_headers(&head, &names);
+        let headers = upstream_request_headers(
+            &head,
+            &names,
+            &RequestHeaderPolicy::Allow(vec![
+                "accept".to_string(),
+                "accept-language".to_string(),
+                "content-type".to_string(),
+                "cache-control".to_string(),
+                "if-none-match".to_string(),
+                "if-modified-since".to_string(),
+                "range".to_string(),
+                "user-agent".to_string(),
+            ]),
+        );
 
         assert!(!headers.iter().any(|(name, _)| name == "cookie"));
+    }
+
+    #[test]
+    fn upstream_request_headers_forward_all_keeps_only_unreserved() {
+        let names = names();
+        let head = request(
+            "PUT",
+            "/",
+            Some("127.0.0.1:49152"),
+            &[
+                ("X-Custom", "forwarded"),
+                ("Authorization", "Bearer caller"),
+                ("X-Solstone-Observer", "caller"),
+                ("X-Solstone-Protocol-Version", "caller"),
+                ("Content-Length", "4"),
+                ("Connection", "close"),
+                ("Transfer-Encoding", "chunked"),
+            ],
+        );
+
+        let headers = upstream_request_headers(&head, &names, &RequestHeaderPolicy::ForwardAll);
+
+        assert_eq!(
+            headers,
+            vec![("x-custom".to_string(), "forwarded".to_string())]
+        );
+    }
+
+    #[test]
+    fn upstream_request_headers_empty_cookie_prefix_forwards_non_capability_cookies() {
+        let mut names = names();
+        names.upstream_cookie_prefix.clear();
+        let head = request(
+            "GET",
+            "/",
+            Some("127.0.0.1:49152"),
+            &[("Cookie", "__journal_cap=secret; sid=journal; theme=dark")],
+        );
+
+        let headers = upstream_request_headers(&head, &names, &RequestHeaderPolicy::ForwardAll);
+
+        assert_eq!(
+            headers,
+            vec![("cookie".to_string(), "sid=journal; theme=dark".to_string())]
+        );
     }
 
     #[test]

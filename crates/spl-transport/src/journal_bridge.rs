@@ -1,7 +1,13 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (c) 2026 sol pbc
 
-//! Hand-rolled loopback proxy for the paired journal dashboard.
+//! Hand-rolled configurable loopback proxy for consumer HTTP traffic.
+//!
+//! The default policy preserves the paired journal dashboard behavior:
+//! ephemeral port, capability gate, streaming `GET /sse/events`, the existing
+//! request-header allow-list, and an 8 MiB request-body limit. Disabling the
+//! capability gate permits every method, while exact loopback `Host` validation
+//! and bridge-reserved header stripping remain mandatory.
 
 use std::future::Future;
 use std::pin::Pin;
@@ -10,6 +16,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use spl_core::bridge::{
     self, BOOTSTRAP_ROUTE, BridgeNames, FailureCategory, RejectReason, RequestHead,
+    RequestHeaderPolicy,
 };
 use spl_core::mux::StreamItem;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -22,8 +29,59 @@ use crate::journal_bridge_carrier::MuxCarrier;
 use crate::{TransportError, transport_error_code};
 
 const MAX_HEAD_BYTES: usize = 64 * 1024;
-const MAX_BODY_BYTES: usize = 8 * 1024 * 1024;
 const READ_BUF_BYTES: usize = 4096;
+
+const DEFAULT_REQUEST_HEADERS: &[&str] = &[
+    "accept",
+    "accept-language",
+    "content-type",
+    "cache-control",
+    "if-none-match",
+    "if-modified-since",
+    "range",
+    "user-agent",
+];
+
+/// Whether local requests must present a bridge capability.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CapabilityGate {
+    /// Mint a capability and require it on forwarded requests.
+    Enabled,
+    /// Do not mint or compare a capability.
+    Disabled,
+}
+
+/// Consumer-selected behavior for one loopback bridge.
+#[derive(Clone)]
+pub struct BridgePolicy {
+    /// IPv4 loopback port to bind, or zero for an ephemeral port.
+    pub port: u16,
+    /// Whether requests require a minted capability.
+    pub capability_gate: CapabilityGate,
+    /// Predicate selecting responses that are delivered incrementally.
+    pub stream_response: Arc<dyn Fn(&RequestHead) -> bool + Send + Sync>,
+    /// Policy for forwarding non-cookie request headers.
+    pub request_headers: RequestHeaderPolicy,
+    /// Maximum request body accepted from a local client.
+    pub max_request_body_bytes: usize,
+}
+
+impl Default for BridgePolicy {
+    fn default() -> Self {
+        Self {
+            port: 0,
+            capability_gate: CapabilityGate::Enabled,
+            stream_response: Arc::new(|head| head.method == "GET" && head.path() == "/sse/events"),
+            request_headers: RequestHeaderPolicy::Allow(
+                DEFAULT_REQUEST_HEADERS
+                    .iter()
+                    .map(|name| (*name).to_string())
+                    .collect(),
+            ),
+            max_request_body_bytes: 8 * 1024 * 1024,
+        }
+    }
+}
 
 /// Consumer seam used by the journal bridge to authenticate and open carriers.
 ///
@@ -55,12 +113,14 @@ pub struct JournalBridgeConfig {
     pub bridge_names: BridgeNames,
     /// Direct endpoint hosts accepted when rewriting journal redirects.
     pub endpoint_hosts: Vec<String>,
+    /// Listener, authorization, streaming, header, and request-size behavior.
+    pub policy: BridgePolicy,
 }
 
 /// Running loopback journal bridge and its shutdown controls.
 pub struct JournalBridgeHandle {
     port: u16,
-    capability: String,
+    capability: CapabilityState,
     contacted: Arc<AtomicBool>,
     shutdown: oneshot::Sender<()>,
     join: JoinHandle<()>,
@@ -78,12 +138,14 @@ impl JournalBridgeHandle {
         self.contacted.load(Ordering::Relaxed)
     }
 
-    /// Return the bootstrap URL carrying the capability compared on every request.
-    pub fn bootstrap_url(&self) -> String {
-        format!(
-            "http://127.0.0.1:{}{}?cap={}",
-            self.port, BOOTSTRAP_ROUTE, self.capability
-        )
+    /// Return the bootstrap URL when capability authorization is enabled.
+    pub fn bootstrap_url(&self) -> Option<String> {
+        self.capability.value().map(|capability| {
+            format!(
+                "http://127.0.0.1:{}{}?cap={capability}",
+                self.port, BOOTSTRAP_ROUTE
+            )
+        })
     }
 
     /// Request shutdown without waiting for the bridge task to exit.
@@ -98,6 +160,41 @@ impl JournalBridgeHandle {
     }
 }
 
+#[derive(Clone)]
+enum CapabilityState {
+    Enabled(Arc<String>),
+    Disabled,
+}
+
+impl CapabilityState {
+    fn value(&self) -> Option<&str> {
+        match self {
+            Self::Enabled(capability) => Some(capability),
+            Self::Disabled => None,
+        }
+    }
+
+    fn bootstrap_capability(&self, path: &str) -> Option<&str> {
+        if path == BOOTSTRAP_ROUTE {
+            self.value()
+        } else {
+            None
+        }
+    }
+}
+
+struct BridgeRuntime {
+    carrier: Arc<MuxCarrier>,
+    capability: CapabilityState,
+    port: u16,
+    journal_hosts: Vec<String>,
+    loopback_origin: String,
+    bridge_names: BridgeNames,
+    stream_response: Arc<dyn Fn(&RequestHead) -> bool + Send + Sync>,
+    request_headers: RequestHeaderPolicy,
+    max_request_body_bytes: usize,
+}
+
 #[derive(Debug)]
 /// Failure while constructing a loopback journal bridge.
 pub enum BridgeStartError {
@@ -107,18 +204,27 @@ pub enum BridgeStartError {
     Bind(std::io::Error),
 }
 
-/// Start a bridge bound to an ephemeral IPv4 loopback port.
+/// Start a bridge bound to the configured IPv4 loopback port.
 ///
 /// # Errors
 ///
 /// Returns [`BridgeStartError::Capability`] if secure capability generation
-/// fails, or [`BridgeStartError::Bind`] for loopback listener failures.
+/// fails while the gate is enabled, or [`BridgeStartError::Bind`] for loopback
+/// listener failures.
 pub async fn start(config: JournalBridgeConfig) -> Result<JournalBridgeHandle, BridgeStartError> {
     let JournalBridgeConfig {
         opener,
         bridge_names,
         endpoint_hosts,
+        policy,
     } = config;
+    let BridgePolicy {
+        port: requested_port,
+        capability_gate,
+        stream_response,
+        request_headers,
+        max_request_body_bytes,
+    } = policy;
     let mut journal_hosts = Vec::with_capacity(endpoint_hosts.len() + 1);
     // No `spl.local` occurrence exists in the vendored `.proto-ref/` mirror;
     // it remains the conventional hostname for transport redirect rewriting.
@@ -126,8 +232,11 @@ pub async fn start(config: JournalBridgeConfig) -> Result<JournalBridgeHandle, B
     journal_hosts.extend(endpoint_hosts);
     let carrier = Arc::new(MuxCarrier::new(opener));
 
-    let capability = mint_capability()?;
-    let listener = match TcpListener::bind(("127.0.0.1", 0)).await {
+    let capability = match capability_gate {
+        CapabilityGate::Enabled => CapabilityState::Enabled(Arc::new(mint_capability()?)),
+        CapabilityGate::Disabled => CapabilityState::Disabled,
+    };
+    let listener = match TcpListener::bind(("127.0.0.1", requested_port)).await {
         Ok(listener) => listener,
         Err(error) => {
             tracing::error!(
@@ -142,28 +251,30 @@ pub async fn start(config: JournalBridgeConfig) -> Result<JournalBridgeHandle, B
         .local_addr()
         .map_err(BridgeStartError::Bind)?
         .port();
-    let loopback_origin = Arc::new(format!("http://127.0.0.1:{port}"));
-    let capability = Arc::new(capability);
-    let journal_hosts = Arc::new(journal_hosts);
-    let bridge_names = Arc::new(bridge_names);
+    let runtime = Arc::new(BridgeRuntime {
+        carrier,
+        capability: capability.clone(),
+        port,
+        journal_hosts,
+        loopback_origin: format!("http://127.0.0.1:{port}"),
+        bridge_names,
+        stream_response,
+        request_headers,
+        max_request_body_bytes,
+    });
     let (shutdown, shutdown_rx) = oneshot::channel();
 
     let contacted = Arc::new(AtomicBool::new(false));
     let join = tokio::spawn(accept_loop(
         listener,
         shutdown_rx,
-        carrier,
-        capability.clone(),
-        port,
-        journal_hosts,
-        loopback_origin,
-        bridge_names,
+        runtime,
         contacted.clone(),
     ));
 
     Ok(JournalBridgeHandle {
         port,
-        capability: (*capability).clone(),
+        capability,
         contacted,
         shutdown,
         join,
@@ -193,25 +304,16 @@ fn hex_encode(bytes: &[u8]) -> String {
     out
 }
 
-#[expect(
-    clippy::too_many_arguments,
-    reason = "the accept task owns the independently shared listener, carrier, authorization, rewrite, and lifecycle values"
-)]
 async fn accept_loop(
     listener: TcpListener,
     mut shutdown: oneshot::Receiver<()>,
-    carrier: Arc<MuxCarrier>,
-    capability: Arc<String>,
-    port: u16,
-    journal_hosts: Arc<Vec<String>>,
-    loopback_origin: Arc<String>,
-    bridge_names: Arc<BridgeNames>,
+    runtime: Arc<BridgeRuntime>,
     contacted: Arc<AtomicBool>,
 ) {
     loop {
         tokio::select! {
             _ = &mut shutdown => {
-                carrier.shutdown().await;
+                runtime.carrier.shutdown().await;
                 break;
             }
             accepted = listener.accept() => {
@@ -219,37 +321,23 @@ async fn accept_loop(
                     continue;
                 };
                 contacted.store(true, Ordering::Relaxed);
-                tokio::spawn(handle_conn(
-                    stream,
-                    carrier.clone(),
-                    capability.clone(),
-                    port,
-                    journal_hosts.clone(),
-                    loopback_origin.clone(),
-                    bridge_names.clone(),
-                ));
+                tokio::spawn(handle_conn(stream, runtime.clone()));
             }
         }
     }
 }
 
-async fn handle_conn(
-    mut stream: TcpStream,
-    carrier: Arc<MuxCarrier>,
-    capability: Arc<String>,
-    port: u16,
-    journal_hosts: Arc<Vec<String>>,
-    loopback_origin: Arc<String>,
-    bridge_names: Arc<BridgeNames>,
-) {
-    let Some((head_bytes, body)) = read_request(&mut stream).await else {
+async fn handle_conn(mut stream: TcpStream, runtime: Arc<BridgeRuntime>) {
+    let Some((head_bytes, body)) = read_request(&mut stream, runtime.max_request_body_bytes).await
+    else {
         return;
     };
     let Some(request_head) = bridge::parse_request_head(&head_bytes) else {
         write_local(&mut stream, 400, b"bad request", "text/plain").await;
         return;
     };
-    let route = if request_head.path() == BOOTSTRAP_ROUTE {
+    let bootstrap_capability = runtime.capability.bootstrap_capability(request_head.path());
+    let route = if bootstrap_capability.is_some() {
         "bootstrap"
     } else {
         "upstream"
@@ -261,14 +349,28 @@ async fn handle_conn(
         "local request"
     );
 
-    if request_head.path() == BOOTSTRAP_ROUTE {
-        handle_bootstrap(&mut stream, &request_head, &capability, port, &bridge_names).await;
+    if let Some(capability) = bootstrap_capability {
+        handle_bootstrap(
+            &mut stream,
+            &request_head,
+            capability,
+            runtime.port,
+            &runtime.bridge_names,
+        )
+        .await;
         return;
     }
 
-    if let Err(reason) =
-        bridge::authorize(&request_head, capability.as_bytes(), port, &bridge_names)
-    {
+    let authorization = match &runtime.capability {
+        CapabilityState::Enabled(capability) => bridge::authorize(
+            &request_head,
+            capability.as_bytes(),
+            runtime.port,
+            &runtime.bridge_names,
+        ),
+        CapabilityState::Disabled => bridge::check_loopback_host(&request_head, runtime.port),
+    };
+    if let Err(reason) = authorization {
         log_capability_reject(reason);
         let status = if reason == RejectReason::BadMethod {
             405
@@ -279,28 +381,27 @@ async fn handle_conn(
         return;
     }
 
-    let upstream_headers = bridge::upstream_request_headers(&request_head, &bridge_names);
-    if request_head.method == "GET" && request_head.path() == "/sse/events" {
-        forward_sse(
+    let upstream_headers = bridge::upstream_request_headers(
+        &request_head,
+        &runtime.bridge_names,
+        &runtime.request_headers,
+    );
+    if (runtime.stream_response)(&request_head) {
+        forward_streaming(
             &mut stream,
-            carrier,
+            &runtime,
             &request_head,
             &upstream_headers,
-            &journal_hosts,
-            &loopback_origin,
-            &bridge_names,
+            &body,
         )
         .await;
     } else {
         forward_buffered(
             &mut stream,
-            carrier,
+            &runtime,
             &request_head,
             &upstream_headers,
             &body,
-            &journal_hosts,
-            &loopback_origin,
-            &bridge_names,
         )
         .await;
     }
@@ -313,8 +414,7 @@ async fn handle_bootstrap(
     port: u16,
     bridge_names: &BridgeNames,
 ) {
-    let expected_host = format!("127.0.0.1:{port}");
-    if request_head.host() != Some(expected_host.as_str()) {
+    if bridge::check_loopback_host(request_head, port).is_err() {
         log_capability_reject(RejectReason::BadHost);
         write_local(stream, 403, b"forbidden", "text/plain").await;
         return;
@@ -324,7 +424,7 @@ async fn handle_bootstrap(
         write_local(stream, 405, b"forbidden", "text/plain").await;
         return;
     }
-    if request_head.has_caller_auth(bridge_names) {
+    if bridge::check_caller_auth(request_head, bridge_names).is_err() {
         log_capability_reject(RejectReason::CallerAuth);
         write_local(stream, 403, b"forbidden", "text/plain").await;
         return;
@@ -332,7 +432,7 @@ async fn handle_bootstrap(
 
     #[expect(
         clippy::map_unwrap_or,
-        reason = "the copied bootstrap check keeps absence and comparison failure visibly equivalent"
+        reason = "the mapped capability comparison keeps absence and mismatch visibly equivalent"
     )]
     let cap_ok = bridge::bootstrap_cap(&request_head.target)
         .map(|presented| bridge::ct_eq(presented.as_bytes(), capability.as_bytes()))
@@ -352,21 +452,15 @@ async fn handle_bootstrap(
     let _ = stream.shutdown().await;
 }
 
-#[expect(
-    clippy::too_many_arguments,
-    reason = "buffered forwarding keeps request, body, authorization names, and response rewrite inputs explicit"
-)]
 async fn forward_buffered(
     stream: &mut TcpStream,
-    carrier: Arc<MuxCarrier>,
+    runtime: &BridgeRuntime,
     request_head: &RequestHead,
     upstream_headers: &[(String, String)],
     body: &[u8],
-    journal_hosts: &[String],
-    loopback_origin: &str,
-    bridge_names: &BridgeNames,
 ) {
-    let mut rx = match carrier
+    let mut rx = match runtime
+        .carrier
         .open_stream(
             &request_head.method,
             &request_head.target,
@@ -412,8 +506,12 @@ async fn forward_buffered(
         return;
     };
 
-    let headers =
-        bridge::response_headers(&head.headers, journal_hosts, loopback_origin, bridge_names);
+    let headers = bridge::response_headers(
+        &head.headers,
+        &runtime.journal_hosts,
+        &runtime.loopback_origin,
+        &runtime.bridge_names,
+    );
     let body = if request_head.method == "HEAD" {
         &[][..]
     } else {
@@ -432,17 +530,21 @@ async fn forward_buffered(
     }
 }
 
-async fn forward_sse(
+async fn forward_streaming(
     stream: &mut TcpStream,
-    carrier: Arc<MuxCarrier>,
+    runtime: &BridgeRuntime,
     request_head: &RequestHead,
     upstream_headers: &[(String, String)],
-    journal_hosts: &[String],
-    loopback_origin: &str,
-    bridge_names: &BridgeNames,
+    body: &[u8],
 ) {
-    let mut rx = match carrier
-        .open_stream("GET", &request_head.target, upstream_headers, b"")
+    let mut rx = match runtime
+        .carrier
+        .open_stream(
+            &request_head.method,
+            &request_head.target,
+            upstream_headers,
+            body,
+        )
         .await
     {
         Ok(rx) => rx,
@@ -466,11 +568,13 @@ async fn forward_sse(
                 }
                 let headers = bridge::response_headers(
                     &head.headers,
-                    journal_hosts,
-                    loopback_origin,
-                    bridge_names,
+                    &runtime.journal_hosts,
+                    &runtime.loopback_origin,
+                    &runtime.bridge_names,
                 );
-                if write_stream_head(stream, head.status, &headers)
+                let content_length = (request_head.method == "HEAD")
+                    .then(|| upstream_content_length(&head.headers).unwrap_or(0));
+                if write_stream_head(stream, head.status, &headers, content_length)
                     .await
                     .is_err()
                 {
@@ -482,6 +586,9 @@ async fn forward_sse(
             StreamItem::Body(bytes) => {
                 if !head_written {
                     break;
+                }
+                if request_head.method == "HEAD" {
+                    continue;
                 }
                 if stream.write_all(&bytes).await.is_err() || stream.flush().await.is_err() {
                     rx.cancel();
@@ -517,7 +624,10 @@ fn log_upstream_open_error(error: &TransportError) {
     );
 }
 
-async fn read_request(stream: &mut TcpStream) -> Option<(Vec<u8>, Vec<u8>)> {
+async fn read_request(
+    stream: &mut TcpStream,
+    max_request_body_bytes: usize,
+) -> Option<(Vec<u8>, Vec<u8>)> {
     let mut received = Vec::new();
     let mut buf = [0u8; READ_BUF_BYTES];
     let split = loop {
@@ -537,7 +647,7 @@ async fn read_request(stream: &mut TcpStream) -> Option<(Vec<u8>, Vec<u8>)> {
     let body_start = split + 4;
     let head = received[..body_start].to_vec();
     let content_length = parse_content_length(&head)?;
-    if content_length > MAX_BODY_BYTES {
+    if content_length > max_request_body_bytes {
         return None;
     }
     let mut body = received[body_start..].to_vec();
@@ -622,12 +732,18 @@ async fn write_stream_head(
     stream: &mut TcpStream,
     status: u16,
     headers: &[(String, String)],
+    content_length: Option<usize>,
 ) -> std::io::Result<()> {
     let mut response = format!("HTTP/1.1 {status} {}\r\n", reason_phrase(status));
     for (name, value) in headers {
         response.push_str(name);
         response.push_str(": ");
         response.push_str(value);
+        response.push_str("\r\n");
+    }
+    if let Some(content_length) = content_length {
+        response.push_str("content-length: ");
+        response.push_str(&content_length.to_string());
         response.push_str("\r\n");
     }
     response.push_str("connection: close\r\n\r\n");
@@ -665,4 +781,44 @@ fn log_capability_reject(reason: RejectReason) {
         category = FailureCategory::LocalCapabilityReject.token(),
         reason = reason.token()
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bridge_policy_default_matches_current_bridge() {
+        // This exhaustive pattern is the guard: adding any field, including a
+        // bind address, makes the test fail to compile until reviewed.
+        let BridgePolicy {
+            port,
+            capability_gate,
+            stream_response,
+            request_headers,
+            max_request_body_bytes,
+        } = BridgePolicy::default();
+
+        assert_eq!(port, 0);
+        assert_eq!(capability_gate, CapabilityGate::Enabled);
+        assert_eq!(
+            request_headers,
+            RequestHeaderPolicy::Allow(
+                DEFAULT_REQUEST_HEADERS
+                    .iter()
+                    .map(|name| (*name).to_string())
+                    .collect()
+            )
+        );
+        assert_eq!(max_request_body_bytes, 8 * 1024 * 1024);
+
+        let request = |method: &str, target: &str| RequestHead {
+            method: method.to_string(),
+            target: target.to_string(),
+            headers: Vec::new(),
+        };
+        assert!(stream_response(&request("GET", "/sse/events")));
+        assert!(!stream_response(&request("HEAD", "/sse/events")));
+        assert!(!stream_response(&request("GET", "/other")));
+    }
 }

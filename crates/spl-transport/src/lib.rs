@@ -32,7 +32,10 @@
 //! accepts an optional [`client::TokenPersistHook`] for consumer-owned,
 //! best-effort relay-token persistence. [`journal_bridge::CarrierOpener`] lets a
 //! consumer combine that transport with its own authentication-header policy
-//! without exposing the carrier implementation.
+//! without exposing the carrier implementation. [`journal_bridge::BridgePolicy`]
+//! selects the loopback port, capability gate, response streaming, request
+//! header forwarding, and request-body limit. The bridge always owns exact
+//! loopback `Host` validation and reserved-header stripping.
 
 #![forbid(unsafe_code)]
 #![cfg_attr(

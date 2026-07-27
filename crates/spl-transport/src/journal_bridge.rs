@@ -165,8 +165,9 @@ pub struct BridgePolicy {
     ///
     /// The bridge never promotes a caller-supplied header on its own: every
     /// attribution header reaching upstream was produced by consumer code that
-    /// saw the request. Reserved header names can never be attributed, and
-    /// cookies are never accepted as attribution headers.
+    /// saw the request. Fields with invalid names or CR, LF, or NUL in their
+    /// values are dropped. Cookies are dropped, and reserved header names can
+    /// never be attributed.
     ///
     /// This hook does not authenticate the caller or bind attribution to a
     /// caller identity. Consumer code that copies a caller header verbatim
@@ -558,6 +559,7 @@ fn filtered_attribution_headers(
 ) -> Vec<(String, String)> {
     let headers = headers
         .into_iter()
+        .filter(|(name, value)| valid_attribution_header(name, value))
         .filter(|(name, _)| !name.eq_ignore_ascii_case("cookie"))
         .collect();
     let attribution = RequestHead {
@@ -566,6 +568,31 @@ fn filtered_attribution_headers(
         headers,
     };
     bridge::upstream_request_headers(&attribution, bridge_names, &RequestHeaderPolicy::ForwardAll)
+}
+
+fn valid_attribution_header(name: &str, value: &str) -> bool {
+    !name.is_empty()
+        && name.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric()
+                || matches!(
+                    byte,
+                    b'!' | b'#'
+                        | b'$'
+                        | b'%'
+                        | b'&'
+                        | b'\''
+                        | b'*'
+                        | b'+'
+                        | b'-'
+                        | b'.'
+                        | b'^'
+                        | b'_'
+                        | b'`'
+                        | b'|'
+                        | b'~'
+                )
+        })
+        && !value.bytes().any(|byte| matches!(byte, b'\r' | b'\n' | 0))
 }
 
 async fn handle_bootstrap(

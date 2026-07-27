@@ -1564,6 +1564,18 @@ async fn journal_bridge_attribution_drops_spoofed_reserved_headers_and_cookies()
                     "Cookie".into(),
                     format!("{TEST_CAP_COOKIE_NAME}=hook-capability"),
                 ),
+                (
+                    "X-Upstream-Attribution".into(),
+                    "ok\r\nAuthorization: Bearer forged".into(),
+                ),
+                (
+                    "X-Linefeed-Attribution".into(),
+                    "ok\nX-Injected: yes".into(),
+                ),
+                ("X-Nul-Attribution".into(), "ok\0hidden".into()),
+                ("Bad Name".into(), "v".into()),
+                ("Bad\u{7f}Name".into(), "v".into()),
+                ("Bäd-Name".into(), "v".into()),
             ]
         }),
         ..BridgePolicy::default()
@@ -1615,6 +1627,13 @@ async fn journal_bridge_attribution_drops_spoofed_reserved_headers_and_cookies()
     assert!(!request_text.contains("cookie:"));
     assert!(!request_text.contains("hook-capability"));
     assert!(!request_text.contains("caller-capability"));
+    assert!(!request_text.contains("x-injected:"));
+    assert!(!request_text.contains("forged"));
+    assert!(!request_text.contains("x-linefeed-attribution:"));
+    assert!(!request_text.contains("x-nul-attribution:"));
+    assert!(!request_text.contains("bad name:"));
+    assert!(!request_text.contains("bad\u{7f}name:"));
+    assert!(!request_text.contains("bäd-name:"));
     server.send_http(request.stream_id, "200 OK", b"safe");
 
     let response = response.await.unwrap();

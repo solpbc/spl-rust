@@ -132,20 +132,16 @@ impl MuxCarrier {
         tokio::spawn(writer_task(
             write,
             writer_rx,
-            alive.clone(),
-            self.status.clone(),
-            status_identity.clone(),
+            CarrierLiveGuard::new(alive.clone(), self.status.clone(), status_identity.clone()),
         ));
         tokio::spawn(coordinator_task(
             read,
             commands_rx,
             handle.commands.clone(),
             writer_tx,
-            alive,
             kind,
             self.keepalive,
-            self.status.clone(),
-            status_identity.clone(),
+            CarrierLiveGuard::new(alive, self.status.clone(), status_identity.clone()),
         ));
 
         *slot = Some(handle.clone());
@@ -210,6 +206,29 @@ pub(crate) struct CarrierHandle {
     commands: mpsc::Sender<CarrierCommand>,
     alive: Arc<AtomicBool>,
     status_identity: Arc<()>,
+}
+
+struct CarrierLiveGuard {
+    alive: Arc<AtomicBool>,
+    status: SharedStatus,
+    status_identity: Arc<()>,
+}
+
+impl CarrierLiveGuard {
+    fn new(alive: Arc<AtomicBool>, status: SharedStatus, status_identity: Arc<()>) -> Self {
+        Self {
+            alive,
+            status,
+            status_identity,
+        }
+    }
+}
+
+impl Drop for CarrierLiveGuard {
+    fn drop(&mut self) {
+        self.alive.store(false, Ordering::SeqCst);
+        mark_carrier_dead(&self.status, &self.status_identity);
+    }
 }
 
 pub(crate) struct StreamRx {
@@ -311,34 +330,28 @@ struct OutstandingProbe {
 async fn writer_task(
     mut write: CarrierWrite,
     mut rx: mpsc::Receiver<Vec<u8>>,
-    alive: Arc<AtomicBool>,
-    status: SharedStatus,
-    status_identity: Arc<()>,
+    carrier_guard: CarrierLiveGuard,
 ) {
     while let Some(bytes) = rx.recv().await {
         if write.write_all(&bytes).await.is_err() || write.flush().await.is_err() {
             break;
         }
     }
-    alive.store(false, Ordering::SeqCst);
-    mark_carrier_dead(&status, &status_identity);
+    drop(carrier_guard);
 }
 
 #[expect(
     clippy::too_many_lines,
-    clippy::too_many_arguments,
-    reason = "the copied coordinator keeps its single event loop, carrier generation, and ordering invariants together"
+    reason = "the copied coordinator keeps its single event loop and ordering invariants together"
 )]
 async fn coordinator_task(
     mut read: CarrierRead,
     mut commands: mpsc::Receiver<CarrierCommand>,
     command_sender: mpsc::Sender<CarrierCommand>,
     writer: mpsc::Sender<Vec<u8>>,
-    alive: Arc<AtomicBool>,
     kind: CarrierKind,
     keepalive: KeepaliveConfig,
-    status: SharedStatus,
-    status_identity: Arc<()>,
+    carrier_guard: CarrierLiveGuard,
 ) {
     let mut demux = CarrierDemux::new();
     let mut dialer = FrameDialer::default();
@@ -461,8 +474,7 @@ async fn coordinator_task(
         }
     }
 
-    alive.store(false, Ordering::SeqCst);
-    mark_carrier_dead(&status, &status_identity);
+    drop(carrier_guard);
 }
 
 fn mark_carrier_dead(status: &SharedStatus, status_identity: &Arc<()>) {
@@ -764,6 +776,29 @@ mod tests {
         }
     }
 
+    fn publish_test_carrier(status: &SharedStatus, status_identity: &Arc<()>) {
+        let mut record = lock_status(status);
+        record.current_carrier = Some(status_identity.clone());
+        record.snapshot.carrier_live = true;
+    }
+
+    fn spawn_waiting_writer(
+        status: SharedStatus,
+        status_identity: Arc<()>,
+    ) -> (mpsc::Sender<Vec<u8>>, tokio::task::JoinHandle<()>) {
+        let (client, _server) = tokio::io::duplex(1024);
+        let stream: Box<dyn CarrierIo> = Box::new(client);
+        let (_read, write) = split(stream);
+        let (writer_tx, writer_rx) = mpsc::channel(WRITER_QUEUE);
+        let alive = Arc::new(AtomicBool::new(true));
+        let task = tokio::spawn(writer_task(
+            write,
+            writer_rx,
+            CarrierLiveGuard::new(alive, status, status_identity),
+        ));
+        (writer_tx, task)
+    }
+
     fn spawn_duplex_carrier(
         keepalive: KeepaliveConfig,
         capacity: usize,
@@ -776,30 +811,57 @@ mod tests {
         let alive = Arc::new(AtomicBool::new(true));
         let status = crate::journal_bridge::new_status();
         let status_identity = Arc::new(());
-        {
-            let mut record = lock_status(&status);
-            record.current_carrier = Some(status_identity.clone());
-            record.snapshot.carrier_live = true;
-        }
+        publish_test_carrier(&status, &status_identity);
         tokio::spawn(writer_task(
             write,
             writer_rx,
-            alive.clone(),
-            status.clone(),
-            status_identity.clone(),
+            CarrierLiveGuard::new(alive.clone(), status.clone(), status_identity.clone()),
         ));
         tokio::spawn(coordinator_task(
             read,
             commands_rx,
             commands_tx.clone(),
             writer_tx,
-            alive.clone(),
             CarrierKind::Lan,
             keepalive,
-            status,
-            status_identity,
+            CarrierLiveGuard::new(alive.clone(), status, status_identity),
         ));
         (commands_tx, alive, server)
+    }
+
+    #[tokio::test]
+    async fn carrier_status_clears_when_writer_task_is_aborted() {
+        let status = crate::journal_bridge::new_status();
+        let status_identity = Arc::new(());
+        publish_test_carrier(&status, &status_identity);
+        let (_writer, task) = spawn_waiting_writer(status.clone(), status_identity);
+
+        task.abort();
+        let _ = task.await;
+
+        assert!(!lock_status(&status).snapshot.carrier_live);
+    }
+
+    #[tokio::test]
+    async fn aborted_replaced_writer_does_not_clear_live_successor() {
+        let status = crate::journal_bridge::new_status();
+        let old_identity = Arc::new(());
+        publish_test_carrier(&status, &old_identity);
+        let (_writer, task) = spawn_waiting_writer(status.clone(), old_identity);
+        let successor_identity = Arc::new(());
+        publish_test_carrier(&status, &successor_identity);
+
+        task.abort();
+        let _ = task.await;
+
+        let record = lock_status(&status);
+        assert!(record.snapshot.carrier_live);
+        assert!(
+            record
+                .current_carrier
+                .as_ref()
+                .is_some_and(|current| Arc::ptr_eq(current, &successor_identity))
+        );
     }
 
     async fn open_test_stream(

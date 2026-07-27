@@ -28,14 +28,19 @@
 //!
 //! # Public seams
 //!
-//! [`client::TransportClient`] owns direct-or-relay carrier establishment and
-//! accepts an optional [`client::TokenPersistHook`] for consumer-owned,
-//! best-effort relay-token persistence. [`journal_bridge::CarrierOpener`] lets a
-//! consumer combine that transport with its own authentication-header policy
-//! without exposing the carrier implementation. [`journal_bridge::BridgePolicy`]
-//! selects the loopback port, capability gate, response streaming, request
-//! header forwarding, and request-body limit. The bridge always owns exact
-//! loopback `Host` validation and reserved-header stripping.
+//! [`client::TransportClient`] owns direct-or-relay carrier establishment,
+//! including explicit relay-only construction, and accepts an optional
+//! [`client::TokenPersistHook`] for consumer-owned, best-effort relay-token
+//! persistence. [`relay_pairing::enroll_device`] exposes relay enrollment when
+//! the consumer has a fresh pairing-window attestation.
+//! [`journal_bridge::CarrierOpener`] combines that transport with consumer
+//! authentication without exposing the carrier implementation.
+//! [`journal_bridge::BridgePolicy`] selects the loopback port, capability gate,
+//! response streaming, authorized local responses, attribution headers, request
+//! header forwarding, and request-body limit. [`journal_bridge::JournalBridgeHandle`]
+//! returns an owned coherent status snapshot. The bridge always owns exact
+//! loopback `Host` validation and reserved-header stripping; credential storage,
+//! retry supervision, and service lifetime remain consumer-owned.
 
 #![forbid(unsafe_code)]
 #![cfg_attr(

@@ -1508,6 +1508,210 @@ async fn journal_bridge_forward_all_forwards_custom_and_strips_reserved_headers(
 }
 
 #[tokio::test]
+async fn journal_bridge_attribution_uses_unfiltered_request() {
+    let policy = BridgePolicy {
+        capability_gate: CapabilityGate::Disabled,
+        attribution_headers: Arc::new(|head| {
+            let saw_context = head.headers.iter().any(|(name, value)| {
+                name.eq_ignore_ascii_case("x-caller-context") && value == "present"
+            });
+            if saw_context {
+                vec![("X-Upstream-Attribution".into(), "derived".into())]
+            } else {
+                Vec::new()
+            }
+        }),
+        ..BridgePolicy::default()
+    };
+    let (handle, mut server) = start_bridge_with_persistent_server_policy(policy).await;
+    let port = handle.port();
+    let response = tokio::spawn(raw_bridge_request(
+        port,
+        "GET",
+        "/journal",
+        Some(loopback_host(port)),
+        None,
+        &[("X-Caller-Context", "present")],
+        b"",
+    ));
+
+    let request = server.next_request().await;
+    let request_text = String::from_utf8_lossy(&request.bytes).to_ascii_lowercase();
+    assert!(request_text.contains("x-upstream-attribution: derived\r\n"));
+    assert!(!request_text.contains("x-caller-context:"));
+    server.send_http(request.stream_id, "200 OK", b"attributed");
+
+    let response = response.await.unwrap();
+    assert_eq!(response_status(&response), 200);
+    handle.shutdown_and_wait().await;
+    server.abort();
+}
+
+#[tokio::test]
+async fn journal_bridge_attribution_drops_spoofed_reserved_headers_and_cookies() {
+    let policy = BridgePolicy {
+        capability_gate: CapabilityGate::Disabled,
+        request_headers: RequestHeaderPolicy::ForwardAll,
+        attribution_headers: Arc::new(|_| {
+            vec![
+                ("X-Upstream-Attribution".into(), "derived".into()),
+                ("Authorization".into(), "Bearer hook".into()),
+                (TEST_OBSERVER_HEADER_NAME.into(), "hook".into()),
+                (TEST_PROTOCOL_HEADER_NAME.into(), "hook".into()),
+                ("Host".into(), "hook.invalid".into()),
+                ("Connection".into(), "upgrade".into()),
+                (
+                    "Cookie".into(),
+                    format!("{TEST_CAP_COOKIE_NAME}=hook-capability"),
+                ),
+            ]
+        }),
+        ..BridgePolicy::default()
+    };
+    let (handle, mut server) = start_bridge_with_persistent_server_policy(policy).await;
+    let port = handle.port();
+    let response = tokio::spawn(raw_bridge_request(
+        port,
+        "GET",
+        "/journal",
+        Some(loopback_host(port)),
+        None,
+        &[
+            ("X-Upstream-Attribution", "forged"),
+            ("Authorization", "Bearer caller"),
+            (TEST_OBSERVER_HEADER_NAME, "caller"),
+            (TEST_PROTOCOL_HEADER_NAME, "caller"),
+            ("Connection", "keep-alive"),
+            ("Cookie", "test-journal-cap=caller-capability"),
+        ],
+        b"",
+    ));
+
+    let request = server.next_request().await;
+    let request_text = String::from_utf8_lossy(&request.bytes).to_ascii_lowercase();
+    assert!(request_text.contains("x-upstream-attribution: derived\r\n"));
+    assert!(!request_text.contains("x-upstream-attribution: forged\r\n"));
+    assert_eq!(request_text.matches("authorization:").count(), 1);
+    assert!(request_text.contains("authorization: bearer test-handle\r\n"));
+    assert_eq!(
+        request_text
+            .matches(&format!("{TEST_OBSERVER_HEADER_NAME}:"))
+            .count(),
+        1
+    );
+    assert!(request_text.contains(&format!(
+        "{TEST_OBSERVER_HEADER_NAME}: {TEST_OBSERVER_KEY}\r\n"
+    )));
+    assert_eq!(
+        request_text
+            .matches(&format!("{TEST_PROTOCOL_HEADER_NAME}:"))
+            .count(),
+        1
+    );
+    assert!(request_text.contains(&format!("{TEST_PROTOCOL_HEADER_NAME}: 2\r\n")));
+    assert_eq!(request_text.matches("host:").count(), 1);
+    assert!(request_text.contains("host: spl.local\r\n"));
+    assert!(!request_text.contains("connection:"));
+    assert!(!request_text.contains("cookie:"));
+    assert!(!request_text.contains("hook-capability"));
+    assert!(!request_text.contains("caller-capability"));
+    server.send_http(request.stream_id, "200 OK", b"safe");
+
+    let response = response.await.unwrap();
+    assert_eq!(response_status(&response), 200);
+    handle.shutdown_and_wait().await;
+    server.abort();
+}
+
+#[tokio::test]
+async fn journal_bridge_default_policy_preserves_current_forwarding() {
+    let (handle, mut server) =
+        start_bridge_with_persistent_server_policy(BridgePolicy::default()).await;
+    let port = handle.port();
+    let capability = capability_from(&handle);
+    let response = tokio::spawn(raw_bridge_request(
+        port,
+        "GET",
+        "/ordinary",
+        Some(loopback_host(port)),
+        Some(cap_cookie(&capability)),
+        &[("Accept", "text/plain"), ("X-Not-Allowed", "caller")],
+        b"",
+    ));
+
+    let request = server.next_request().await;
+    assert_eq!(
+        String::from_utf8_lossy(&request.bytes),
+        concat!(
+            "GET /ordinary HTTP/1.1\r\n",
+            "host: spl.local\r\n",
+            "accept: text/plain\r\n",
+            "x-test-observer: test-handle\r\n",
+            "Authorization: Bearer test-handle\r\n",
+            "x-test-protocol: 2\r\n",
+            "content-length: 0\r\n",
+            "\r\n",
+        )
+    );
+    server.send_http(request.stream_id, "200 OK", b"unchanged");
+
+    let response = response.await.unwrap();
+    assert_eq!(response_status(&response), 200);
+    assert_eq!(response_body(&response), "unchanged");
+    handle.shutdown_and_wait().await;
+    server.abort();
+}
+
+#[tokio::test]
+async fn journal_bridge_status_tracks_current_carrier() {
+    let (handle, mut server) = start_bridge_with_persistent_server().await;
+    assert!(!handle.status().carrier_live);
+    let port = handle.port();
+    let capability = capability_from(&handle);
+
+    let first = tokio::spawn(raw_bridge_request(
+        port,
+        "GET",
+        "/first",
+        Some(loopback_host(port)),
+        Some(cap_cookie(&capability)),
+        &[],
+        b"",
+    ));
+    let first_request = server.next_request().await;
+    assert!(handle.status().carrier_live);
+    server.send_http(first_request.stream_id, "200 OK", b"first");
+    assert_eq!(response_status(&first.await.unwrap()), 200);
+
+    server.close_current_carrier();
+    for _ in 0..200 {
+        if !handle.status().carrier_live {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    assert!(!handle.status().carrier_live);
+
+    let second = tokio::spawn(raw_bridge_request(
+        port,
+        "GET",
+        "/second",
+        Some(loopback_host(port)),
+        Some(cap_cookie(&capability)),
+        &[],
+        b"",
+    ));
+    let second_request = server.next_request().await;
+    assert!(handle.status().carrier_live);
+    assert_eq!(server.accepted_carriers(), 2);
+    server.send_http(second_request.stream_id, "200 OK", b"second");
+    assert_eq!(response_status(&second.await.unwrap()), 200);
+
+    handle.shutdown_and_wait().await;
+    server.abort();
+}
+
+#[tokio::test]
 async fn journal_bridge_buffered_pass_through_injects_auth_and_strips_local_headers() {
     let (handle, upstream) = start_bridge_with_response("200 OK", b"bridge ok").await;
     let port = handle.port();

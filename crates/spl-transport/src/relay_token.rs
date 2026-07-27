@@ -20,7 +20,9 @@ pub enum RefreshOutcome {
         /// Replacement token expiry as Unix seconds.
         expires_at: i64,
     },
-    /// The device must repeat relay enrollment before dialing again.
+    /// The device must repeat relay enrollment before dialing again. A stored
+    /// home attestation is bound to a pairing window of at most five minutes; once
+    /// that window has elapsed, enrollment requires a new pairing ceremony.
     ReconnectNeeded,
     /// A transient control-plane failure left the current token unchanged.
     TransientError,

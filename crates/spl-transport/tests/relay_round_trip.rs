@@ -1455,6 +1455,48 @@ async fn relay_credential_without_lan_endpoints_rejected_at_new() {
 }
 
 #[tokio::test]
+async fn relay_only_constructor_rejects_lan_endpoints_and_missing_relay_inputs() {
+    let (pin, _acceptor) = tls_pair_with_pin();
+    let token = mint_jwt(100, 200);
+
+    let with_lan = relay_credential(
+        pin.clone(),
+        7657,
+        "http://127.0.0.1:1".into(),
+        token.clone(),
+    );
+    assert!(matches!(
+        TransportClient::new_relay_only(with_lan, None),
+        Err(TransportError::Pairing(message))
+            if message
+                == "relay-only credential has LAN endpoints; use TransportClient::new for a credential with LAN endpoints"
+    ));
+
+    let mut without_origin = relay_credential(
+        pin.clone(),
+        7657,
+        "http://127.0.0.1:1".into(),
+        token.clone(),
+    );
+    without_origin.endpoints.clear();
+    without_origin.relay_origin = None;
+    assert!(matches!(
+        TransportClient::new_relay_only(without_origin, None),
+        Err(TransportError::Pairing(message))
+            if message == "relay-only credential has no relay origin"
+    ));
+
+    let mut without_token = relay_credential(pin, 7657, "http://127.0.0.1:1".into(), token);
+    without_token.endpoints.clear();
+    without_token.device_token = None;
+    assert!(matches!(
+        TransportClient::new_relay_only(without_token, None),
+        Err(TransportError::Pairing(message))
+            if message == "relay-only credential has no device token"
+    ));
+}
+
+#[tokio::test]
 async fn relay_proactive_refresh_before_first_dial() {
     let (pin, acceptor) = tls_pair_with_pin();
     let now = epoch_secs();

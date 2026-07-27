@@ -23,8 +23,9 @@ use serde_json::json;
 use spl_core::PairRequest;
 use spl_core::frame::{FLAG_CLOSE, FLAG_DATA, Frame, FrameDecoder};
 use spl_core::pairlink::RelayPairLink;
+use spl_transport::client::TransportClient;
 use spl_transport::credential::EndpointAddr;
-use spl_transport::relay_pairing::pair_over_relay;
+use spl_transport::relay_pairing::{enroll_device, pair_over_relay};
 use spl_transport::relay_token::{RefreshOutcome, refresh_device_token};
 use spl_transport::{RelayControlEndpoint, TransportError, transport_error_code};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, DuplexStream};
@@ -82,7 +83,10 @@ fn leaf_config(signer: &TestCa) -> ServerConfig {
         .unwrap()
         .with_no_client_auth()
         .with_single_cert(
-            vec![CertificateDer::from(cert.der().to_vec())],
+            vec![
+                CertificateDer::from(cert.der().to_vec()),
+                CertificateDer::from(signer.cert.der().to_vec()),
+            ],
             PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key.serialize_der())),
         )
         .unwrap()
@@ -91,6 +95,7 @@ fn leaf_config(signer: &TestCa) -> ServerConfig {
 #[derive(Clone)]
 enum HomeMode {
     Ok,
+    NoLocalEndpoints,
     Reject { status: u16, body: &'static [u8] },
     MissingHomeAttestation,
     UnrelatedClientKey,
@@ -102,8 +107,12 @@ struct MockState {
     home_mode: HomeMode,
     pair_instance_id: Mutex<Option<String>>,
     enroll_status: Mutex<Option<u16>>,
+    enroll_hits: AtomicUsize,
     refresh_status: Mutex<Option<u16>>,
     refresh_hits: AtomicUsize,
+    session_dials: AtomicUsize,
+    dial_target: Mutex<Option<String>>,
+    dial_authorization: Mutex<Option<String>>,
     expected_pair_token: Mutex<String>,
     pair_request: Mutex<Option<PairRequest>>,
 }
@@ -117,8 +126,12 @@ impl MockState {
             home_mode: HomeMode::Ok,
             pair_instance_id: Mutex::new(None),
             enroll_status: Mutex::new(None),
+            enroll_hits: AtomicUsize::new(0),
             refresh_status: Mutex::new(None),
             refresh_hits: AtomicUsize::new(0),
+            session_dials: AtomicUsize::new(0),
+            dial_target: Mutex::new(None),
+            dial_authorization: Mutex::new(None),
             expected_pair_token: Mutex::new(PAIR_SECRET_HEX.to_owned()),
             pair_request: Mutex::new(None),
         }
@@ -171,12 +184,33 @@ async fn handle_connection(tcp: TcpStream, state: Arc<MockState>) -> io::Result<
 }
 
 async fn handle_ws(tcp: TcpStream, state: Arc<MockState>) -> io::Result<()> {
+    let mut peek = [0u8; 1024];
+    let n = tcp.peek(&mut peek).await?;
+    let request = String::from_utf8_lossy(&peek[..n]);
+    let target = request
+        .lines()
+        .next()
+        .and_then(|line| line.split_whitespace().nth(1))
+        .unwrap_or("/")
+        .to_string();
+    let authorization = request.lines().find_map(|line| {
+        let (name, value) = line.split_once(':')?;
+        name.eq_ignore_ascii_case("authorization")
+            .then(|| value.trim().to_string())
+    });
     let ws = accept_async(tcp).await.map_err(io::Error::other)?;
     let (relay_side, home_side) = tokio::io::duplex(64 * 1024);
     tokio::spawn(async move {
         let _ = pump_ws(ws, relay_side).await;
     });
-    serve_home_pair(home_side, state).await
+    if target.starts_with("/session/dial?") {
+        state.session_dials.fetch_add(1, Ordering::SeqCst);
+        *state.dial_target.lock().unwrap() = Some(target);
+        *state.dial_authorization.lock().unwrap() = authorization;
+        serve_home_carrier(home_side, state).await
+    } else {
+        serve_home_pair(home_side, state).await
+    }
 }
 
 async fn pump_ws(ws: WebSocketStream<TcpStream>, relay_side: DuplexStream) -> io::Result<()> {
@@ -234,6 +268,7 @@ async fn handle_http(mut tcp: TcpStream, state: Arc<MockState>) -> io::Result<()
         .unwrap_or("/");
 
     if path == "/enroll/device" {
+        state.enroll_hits.fetch_add(1, Ordering::SeqCst);
         let status = *state.enroll_status.lock().unwrap();
         match status {
             Some(status) => write_json(&mut tcp, status, json!({"error":"rejected"})).await?,
@@ -350,13 +385,23 @@ async fn serve_home_pair(stream: DuplexStream, state: Arc<MockState>) -> io::Res
         "ca_chain": [state.json_ca.cert.pem()],
         "instance_id": instance_id,
         "home_label": "Home",
-        "fingerprint": fingerprint,
-        "local_endpoints": [{"ip":"10.0.0.2","port":7657,"scope":"lan"}]
+        "fingerprint": fingerprint
     });
+    if !matches!(state.home_mode, HomeMode::NoLocalEndpoints) {
+        response["local_endpoints"] = json!([{"ip":"10.0.0.2","port":7657,"scope":"lan"}]);
+    }
     if !matches!(state.home_mode, HomeMode::MissingHomeAttestation) {
         response["home_attestation"] = json!("attestation");
     }
     write_pl_response(&mut tls, 200, response).await
+}
+
+async fn serve_home_carrier(stream: DuplexStream, state: Arc<MockState>) -> io::Result<()> {
+    let acceptor = TlsAcceptor::from(Arc::new(leaf_config(state.tls_signer.as_ref())));
+    let mut tls = acceptor.accept(stream).await.map_err(io::Error::other)?;
+    let mut buf = [0u8; 4096];
+    while tls.read(&mut buf).await? != 0 {}
+    Ok(())
 }
 
 async fn read_pl_request<S>(tls: &mut S) -> io::Result<Vec<u8>>
@@ -443,6 +488,66 @@ async fn relay_pairing_full_ceremony_populates_credential() {
         credential.local_endpoints,
         Some(json!([{"ip":"10.0.0.2","port":7657,"scope":"lan"}]))
     );
+}
+
+#[tokio::test]
+async fn relay_enrollment_builds_relay_only_persistent_carrier_through_public_api() {
+    let mut mock = MockState::normal().with_same_tls_ca();
+    mock.home_mode = HomeMode::NoLocalEndpoints;
+    let state = Arc::new(mock);
+    let origin = spawn_mock_relay(state.clone()).await;
+    let link = relay_link(origin.clone(), state.json_ca.spki_pin());
+
+    #[expect(
+        clippy::large_futures,
+        reason = "the copied transport future keeps its established stack layout; this site goes red if a later refactor shrinks it"
+    )]
+    let mut credential = pair_over_relay(&link, "resident-test", &serde_json::Map::new())
+        .await
+        .unwrap();
+    assert!(credential.endpoints.is_empty());
+
+    #[expect(
+        clippy::large_futures,
+        reason = "the public enrollment future keeps the transport harness stack layout visible at its assertion site"
+    )]
+    let token = enroll_device(
+        &origin,
+        &credential.instance_id,
+        credential.home_attestation.as_deref().unwrap(),
+    )
+    .await
+    .unwrap();
+    credential.device_token_expires_at =
+        spl_core::jwt::decode_unverified_claims(&token).map(|claims| claims.exp);
+    credential.device_token = Some(token.clone());
+
+    let client = TransportClient::new_relay_only(credential, None).unwrap();
+    #[expect(
+        clippy::large_futures,
+        reason = "the public carrier dial keeps the transport harness stack layout visible at its assertion site"
+    )]
+    let carrier = client.dial_carrier().await.unwrap();
+
+    assert_eq!(state.enroll_hits.load(Ordering::SeqCst), 2);
+    assert_eq!(state.session_dials.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        state.dial_authorization.lock().unwrap().as_deref(),
+        Some(format!("Bearer {token}").as_str())
+    );
+    assert!(
+        state
+            .dial_target
+            .lock()
+            .unwrap()
+            .as_deref()
+            .is_some_and(|target| target.contains(&credential_instance_query(&state)))
+    );
+    drop(carrier);
+}
+
+fn credential_instance_query(state: &MockState) -> String {
+    format!("instance={}", jid_for_ca(state.json_ca.as_ref()))
 }
 
 #[tokio::test]

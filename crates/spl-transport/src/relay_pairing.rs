@@ -124,7 +124,23 @@ pub async fn pair_over_relay(
     })
 }
 
-async fn enroll_device(
+/// Exchange a fresh home attestation for a relay device token.
+///
+/// The caller must obtain `home_attestation` from a current pairing ceremony.
+/// The relay requires its JWT lifetime to be no more than five minutes, so the
+/// copy stored on [`Credential`] is not a restart-survivable enrollment input.
+/// Once that pairing window has elapsed, a device that receives
+/// [`crate::relay_token::RefreshOutcome::ReconnectNeeded`] after restarting
+/// requires a new pairing ceremony. This crate forwards the attestation without
+/// parsing, signature verification, or a local expiry check.
+///
+/// # Errors
+///
+/// Returns [`TransportError::RelayControlRejected`] with
+/// [`RelayControlEndpoint::EnrollDevice`] when the relay rejects a stale or
+/// otherwise invalid attestation. Returns an I/O, TLS, JSON, or pairing error
+/// when the request fails or a successful response is malformed.
+pub async fn enroll_device(
     relay_origin: &str,
     instance_id: &str,
     home_attestation: &str,

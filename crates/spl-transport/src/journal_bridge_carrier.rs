@@ -20,7 +20,7 @@ use tokio::sync::{Mutex, mpsc, oneshot};
 use tokio::time::{Instant, MissedTickBehavior};
 
 use crate::client::{CarrierIo, CarrierKind};
-use crate::journal_bridge::CarrierOpener;
+use crate::journal_bridge::{CarrierOpener, SharedStatus, lock_status};
 use crate::{TransportError, transport_error_code};
 
 const READ_BUF_BYTES: usize = 64 * 1024;
@@ -35,21 +35,24 @@ pub(crate) struct MuxCarrier {
     opener: Arc<dyn CarrierOpener>,
     slot: Mutex<Option<Arc<CarrierHandle>>>,
     keepalive: KeepaliveConfig,
+    status: SharedStatus,
 }
 
 impl MuxCarrier {
-    pub(crate) fn new(opener: Arc<dyn CarrierOpener>) -> Self {
-        Self::with_keepalive(opener, KeepaliveConfig::default())
+    pub(crate) fn new(opener: Arc<dyn CarrierOpener>, status: SharedStatus) -> Self {
+        Self::with_keepalive(opener, KeepaliveConfig::default(), status)
     }
 
     pub(crate) fn with_keepalive(
         opener: Arc<dyn CarrierOpener>,
         keepalive: KeepaliveConfig,
+        status: SharedStatus,
     ) -> Self {
         Self {
             opener,
             slot: Mutex::new(None),
             keepalive,
+            status,
         }
     }
 
@@ -96,6 +99,7 @@ impl MuxCarrier {
         let handle = self.slot.lock().await.take();
         if let Some(handle) = handle {
             handle.alive.store(false, Ordering::SeqCst);
+            mark_carrier_dead(&self.status, &handle.status_identity);
             let _ = handle.commands.send(CarrierCommand::Shutdown).await;
         }
     }
@@ -107,6 +111,9 @@ impl MuxCarrier {
         {
             return Ok(handle.clone());
         }
+        if let Some(handle) = slot.as_ref() {
+            mark_carrier_dead(&self.status, &handle.status_identity);
+        }
 
         let dialed = self.opener.dial_carrier().await?;
         let (stream, kind) = dialed.into_parts();
@@ -114,12 +121,21 @@ impl MuxCarrier {
         let (commands_tx, commands_rx) = mpsc::channel(COMMAND_QUEUE);
         let (writer_tx, writer_rx) = mpsc::channel(WRITER_QUEUE);
         let alive = Arc::new(AtomicBool::new(true));
+        let status_identity = Arc::new(());
         let handle = Arc::new(CarrierHandle {
             commands: commands_tx,
             alive: alive.clone(),
+            status_identity: status_identity.clone(),
         });
 
-        tokio::spawn(writer_task(write, writer_rx, alive.clone()));
+        let mut status = lock_status(&self.status);
+        tokio::spawn(writer_task(
+            write,
+            writer_rx,
+            alive.clone(),
+            self.status.clone(),
+            status_identity.clone(),
+        ));
         tokio::spawn(coordinator_task(
             read,
             commands_rx,
@@ -128,9 +144,14 @@ impl MuxCarrier {
             alive,
             kind,
             self.keepalive,
+            self.status.clone(),
+            status_identity.clone(),
         ));
 
         *slot = Some(handle.clone());
+        status.current_carrier = Some(status_identity);
+        status.snapshot.carrier_live = true;
+        drop(status);
         Ok(handle)
     }
 
@@ -175,6 +196,7 @@ impl MuxCarrier {
             .unwrap_or(false)
         {
             *slot = None;
+            mark_carrier_dead(&self.status, &handle.status_identity);
         }
     }
 }
@@ -187,6 +209,7 @@ enum OpenFailure {
 pub(crate) struct CarrierHandle {
     commands: mpsc::Sender<CarrierCommand>,
     alive: Arc<AtomicBool>,
+    status_identity: Arc<()>,
 }
 
 pub(crate) struct StreamRx {
@@ -289,6 +312,8 @@ async fn writer_task(
     mut write: CarrierWrite,
     mut rx: mpsc::Receiver<Vec<u8>>,
     alive: Arc<AtomicBool>,
+    status: SharedStatus,
+    status_identity: Arc<()>,
 ) {
     while let Some(bytes) = rx.recv().await {
         if write.write_all(&bytes).await.is_err() || write.flush().await.is_err() {
@@ -296,11 +321,13 @@ async fn writer_task(
         }
     }
     alive.store(false, Ordering::SeqCst);
+    mark_carrier_dead(&status, &status_identity);
 }
 
 #[expect(
     clippy::too_many_lines,
-    reason = "the copied coordinator keeps its single event loop and ordering invariants together"
+    clippy::too_many_arguments,
+    reason = "the copied coordinator keeps its single event loop, carrier generation, and ordering invariants together"
 )]
 async fn coordinator_task(
     mut read: CarrierRead,
@@ -310,6 +337,8 @@ async fn coordinator_task(
     alive: Arc<AtomicBool>,
     kind: CarrierKind,
     keepalive: KeepaliveConfig,
+    status: SharedStatus,
+    status_identity: Arc<()>,
 ) {
     let mut demux = CarrierDemux::new();
     let mut dialer = FrameDialer::default();
@@ -433,6 +462,19 @@ async fn coordinator_task(
     }
 
     alive.store(false, Ordering::SeqCst);
+    mark_carrier_dead(&status, &status_identity);
+}
+
+fn mark_carrier_dead(status: &SharedStatus, status_identity: &Arc<()>) {
+    let mut record = lock_status(status);
+    if record
+        .current_carrier
+        .as_ref()
+        .is_some_and(|current| Arc::ptr_eq(current, status_identity))
+    {
+        record.current_carrier = None;
+        record.snapshot.carrier_live = false;
+    }
 }
 
 fn handle_read(
@@ -732,7 +774,20 @@ mod tests {
         let (commands_tx, commands_rx) = mpsc::channel(COMMAND_QUEUE);
         let (writer_tx, writer_rx) = mpsc::channel(WRITER_QUEUE);
         let alive = Arc::new(AtomicBool::new(true));
-        tokio::spawn(writer_task(write, writer_rx, alive.clone()));
+        let status = crate::journal_bridge::new_status();
+        let status_identity = Arc::new(());
+        {
+            let mut record = lock_status(&status);
+            record.current_carrier = Some(status_identity.clone());
+            record.snapshot.carrier_live = true;
+        }
+        tokio::spawn(writer_task(
+            write,
+            writer_rx,
+            alive.clone(),
+            status.clone(),
+            status_identity.clone(),
+        ));
         tokio::spawn(coordinator_task(
             read,
             commands_rx,
@@ -741,6 +796,8 @@ mod tests {
             alive.clone(),
             CarrierKind::Lan,
             keepalive,
+            status,
+            status_identity,
         ));
         (commands_tx, alive, server)
     }

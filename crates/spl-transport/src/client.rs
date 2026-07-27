@@ -80,6 +80,55 @@ impl TransportClient {
                 "relay credential has no LAN endpoints".into(),
             ));
         }
+        Self::build(credential, token_persist)
+    }
+
+    /// Build a transport client for a credential that deliberately has only a
+    /// relay origin and device token.
+    ///
+    /// Use [`TransportClient::new`] when the credential carries LAN endpoints.
+    /// This client never dials LAN because an empty endpoint list is required, so
+    /// [`TransportClient::dial_carrier`] proceeds directly to relay fallback
+    /// without a direct-network delay.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TransportError::Pairing`] when the credential carries LAN
+    /// endpoints or lacks a relay origin or device token. Returns a TLS or crypto
+    /// error when the certificate, private key, or fingerprint pin is invalid.
+    pub fn new_relay_only(
+        credential: Credential,
+        token_persist: Option<TokenPersistHook>,
+    ) -> Result<Self, TransportError> {
+        if !credential.endpoints.is_empty() {
+            return Err(TransportError::Pairing(
+                "relay-only credential has LAN endpoints; use TransportClient::new for a credential with LAN endpoints"
+                    .into(),
+            ));
+        }
+        if !matches!(
+            credential.relay_origin.as_deref(),
+            Some(origin) if !origin.is_empty()
+        ) {
+            return Err(TransportError::Pairing(
+                "relay-only credential has no relay origin".into(),
+            ));
+        }
+        if !matches!(
+            credential.device_token.as_deref(),
+            Some(token) if !token.is_empty()
+        ) {
+            return Err(TransportError::Pairing(
+                "relay-only credential has no device token".into(),
+            ));
+        }
+        Self::build(credential, token_persist)
+    }
+
+    fn build(
+        credential: Credential,
+        token_persist: Option<TokenPersistHook>,
+    ) -> Result<Self, TransportError> {
         let device_token = credential.device_token.clone().map(tokio::sync::Mutex::new);
         let chain = tls::parse_certs(&credential.client_cert_pem)?;
         let key = tls::parse_private_key(&credential.client_key_pem)?;

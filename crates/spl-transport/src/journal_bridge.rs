@@ -11,8 +11,7 @@
 
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use spl_core::bridge::{
     self, BOOTSTRAP_ROUTE, BridgeNames, FailureCategory, RejectReason, RequestHead,
@@ -51,8 +50,104 @@ pub enum CapabilityGate {
     Disabled,
 }
 
+/// Complete response returned locally without opening an upstream stream.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LocalResponse {
+    /// HTTP response status.
+    pub status: u16,
+    /// HTTP response content type.
+    pub content_type: String,
+    /// Complete response body.
+    pub body: Vec<u8>,
+}
+
+/// Owned point-in-time status for one journal bridge.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct JournalBridgeStatus {
+    /// Whether the loopback listener task has not exited.
+    pub listener_active: bool,
+    /// Whether the listener has accepted at least one TCP connection.
+    pub contacted: bool,
+    /// Whether the current persistent carrier is live.
+    pub carrier_live: bool,
+    /// Accepted connection tasks that have not completed.
+    pub active_requests: usize,
+}
+
+pub(crate) type SharedStatus = Arc<Mutex<StatusRecord>>;
+
+pub(crate) struct StatusRecord {
+    pub(crate) snapshot: JournalBridgeStatus,
+    pub(crate) current_carrier: Option<Arc<()>>,
+}
+
+pub(crate) fn lock_status(status: &SharedStatus) -> MutexGuard<'_, StatusRecord> {
+    match status.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    }
+}
+
+pub(crate) fn new_status() -> SharedStatus {
+    Arc::new(Mutex::new(StatusRecord {
+        snapshot: JournalBridgeStatus {
+            listener_active: false,
+            contacted: false,
+            carrier_live: false,
+            active_requests: 0,
+        },
+        current_carrier: None,
+    }))
+}
+
+fn status_snapshot(status: &SharedStatus) -> JournalBridgeStatus {
+    lock_status(status).snapshot
+}
+
+struct ListenerActiveGuard {
+    status: SharedStatus,
+}
+
+impl ListenerActiveGuard {
+    fn new(status: SharedStatus) -> Self {
+        lock_status(&status).snapshot.listener_active = true;
+        Self { status }
+    }
+}
+
+impl Drop for ListenerActiveGuard {
+    fn drop(&mut self) {
+        lock_status(&self.status).snapshot.listener_active = false;
+    }
+}
+
+struct ActiveRequestGuard {
+    status: SharedStatus,
+}
+
+impl ActiveRequestGuard {
+    fn new(status: SharedStatus) -> Self {
+        let mut record = lock_status(&status);
+        record.snapshot.contacted = true;
+        record.snapshot.active_requests = record.snapshot.active_requests.saturating_add(1);
+        drop(record);
+        Self { status }
+    }
+}
+
+impl Drop for ActiveRequestGuard {
+    fn drop(&mut self) {
+        let mut record = lock_status(&self.status);
+        record.snapshot.active_requests = record.snapshot.active_requests.saturating_sub(1);
+    }
+}
+
 /// Consumer-selected behavior for one loopback bridge.
 #[derive(Clone)]
+#[expect(
+    clippy::type_complexity,
+    reason = "the two public policy hooks keep their complete synchronous per-request signatures visible"
+)]
 pub struct BridgePolicy {
     /// IPv4 loopback port to bind, or zero for an ephemeral port.
     pub port: u16,
@@ -62,6 +157,21 @@ pub struct BridgePolicy {
     /// Selected requests forward their real method and body; the default
     /// bodyless `GET /sse/events` is unchanged, while a GET with a body forwards it.
     pub stream_response: Arc<dyn Fn(&RequestHead) -> bool + Send + Sync>,
+    /// Optionally answer an authorized request without opening an upstream
+    /// stream. The hook receives one coherent owned-status view by reference.
+    pub local_response:
+        Arc<dyn Fn(&RequestHead, &JournalBridgeStatus) -> Option<LocalResponse> + Send + Sync>,
+    /// Produce attribution headers from the unfiltered authorized request.
+    ///
+    /// The bridge never promotes a caller-supplied header on its own: every
+    /// attribution header reaching upstream was produced by consumer code that
+    /// saw the request. Reserved header names can never be attributed, and
+    /// cookies are never accepted as attribution headers.
+    ///
+    /// This hook does not authenticate the caller or bind attribution to a
+    /// caller identity. Consumer code that copies a caller header verbatim
+    /// reopens forgery, and this crate cannot prevent that.
+    pub attribution_headers: Arc<dyn Fn(&RequestHead) -> Vec<(String, String)> + Send + Sync>,
     /// Policy for forwarding non-cookie request headers.
     pub request_headers: RequestHeaderPolicy,
     /// Maximum request body accepted from a local client.
@@ -74,6 +184,8 @@ impl Default for BridgePolicy {
             port: 0,
             capability_gate: CapabilityGate::Enabled,
             stream_response: Arc::new(|head| head.method == "GET" && head.path() == "/sse/events"),
+            local_response: Arc::new(|_, _| None),
+            attribution_headers: Arc::new(|_| Vec::new()),
             request_headers: RequestHeaderPolicy::Allow(
                 DEFAULT_REQUEST_HEADERS
                     .iter()
@@ -123,7 +235,7 @@ pub struct JournalBridgeConfig {
 pub struct JournalBridgeHandle {
     port: u16,
     capability: CapabilityState,
-    contacted: Arc<AtomicBool>,
+    status: SharedStatus,
     shutdown: oneshot::Sender<()>,
     join: JoinHandle<()>,
 }
@@ -137,7 +249,12 @@ impl JournalBridgeHandle {
     /// Whether the loopback listener has accepted at least one TCP connection.
     /// Write-once observation flag (set at accept, before HTTP parse).
     pub fn contacted(&self) -> bool {
-        self.contacted.load(Ordering::Relaxed)
+        self.status().contacted
+    }
+
+    /// Return one coherent owned bridge-status snapshot.
+    pub fn status(&self) -> JournalBridgeStatus {
+        status_snapshot(&self.status)
     }
 
     /// Return the bootstrap URL when capability authorization is enabled.
@@ -185,14 +302,22 @@ impl CapabilityState {
     }
 }
 
+#[expect(
+    clippy::type_complexity,
+    reason = "the runtime retains the public policy hook signatures without adapter types"
+)]
 struct BridgeRuntime {
     carrier: Arc<MuxCarrier>,
+    status: SharedStatus,
     capability: CapabilityState,
     port: u16,
     journal_hosts: Vec<String>,
     loopback_origin: String,
     bridge_names: BridgeNames,
     stream_response: Arc<dyn Fn(&RequestHead) -> bool + Send + Sync>,
+    local_response:
+        Arc<dyn Fn(&RequestHead, &JournalBridgeStatus) -> Option<LocalResponse> + Send + Sync>,
+    attribution_headers: Arc<dyn Fn(&RequestHead) -> Vec<(String, String)> + Send + Sync>,
     request_headers: RequestHeaderPolicy,
     max_request_body_bytes: usize,
 }
@@ -224,6 +349,8 @@ pub async fn start(config: JournalBridgeConfig) -> Result<JournalBridgeHandle, B
         port: requested_port,
         capability_gate,
         stream_response,
+        local_response,
+        attribution_headers,
         request_headers,
         max_request_body_bytes,
     } = policy;
@@ -232,7 +359,8 @@ pub async fn start(config: JournalBridgeConfig) -> Result<JournalBridgeHandle, B
     // it remains the conventional hostname for transport redirect rewriting.
     journal_hosts.push("spl.local".to_string());
     journal_hosts.extend(endpoint_hosts);
-    let carrier = Arc::new(MuxCarrier::new(opener));
+    let status = new_status();
+    let carrier = Arc::new(MuxCarrier::new(opener, status.clone()));
 
     let capability = match capability_gate {
         CapabilityGate::Enabled => CapabilityState::Enabled(Arc::new(mint_capability()?)),
@@ -255,29 +383,27 @@ pub async fn start(config: JournalBridgeConfig) -> Result<JournalBridgeHandle, B
         .port();
     let runtime = Arc::new(BridgeRuntime {
         carrier,
+        status: status.clone(),
         capability: capability.clone(),
         port,
         journal_hosts,
         loopback_origin: format!("http://127.0.0.1:{port}"),
         bridge_names,
         stream_response,
+        local_response,
+        attribution_headers,
         request_headers,
         max_request_body_bytes,
     });
     let (shutdown, shutdown_rx) = oneshot::channel();
 
-    let contacted = Arc::new(AtomicBool::new(false));
-    let join = tokio::spawn(accept_loop(
-        listener,
-        shutdown_rx,
-        runtime,
-        contacted.clone(),
-    ));
+    let listener_guard = ListenerActiveGuard::new(status.clone());
+    let join = tokio::spawn(accept_loop(listener, shutdown_rx, runtime, listener_guard));
 
     Ok(JournalBridgeHandle {
         port,
         capability,
-        contacted,
+        status,
         shutdown,
         join,
     })
@@ -310,7 +436,7 @@ async fn accept_loop(
     listener: TcpListener,
     mut shutdown: oneshot::Receiver<()>,
     runtime: Arc<BridgeRuntime>,
-    contacted: Arc<AtomicBool>,
+    _listener_guard: ListenerActiveGuard,
 ) {
     loop {
         tokio::select! {
@@ -322,14 +448,18 @@ async fn accept_loop(
                 let Ok((stream, _)) = accepted else {
                     continue;
                 };
-                contacted.store(true, Ordering::Relaxed);
-                tokio::spawn(handle_conn(stream, runtime.clone()));
+                let request_guard = ActiveRequestGuard::new(runtime.status.clone());
+                tokio::spawn(handle_conn(stream, runtime.clone(), request_guard));
             }
         }
     }
 }
 
-async fn handle_conn(mut stream: TcpStream, runtime: Arc<BridgeRuntime>) {
+async fn handle_conn(
+    mut stream: TcpStream,
+    runtime: Arc<BridgeRuntime>,
+    _request_guard: ActiveRequestGuard,
+) {
     let Some((head_bytes, body)) = read_request(&mut stream, runtime.max_request_body_bytes).await
     else {
         return;
@@ -339,19 +469,9 @@ async fn handle_conn(mut stream: TcpStream, runtime: Arc<BridgeRuntime>) {
         return;
     };
     let bootstrap_capability = runtime.capability.bootstrap_capability(request_head.path());
-    let route = if bootstrap_capability.is_some() {
-        "bootstrap"
-    } else {
-        "upstream"
-    };
-    tracing::info!(
-        target: "journal_bridge",
-        method = request_head.method.as_str(),
-        route,
-        "local request"
-    );
 
     if let Some(capability) = bootstrap_capability {
+        log_local_request(&request_head, "bootstrap");
         handle_bootstrap(
             &mut stream,
             &request_head,
@@ -387,11 +507,29 @@ async fn handle_conn(mut stream: TcpStream, runtime: Arc<BridgeRuntime>) {
         return;
     }
 
-    let upstream_headers = bridge::upstream_request_headers(
+    let snapshot = status_snapshot(&runtime.status);
+    if let Some(response) = (runtime.local_response)(&request_head, &snapshot) {
+        log_local_request(&request_head, "local");
+        let content_type = safe_content_type(&response.content_type);
+        write_local(&mut stream, response.status, &response.body, content_type).await;
+        return;
+    }
+
+    log_local_request(&request_head, "upstream");
+    let mut upstream_headers = bridge::upstream_request_headers(
         &request_head,
         &runtime.bridge_names,
         &runtime.request_headers,
     );
+    let attribution_headers = filtered_attribution_headers(
+        &request_head,
+        &runtime.bridge_names,
+        (runtime.attribution_headers)(&request_head),
+    );
+    for (name, _) in &attribution_headers {
+        upstream_headers.retain(|(existing, _)| !existing.eq_ignore_ascii_case(name));
+    }
+    upstream_headers.extend(attribution_headers);
     if (runtime.stream_response)(&request_head) {
         forward_streaming(
             &mut stream,
@@ -411,6 +549,23 @@ async fn handle_conn(mut stream: TcpStream, runtime: Arc<BridgeRuntime>) {
         )
         .await;
     }
+}
+
+fn filtered_attribution_headers(
+    request_head: &RequestHead,
+    bridge_names: &BridgeNames,
+    headers: Vec<(String, String)>,
+) -> Vec<(String, String)> {
+    let headers = headers
+        .into_iter()
+        .filter(|(name, _)| !name.eq_ignore_ascii_case("cookie"))
+        .collect();
+    let attribution = RequestHead {
+        method: request_head.method.clone(),
+        target: request_head.target.clone(),
+        headers,
+    };
+    bridge::upstream_request_headers(&attribution, bridge_names, &RequestHeaderPolicy::ForwardAll)
 }
 
 async fn handle_bootstrap(
@@ -789,6 +944,23 @@ fn log_capability_reject(reason: RejectReason) {
     );
 }
 
+fn log_local_request(request_head: &RequestHead, route: &'static str) {
+    tracing::info!(
+        target: "journal_bridge",
+        method = request_head.method.as_str(),
+        route,
+        "local request"
+    );
+}
+
+fn safe_content_type(content_type: &str) -> &str {
+    if content_type.contains(['\r', '\n']) {
+        "application/octet-stream"
+    } else {
+        content_type
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -801,6 +973,8 @@ mod tests {
             port,
             capability_gate,
             stream_response,
+            local_response,
+            attribution_headers,
             request_headers,
             max_request_body_bytes,
         } = BridgePolicy::default();
@@ -830,5 +1004,17 @@ mod tests {
         assert!(stream_response(&request("GET", "/sse/events")));
         assert!(!stream_response(&request("HEAD", "/sse/events")));
         assert!(!stream_response(&request("GET", "/other")));
+        let status = JournalBridgeStatus {
+            listener_active: true,
+            contacted: true,
+            carrier_live: false,
+            active_requests: 1,
+        };
+        assert!(local_response(&request("GET", "/other"), &status).is_none());
+        assert!(attribution_headers(&request("GET", "/other")).is_empty());
+        assert_eq!(
+            safe_content_type("text/plain\r\nx-injected: value"),
+            "application/octet-stream"
+        );
     }
 }

@@ -71,7 +71,8 @@ pub const PAIR_PATH: &str = "/app/network/pair";
 pub struct PairRequest {
     /// PEM-encoded certificate-signing request for the generated device key.
     pub csr: String,
-    /// Human-facing label to place in the signed device certificate.
+    /// Full human-facing device label carried as request data; the certificate
+    /// subject CN may contain only a truncated prefix.
     pub device_label: String,
     /// Consumer-defined top-level request fields forwarded without interpretation.
     #[serde(default, flatten)]

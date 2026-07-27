@@ -96,6 +96,8 @@ pub(crate) fn endpoint_addrs_from_local_endpoints(
         .collect()
 }
 
+/// Generate a device key and CSR whose subject CN is a UTF-8-safe prefix of
+/// `device_label`; the full label remains separate pairing-request data.
 pub(crate) fn generate_csr(device_label: &str) -> Result<GeneratedKey, TransportError> {
     let key_pair = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256)
         .map_err(|error| TransportError::Crypto(format!("keygen: {error}")))?;
@@ -117,6 +119,8 @@ pub(crate) fn generate_csr(device_label: &str) -> Result<GeneratedKey, Transport
     })
 }
 
+/// RFC 5280 defines `ub-common-name` as 64 characters. For parity with the
+/// consumer (`join_cli.py:417`), apply the stricter 64-byte limit.
 fn truncate_cn_label(device_label: &str) -> &str {
     let mut end = device_label.len().min(64);
     while !device_label.is_char_boundary(end) {

@@ -44,8 +44,13 @@ pub type DirectPairSendFuture<'a> =
     Pin<Box<dyn Future<Output = Result<HttpResponse, TransportError>> + Send + 'a>>;
 
 /// Consumer-implementable seam for preparing a direct-pairing transport.
+///
+/// Implementations must connect to the supplied [`Endpoint`] and use the
+/// supplied [`ClientConfig`] unmodified for TLS. Substituting the endpoint or
+/// relaxing the configuration defeats the CA-fingerprint pinning that makes
+/// the pairing nonce and CSR safe to transmit.
 pub trait DirectPairingSeam: Send + Sync {
-    /// Prepare a connection to `endpoint` without writing the pairing request.
+    /// Prepare the pinned TLS connection without writing the pairing request.
     fn prepare<'a>(
         &'a self,
         config: Arc<ClientConfig>,
@@ -55,7 +60,8 @@ pub trait DirectPairingSeam: Send + Sync {
 
 /// A prepared direct-pairing connection that has not yet sent its sole request.
 pub trait PreparedDirectPairConnection: Send {
-    /// Send the pairing request and return its HTTP response.
+    /// Transmit the supplied method, path, headers, and body unchanged over the
+    /// prepared connection, then return the peer's response unmodified.
     fn send<'a>(
         self: Box<Self>,
         method: &'a str,

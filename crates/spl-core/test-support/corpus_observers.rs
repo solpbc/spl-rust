@@ -9,12 +9,12 @@ use std::path::{Path, PathBuf};
 pub(crate) const PROTOCOL_REVISION: &str = "92b54d057d445d60b06b0fbe6f0c6b14120148ff";
 const VECTORS_PATH_FROM_MANIFEST: &str = "../../conformance/bundle/vectors.json";
 
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Deserialize)]
 pub(crate) struct Corpus {
     pub(crate) vectors: Vec<Vector>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Deserialize)]
 pub(crate) struct Vector {
     pub(crate) id: String,
     pub(crate) kind: VectorKind,
@@ -23,20 +23,20 @@ pub(crate) struct Vector {
     pub(crate) case: VectorCase,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[derive(PartialEq, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum VectorKind {
     Declared,
     Recorded,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Deserialize)]
 pub(crate) struct Citation {
     pub(crate) document: String,
     pub(crate) marker: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Deserialize)]
 #[serde(tag = "operation", rename_all = "snake_case")]
 pub(crate) enum VectorCase {
     ParsePairLink {
@@ -53,14 +53,14 @@ pub(crate) enum VectorCase {
     },
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Deserialize)]
 #[serde(tag = "encoding", rename_all = "snake_case")]
 pub(crate) enum PairInput {
     Link { value: String },
     BlobHex { value: String },
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, PartialEq, Deserialize)]
 #[serde(tag = "result", rename_all = "snake_case")]
 pub(crate) enum PairExpectation {
     Direct {
@@ -78,13 +78,13 @@ pub(crate) enum PairExpectation {
     },
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, PartialEq, Deserialize)]
 pub(crate) struct EndpointExpectation {
     pub(crate) host: String,
     pub(crate) port: u16,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, PartialEq, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub(crate) enum PairErrorExpectation {
     MissingFragment,

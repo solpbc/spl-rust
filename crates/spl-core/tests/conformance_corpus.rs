@@ -34,6 +34,7 @@ struct Manifest {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct FileDigest {
     path: String,
     sha256: String,
@@ -48,6 +49,7 @@ struct GeneratorInput {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct Adoption {
     spdx_license_identifier: String,
     #[serde(rename = "adoption_schema_version")]
@@ -123,6 +125,19 @@ fn vendored_bundle_is_byte_exact_against_manifest() -> Result<(), Box<dyn Error>
 fn adoption_record_agrees_with_vendored_bundle() -> Result<(), Box<dyn Error>> {
     let manifest = read_pinned_manifest()?;
     let adoption_path = adoption_path();
+    let adoption_metadata = fs::symlink_metadata(&adoption_path).map_err(|error| {
+        format!(
+            "failed to inspect {}: {error}",
+            repo_relative_display(&adoption_path)
+        )
+    })?;
+    if !adoption_metadata.file_type().is_file() {
+        return Err(format!(
+            "{} is not a regular file",
+            repo_relative_display(&adoption_path)
+        )
+        .into());
+    }
     let adoption_bytes = read_bytes(&adoption_path)?;
     let adoption: Adoption = serde_json::from_slice(&adoption_bytes).map_err(|error| {
         format!(
@@ -625,8 +640,8 @@ fn adoption_path() -> PathBuf {
 }
 
 fn repo_relative_display(path: &Path) -> String {
-    path.strip_prefix(repo_root()).map_or_else(
-        |_| path.display().to_string(),
-        |path| path.display().to_string(),
-    )
+    path.strip_prefix(repo_root())
+        .unwrap_or(path)
+        .display()
+        .to_string()
 }

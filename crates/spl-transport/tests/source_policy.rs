@@ -10,11 +10,14 @@ use std::path::{Path, PathBuf};
 #[test]
 fn library_sources_exclude_consumer_crates() -> Result<(), Box<dyn Error>> {
     let source_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    // `observer_` strictly broadens the four former observer-specific needles:
+    // observer_model, observer_retention, observer_log, and observer_segment.
     let needles = [
-        "observer_model",
-        "observer_retention",
-        "observer_log",
-        "observer_segment",
+        "sender_instance_id",
+        "role",
+        "segment",
+        "linked_system",
+        "observer_",
         "platform_win",
         "xtask",
     ];

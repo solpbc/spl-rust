@@ -73,6 +73,9 @@ pub struct PairRequest {
     pub csr: String,
     /// Human-facing label to place in the signed device certificate.
     pub device_label: String,
+    /// Consumer-defined top-level request fields forwarded without interpretation.
+    #[serde(default, flatten)]
+    pub additional_fields: serde_json::Map<String, serde_json::Value>,
 }
 
 /// Successful response from the pairing request.
@@ -98,4 +101,42 @@ pub struct PairResponse {
     /// Journal-advertised LAN endpoints, retained in their extensible JSON shape.
     #[serde(default)]
     pub local_endpoints: Option<serde_json::Value>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::PairRequest;
+
+    #[test]
+    fn pair_request_flattens_additional_fields_and_captures_unknown_fields() {
+        let decoded: PairRequest = serde_json::from_value(serde_json::json!({
+            "csr": "CSR",
+            "device_label": "device",
+            "consumer_field": {"enabled": true}
+        }))
+        .unwrap();
+        assert_eq!(
+            decoded.additional_fields.get("consumer_field"),
+            Some(&serde_json::json!({"enabled": true}))
+        );
+
+        let encoded = serde_json::to_value(&decoded).unwrap();
+        assert_eq!(encoded["csr"], "CSR");
+        assert_eq!(encoded["device_label"], "device");
+        assert_eq!(
+            encoded["consumer_field"],
+            serde_json::json!({"enabled": true})
+        );
+        assert!(encoded.get("additional_fields").is_none());
+
+        let without_extras = PairRequest {
+            csr: "CSR".into(),
+            device_label: "device".into(),
+            additional_fields: serde_json::Map::new(),
+        };
+        assert_eq!(
+            serde_json::to_value(without_extras).unwrap(),
+            serde_json::json!({"csr": "CSR", "device_label": "device"})
+        );
+    }
 }

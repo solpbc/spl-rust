@@ -167,7 +167,7 @@ pub enum TransportError {
     Rejected {
         /// HTTP response status.
         status: u16,
-        /// Response detail retained for presentation; it may contain raw peer text and must never be logged.
+        /// Sanitized rejection-body metadata retained for presentation; never contains raw peer response text.
         body: String,
     },
     /// Relay data-plane failure.

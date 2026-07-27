@@ -9,9 +9,12 @@ use rustls::pki_types::CertificateDer;
 use serde::Deserialize;
 use serde_json::json;
 use spl_core::pairlink::RelayPairLink;
-use spl_core::{PAIR_PATH, PairRequest, PairResponse, ca};
+use spl_core::{PAIR_PATH, PairResponse, ca};
 
 use crate::credential::{Credential, endpoint_addrs_from_local_endpoints, generate_csr};
+use crate::pairing::{
+    build_pair_request, summarize_rejection_body, verify_client_cert_key_binding,
+};
 use crate::{RelayControlEndpoint, TransportError, relay, relay_http, spki_pin, tls};
 
 #[derive(Deserialize)]
@@ -28,6 +31,7 @@ struct EnrollResponse {
 pub async fn pair_over_relay(
     link: &RelayPairLink,
     device_label: &str,
+    additional_fields: &serde_json::Map<String, serde_json::Value>,
 ) -> Result<Credential, TransportError> {
     let rk = spl_core::relay_window::derive_rk(&link.s);
     let url = spl_core::relay::pair_dial_url(&link.relay_origin)
@@ -35,10 +39,7 @@ pub async fn pair_over_relay(
     let ws = relay::dial_pair_relay_ws(&url, &hex_lower(&rk), relay::outer_config()).await?;
 
     let generated = generate_csr(device_label)?;
-    let request = PairRequest {
-        csr: generated.csr_pem,
-        device_label: device_label.to_string(),
-    };
+    let request = build_pair_request(generated.csr_pem, device_label, additional_fields)?;
     let body = serde_json::to_vec(&request)?;
     let headers = vec![("Content-Type".to_string(), "application/json".to_string())];
     let path = format!("{PAIR_PATH}?token={}", hex_lower(&link.s));
@@ -58,7 +59,7 @@ pub async fn pair_over_relay(
     if !response.is_success() {
         return Err(TransportError::Rejected {
             status: response.status,
-            body: response.body_text(),
+            body: summarize_rejection_body(&response.body),
         });
     }
 
@@ -90,6 +91,7 @@ pub async fn pair_over_relay(
             "relay client cert fingerprint mismatch".into(),
         ));
     }
+    verify_client_cert_key_binding(client_cert_der.as_ref(), &generated.public_key_spki_der)?;
 
     let home_attestation = pair
         .home_attestation
@@ -114,6 +116,8 @@ pub async fn pair_over_relay(
         instance_id: pair.instance_id,
         home_label: pair.home_label,
         endpoints,
+        home_attestation: pair.home_attestation,
+        local_endpoints: pair.local_endpoints,
         relay_origin: Some(link.relay_origin.clone()),
         device_token: Some(device_token),
         device_token_expires_at,

@@ -91,8 +91,9 @@ fn leaf_config(signer: &TestCa) -> ServerConfig {
 #[derive(Clone)]
 enum HomeMode {
     Ok,
-    InnerGone,
+    Reject { status: u16, body: &'static [u8] },
     MissingHomeAttestation,
+    UnrelatedClientKey,
 }
 
 struct MockState {
@@ -307,8 +308,8 @@ async fn serve_home_pair(stream: DuplexStream, state: Arc<MockState>) -> io::Res
     let mut tls = acceptor.accept(stream).await.map_err(io::Error::other)?;
     let request = read_pl_request(&mut tls).await?;
 
-    if matches!(state.home_mode, HomeMode::InnerGone) {
-        write_pl_response(&mut tls, 410, json!({"error":"gone"})).await?;
+    if let HomeMode::Reject { status, body } = &state.home_mode {
+        write_pl_response_bytes(&mut tls, *status, body).await?;
         return Ok(());
     }
 
@@ -324,10 +325,18 @@ async fn serve_home_pair(stream: DuplexStream, state: Arc<MockState>) -> io::Res
         .unwrap();
     let pair_request: PairRequest = serde_json::from_slice(body).unwrap();
     *state.pair_request.lock().unwrap() = Some(pair_request.clone());
-    let csr = CertificateSigningRequestParams::from_pem(&pair_request.csr).unwrap();
-    let client_cert = csr
-        .signed_by(&state.json_ca.cert, &state.json_ca.key)
-        .unwrap();
+    let client_cert = if matches!(state.home_mode, HomeMode::UnrelatedClientKey) {
+        let unrelated_key = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).unwrap();
+        CertificateParams::new(Vec::<String>::new())
+            .unwrap()
+            .signed_by(&unrelated_key, &state.json_ca.cert, &state.json_ca.key)
+            .unwrap()
+    } else {
+        CertificateSigningRequestParams::from_pem(&pair_request.csr)
+            .unwrap()
+            .signed_by(&state.json_ca.cert, &state.json_ca.key)
+            .unwrap()
+    };
     let fingerprint = format!("sha256:{}", spl_core::ca::sha256_hex(client_cert.der()));
 
     let instance_id = state
@@ -379,12 +388,21 @@ where
     S: AsyncWrite + Unpin,
 {
     let body = body.to_string();
+    write_pl_response_bytes(tls, status, body.as_bytes()).await
+}
+
+async fn write_pl_response_bytes<S>(tls: &mut S, status: u16, body: &[u8]) -> io::Result<()>
+where
+    S: AsyncWrite + Unpin,
+{
     let status_text = if status == 200 { "OK" } else { "ERR" };
-    let response = format!(
-        "HTTP/1.1 {status} {status_text}\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{body}",
+    let response_head = format!(
+        "HTTP/1.1 {status} {status_text}\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n",
         body.len()
     );
-    let frame = Frame::new(1, FLAG_DATA | FLAG_CLOSE, response.into_bytes());
+    let mut response = response_head.into_bytes();
+    response.extend_from_slice(body);
+    let frame = Frame::new(1, FLAG_DATA | FLAG_CLOSE, response);
     tls.write_all(&frame.encode().unwrap()).await?;
     tls.flush().await?;
     let _ = tls.shutdown().await;
@@ -401,7 +419,9 @@ async fn relay_pairing_full_ceremony_populates_credential() {
         clippy::large_futures,
         reason = "the copied transport future keeps its established stack layout; this site goes red if a later refactor shrinks it"
     )]
-    let credential = pair_over_relay(&link, "win-test").await.unwrap();
+    let credential = pair_over_relay(&link, "win-test", &serde_json::Map::new())
+        .await
+        .unwrap();
 
     assert_eq!(credential.relay_origin.as_deref(), Some(origin.as_str()));
     assert_eq!(credential.instance_id, jid_for_ca(state.json_ca.as_ref()));
@@ -417,6 +437,11 @@ async fn relay_pairing_full_ceremony_populates_credential() {
             host: "10.0.0.2".into(),
             port: 7657
         }]
+    );
+    assert_eq!(credential.home_attestation.as_deref(), Some("attestation"));
+    assert_eq!(
+        credential.local_endpoints,
+        Some(json!([{"ip":"10.0.0.2","port":7657,"scope":"lan"}]))
     );
 }
 
@@ -441,7 +466,9 @@ async fn observer_contract_authority_relay_pairing_uses_real_ceremony() {
         clippy::large_futures,
         reason = "the copied transport future keeps its established stack layout; this site goes red if a later refactor shrinks it"
     )]
-    let credential = pair_over_relay(&link, device_label).await.unwrap();
+    let credential = pair_over_relay(&link, device_label, &serde_json::Map::new())
+        .await
+        .unwrap();
     let captured = state.pair_request.lock().unwrap().clone().unwrap();
     assert_eq!(captured.device_label, device_label);
     assert!(captured.csr.contains("BEGIN CERTIFICATE REQUEST"));
@@ -476,9 +503,10 @@ async fn observer_contract_authority_pair_from_link_dispatches_relay_ceremony() 
         clippy::large_futures,
         reason = "the copied transport future keeps its established stack layout; this site goes red if a later refactor shrinks it"
     )]
-    let credential = spl_transport::pairing::pair_from_link(&link, device_label)
-        .await
-        .unwrap();
+    let credential =
+        spl_transport::pairing::pair_from_link(&link, device_label, &serde_json::Map::new())
+            .await
+            .unwrap();
     assert_eq!(
         state
             .pair_request
@@ -489,6 +517,49 @@ async fn observer_contract_authority_pair_from_link_dispatches_relay_ceremony() 
             .device_label,
         device_label
     );
+    assert!(credential.client_cert_pem.contains("BEGIN CERTIFICATE"));
+}
+
+#[tokio::test]
+async fn linked_system_pair_from_link_forwards_additional_fields_over_relay() {
+    let nonce = PAIR_EXAMPLE_NONCE;
+    let mut secret = [0u8; 8];
+    for (index, byte) in secret.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(&nonce[index * 2..index * 2 + 2], 16).unwrap();
+    }
+    let state = Arc::new(MockState::normal().with_same_tls_ca());
+    *state.expected_pair_token.lock().unwrap() = nonce[..16].to_owned();
+    let origin = spawn_mock_relay(state.clone()).await;
+    let origin_bytes = origin.as_bytes();
+    let mut blob = vec![0x06];
+    blob.extend_from_slice(&secret);
+    blob.push(0x01);
+    blob.extend_from_slice(&state.json_ca.spki_pin());
+    blob.push(u8::try_from(origin_bytes.len()).unwrap());
+    blob.extend_from_slice(origin_bytes);
+    let link = format!(
+        "https://go.solstone.app/p#{}",
+        spl_core::crockford::encode(&blob)
+    );
+    let device_label = "r".repeat(80);
+    let mut additional_fields = serde_json::Map::new();
+    additional_fields.insert("sender_instance_id".into(), json!("consumer-instance"));
+
+    #[expect(
+        clippy::large_futures,
+        reason = "the copied transport future keeps its established stack layout; this site goes red if a later refactor shrinks it"
+    )]
+    let credential =
+        spl_transport::pairing::pair_from_link(&link, &device_label, &additional_fields)
+            .await
+            .unwrap();
+
+    let captured = state.pair_request.lock().unwrap().clone().unwrap();
+    assert_eq!(
+        captured.additional_fields["sender_instance_id"],
+        json!("consumer-instance")
+    );
+    assert_eq!(captured.device_label, device_label);
     assert!(credential.client_cert_pem.contains("BEGIN CERTIFICATE"));
 }
 
@@ -504,7 +575,9 @@ async fn relay_pairing_rejects_jid_mismatch_before_enroll() {
         clippy::large_futures,
         reason = "the copied transport future keeps its established stack layout; this site goes red if a later refactor shrinks it"
     )]
-    let err = pair_over_relay(&link, "win-test").await.unwrap_err();
+    let err = pair_over_relay(&link, "win-test", &serde_json::Map::new())
+        .await
+        .unwrap_err();
     assert!(matches!(err, TransportError::Pairing(_)));
 }
 
@@ -518,7 +591,9 @@ async fn relay_pairing_rejects_anti_pin_theater_leaf() {
         clippy::large_futures,
         reason = "the copied transport future keeps its established stack layout; this site goes red if a later refactor shrinks it"
     )]
-    let err = pair_over_relay(&link, "win-test").await.unwrap_err();
+    let err = pair_over_relay(&link, "win-test", &serde_json::Map::new())
+        .await
+        .unwrap_err();
     assert!(matches!(err, TransportError::Pairing(_)));
 }
 
@@ -532,14 +607,19 @@ async fn relay_pairing_rejects_wrong_spki_before_enroll() {
         clippy::large_futures,
         reason = "the copied transport future keeps its established stack layout; this site goes red if a later refactor shrinks it"
     )]
-    let err = pair_over_relay(&link, "win-test").await.unwrap_err();
+    let err = pair_over_relay(&link, "win-test", &serde_json::Map::new())
+        .await
+        .unwrap_err();
     assert!(matches!(err, TransportError::Pairing(_)));
 }
 
 #[tokio::test]
 async fn relay_pairing_inner_410_maps_to_http_410() {
     let mut state = MockState::normal().with_same_tls_ca();
-    state.home_mode = HomeMode::InnerGone;
+    state.home_mode = HomeMode::Reject {
+        status: 410,
+        body: br#"{"error":"gone"}"#,
+    };
     let state = Arc::new(state);
     let origin = spawn_mock_relay(state.clone()).await;
     let link = relay_link(origin, state.json_ca.spki_pin());
@@ -548,9 +628,68 @@ async fn relay_pairing_inner_410_maps_to_http_410() {
         clippy::large_futures,
         reason = "the copied transport future keeps its established stack layout; this site goes red if a later refactor shrinks it"
     )]
-    let err = pair_over_relay(&link, "win-test").await.unwrap_err();
+    let err = pair_over_relay(&link, "win-test", &serde_json::Map::new())
+        .await
+        .unwrap_err();
     assert!(matches!(err, TransportError::Rejected { status: 410, .. }));
     assert_eq!(transport_error_code(&err), "http_410");
+}
+
+#[tokio::test]
+async fn relay_pairing_rejection_displays_only_body_summary() {
+    const SENTINEL: &str = "RELAY-PAIR-REJECTION-SENTINEL token=0123456789abcdef private=response";
+    let mut state = MockState::normal().with_same_tls_ca();
+    state.home_mode = HomeMode::Reject {
+        status: 403,
+        body: SENTINEL.as_bytes(),
+    };
+    let state = Arc::new(state);
+    let origin = spawn_mock_relay(state.clone()).await;
+    let link = relay_link(origin, state.json_ca.spki_pin());
+    let expected_digest = spl_core::ca::sha256_hex(SENTINEL.as_bytes());
+    let expected_display = format!(
+        "server rejected request: HTTP 403 rejection-body bytes={} sha256={}",
+        SENTINEL.len(),
+        &expected_digest[..12]
+    );
+
+    #[expect(
+        clippy::large_futures,
+        reason = "the copied transport future keeps its established stack layout; this site goes red if a later refactor shrinks it"
+    )]
+    let err = pair_over_relay(&link, "win-test", &serde_json::Map::new())
+        .await
+        .unwrap_err();
+
+    assert_eq!(err.to_string(), expected_display);
+    assert!(
+        !err.to_string().contains(SENTINEL),
+        "relay rejection display reflected sentinel"
+    );
+}
+
+#[tokio::test]
+async fn relay_pairing_rejects_client_certificate_for_unrelated_key() {
+    let mut state = MockState::normal().with_same_tls_ca();
+    state.home_mode = HomeMode::UnrelatedClientKey;
+    let state = Arc::new(state);
+    let origin = spawn_mock_relay(state.clone()).await;
+    let link = relay_link(origin, state.json_ca.spki_pin());
+
+    #[expect(
+        clippy::large_futures,
+        reason = "the copied transport future keeps its established stack layout; this site goes red if a later refactor shrinks it"
+    )]
+    let result = pair_over_relay(&link, "win-test", &serde_json::Map::new()).await;
+
+    assert!(
+        matches!(
+            result,
+            Err(TransportError::Pairing(message))
+                if message == "client certificate public key does not match generated key"
+        ),
+        "relay pairing accepted a client certificate for an unrelated key"
+    );
 }
 
 #[tokio::test]
@@ -565,7 +704,9 @@ async fn relay_pairing_rejects_missing_home_attestation() {
         clippy::large_futures,
         reason = "the copied transport future keeps its established stack layout; this site goes red if a later refactor shrinks it"
     )]
-    let err = pair_over_relay(&link, "win-test").await.unwrap_err();
+    let err = pair_over_relay(&link, "win-test", &serde_json::Map::new())
+        .await
+        .unwrap_err();
     assert!(matches!(err, TransportError::Pairing(_)));
 }
 
@@ -581,7 +722,9 @@ async fn relay_pairing_enroll_statuses_are_control_rejections() {
             clippy::large_futures,
             reason = "the copied transport future keeps its established stack layout; this site goes red if a later refactor shrinks it"
         )]
-        let err = pair_over_relay(&link, "win-test").await.unwrap_err();
+        let err = pair_over_relay(&link, "win-test", &serde_json::Map::new())
+            .await
+            .unwrap_err();
         assert!(matches!(
             err,
             TransportError::RelayControlRejected {

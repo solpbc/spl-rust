@@ -46,6 +46,12 @@ pub struct Credential {
     pub home_label: String,
     /// Direct-network endpoints learned during pairing.
     pub endpoints: Vec<EndpointAddr>,
+    /// Short-lived home attestation returned by the pairing ceremony, when supplied.
+    #[serde(default)]
+    pub home_attestation: Option<String>,
+    /// Journal-advertised LAN endpoints in their extensible response shape.
+    #[serde(default)]
+    pub local_endpoints: Option<serde_json::Value>,
     /// Relay control and WebSocket origin, when relay service is configured.
     #[serde(default)]
     pub relay_origin: Option<String>,
@@ -97,7 +103,7 @@ pub(crate) fn generate_csr(device_label: &str) -> Result<GeneratedKey, Transport
         .map_err(|error| TransportError::Crypto(format!("csr params: {error}")))?;
     params
         .distinguished_name
-        .push(DnType::CommonName, device_label);
+        .push(DnType::CommonName, truncate_cn_label(device_label));
     let csr = params
         .serialize_request(&key_pair)
         .map_err(|error| TransportError::Crypto(format!("csr serialize: {error}")))?;
@@ -111,9 +117,18 @@ pub(crate) fn generate_csr(device_label: &str) -> Result<GeneratedKey, Transport
     })
 }
 
+fn truncate_cn_label(device_label: &str) -> &str {
+    let mut end = device_label.len().min(64);
+    while !device_label.is_char_boundary(end) {
+        end -= 1;
+    }
+    &device_label[..end]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rcgen::{CertificateSigningRequestParams, DnValue};
 
     #[test]
     fn generated_csr_carries_matching_public_key_spki_der() {
@@ -122,6 +137,26 @@ mod tests {
         assert!(g.key_pem.contains("BEGIN PRIVATE KEY"));
         let key = KeyPair::from_pem(&g.key_pem).unwrap();
         assert_eq!(g.public_key_spki_der, key.public_key_der());
+    }
+
+    #[test]
+    fn generated_csr_truncates_common_name_to_64_bytes_at_utf8_boundary() {
+        for (label, expected) in [
+            ("a".repeat(80), "a".repeat(64)),
+            (format!("{}é-tail", "a".repeat(63)), "a".repeat(63)),
+        ] {
+            let generated = generate_csr(&label).unwrap();
+            let parsed = CertificateSigningRequestParams::from_pem(&generated.csr_pem).unwrap();
+            let Some(DnValue::Utf8String(common_name)) =
+                parsed.params.distinguished_name.get(&DnType::CommonName)
+            else {
+                panic!("generated CSR common name is not a UTF-8 string");
+            };
+            assert_eq!(
+                common_name, &expected,
+                "CSR common name exceeds the 64-byte bound"
+            );
+        }
     }
 
     #[test]
@@ -160,6 +195,10 @@ mod tests {
                 host: "127.0.0.1".into(),
                 port: 7657,
             }],
+            home_attestation: Some("home-attestation".into()),
+            local_endpoints: Some(serde_json::json!([
+                {"ip": "127.0.0.1", "port": 7657, "scope": "lan"}
+            ])),
             relay_origin: Some("https://relay.example".into()),
             device_token: Some("device-token".into()),
             device_token_expires_at: Some(1_800_000_000),
@@ -167,7 +206,7 @@ mod tests {
     }
 
     #[test]
-    fn relay_fields_round_trip_directly_through_credential() {
+    fn optional_fields_round_trip_directly_through_credential() {
         let encoded = serde_json::to_vec(&credential()).unwrap();
         let decoded: Credential = serde_json::from_slice(&encoded).unwrap();
 
@@ -177,6 +216,16 @@ mod tests {
         );
         assert_eq!(decoded.device_token.as_deref(), Some("device-token"));
         assert_eq!(decoded.device_token_expires_at, Some(1_800_000_000));
+        assert_eq!(
+            decoded.home_attestation.as_deref(),
+            Some("home-attestation")
+        );
+        assert_eq!(
+            decoded.local_endpoints,
+            Some(serde_json::json!([
+                {"ip": "127.0.0.1", "port": 7657, "scope": "lan"}
+            ]))
+        );
     }
 
     #[test]
@@ -196,5 +245,7 @@ mod tests {
         assert_eq!(decoded.relay_origin, None);
         assert_eq!(decoded.device_token, None);
         assert_eq!(decoded.device_token_expires_at, None);
+        assert_eq!(decoded.home_attestation, None);
+        assert_eq!(decoded.local_endpoints, None);
     }
 }

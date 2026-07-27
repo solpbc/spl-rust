@@ -26,18 +26,23 @@ use rcgen::{
     BasicConstraints, CertificateParams, CertificateSigningRequestParams, IsCa, KeyPair,
     KeyUsagePurpose, PKCS_ECDSA_P256_SHA256,
 };
-use rustls::ServerConfig;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
+use rustls::{ClientConfig, ServerConfig};
 use spl_core::bridge::BridgeNames;
 use spl_core::frame::{
     FLAG_CLOSE, FLAG_DATA, FLAG_RESET, FLAG_WINDOW, Frame, FrameDecoder, RESET_CANCEL,
 };
+use spl_core::http::HttpResponse;
 use spl_core::mux::INITIAL_WINDOW;
+use spl_core::pairlink::Endpoint;
 use spl_transport::TransportError;
 use spl_transport::client::{DialedCarrier, TransportClient};
 use spl_transport::connection::request_once;
 use spl_transport::credential::{Credential, EndpointAddr};
 use spl_transport::journal_bridge::{self, CarrierOpener, JournalBridgeConfig};
+use spl_transport::pairing::{
+    DirectPairPrepareFuture, DirectPairSendFuture, DirectPairingSeam, PreparedDirectPairConnection,
+};
 use spl_transport::tls::pairing_config;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
@@ -91,6 +96,8 @@ fn transport_credential(pin: Vec<u8>, port: u16) -> Credential {
             host: "127.0.0.1".into(),
             port,
         }],
+        home_attestation: None,
+        local_endpoints: None,
         relay_origin: None,
         device_token: None,
         device_token_expires_at: None,
@@ -206,34 +213,28 @@ enum PairCertificateMode {
     UnrelatedKey,
 }
 
-async fn serve_one_pair_response(
-    listener: TcpListener,
-    acceptor: TlsAcceptor,
-    signing_cert: rcgen::Certificate,
-    signing_key: KeyPair,
+fn pair_response_body(
+    pair_request: &spl_core::PairRequest,
+    signing_cert: &rcgen::Certificate,
+    signing_key: &KeyPair,
     mode: PairCertificateMode,
 ) -> Vec<u8> {
-    let (tcp, _) = listener.accept().await.unwrap();
-    let mut tls = acceptor.accept(tcp).await.unwrap();
-    let (stream_id, request) = read_framed_request(&mut tls).await;
-    let pair_request: spl_core::PairRequest =
-        serde_json::from_value(request_body(&request)).unwrap();
     let client_cert = match mode {
         PairCertificateMode::SubmittedCsr => {
             CertificateSigningRequestParams::from_pem(&pair_request.csr)
                 .unwrap()
-                .signed_by(&signing_cert, &signing_key)
+                .signed_by(signing_cert, signing_key)
                 .unwrap()
         }
         PairCertificateMode::UnrelatedKey => {
             let unrelated_key = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).unwrap();
             CertificateParams::new(Vec::<String>::new())
                 .unwrap()
-                .signed_by(&unrelated_key, &signing_cert, &signing_key)
+                .signed_by(&unrelated_key, signing_cert, signing_key)
                 .unwrap()
         }
     };
-    let response_body = serde_json::to_vec(&serde_json::json!({
+    serde_json::to_vec(&serde_json::json!({
         "client_cert": client_cert.pem(),
         "ca_chain": [signing_cert.pem()],
         "instance_id": PAIR_EXAMPLE_INSTANCE_ID,
@@ -246,7 +247,22 @@ async fn serve_one_pair_response(
             "scope": "lan",
         }],
     }))
-    .unwrap();
+    .unwrap()
+}
+
+async fn serve_one_pair_response(
+    listener: TcpListener,
+    acceptor: TlsAcceptor,
+    signing_cert: rcgen::Certificate,
+    signing_key: KeyPair,
+    mode: PairCertificateMode,
+) -> Vec<u8> {
+    let (tcp, _) = listener.accept().await.unwrap();
+    let mut tls = acceptor.accept(tcp).await.unwrap();
+    let (stream_id, request) = read_framed_request(&mut tls).await;
+    let pair_request: spl_core::PairRequest =
+        serde_json::from_value(request_body(&request)).unwrap();
+    let response_body = pair_response_body(&pair_request, &signing_cert, &signing_key, mode);
     let response = format!(
         "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
         response_body.len(),
@@ -257,6 +273,56 @@ async fn serve_one_pair_response(
     tls.flush().await.unwrap();
     let _ = tls.shutdown().await;
     request
+}
+
+struct ConsumerDirectPairingSeam;
+
+impl DirectPairingSeam for ConsumerDirectPairingSeam {
+    fn prepare<'a>(
+        &'a self,
+        _config: Arc<ClientConfig>,
+        _endpoint: &'a Endpoint,
+    ) -> DirectPairPrepareFuture<'a> {
+        Box::pin(async {
+            Ok(Box::new(ConsumerPreparedDirectPairConnection)
+                as Box<dyn PreparedDirectPairConnection>)
+        })
+    }
+}
+
+struct ConsumerPreparedDirectPairConnection;
+
+impl PreparedDirectPairConnection for ConsumerPreparedDirectPairConnection {
+    fn send<'a>(
+        self: Box<Self>,
+        _method: &'a str,
+        _path: &'a str,
+        _headers: &'a [(String, String)],
+        body: &'a [u8],
+    ) -> DirectPairSendFuture<'a> {
+        let response = (|| {
+            let pair_request: spl_core::PairRequest = serde_json::from_slice(body)?;
+            let signing_key = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).unwrap();
+            let mut signing_params = CertificateParams::new(Vec::<String>::new()).unwrap();
+            signing_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+            signing_params
+                .key_usages
+                .push(KeyUsagePurpose::DigitalSignature);
+            signing_params.key_usages.push(KeyUsagePurpose::KeyCertSign);
+            let signing_cert = signing_params.self_signed(&signing_key).unwrap();
+            Ok(HttpResponse {
+                status: 200,
+                headers: Vec::new(),
+                body: pair_response_body(
+                    &pair_request,
+                    &signing_cert,
+                    &signing_key,
+                    PairCertificateMode::SubmittedCsr,
+                ),
+            })
+        })();
+        Box::pin(async move { response })
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -828,11 +894,29 @@ async fn observer_contract_authority_direct_pairing_uses_real_crypto_and_request
         port,
     }];
 
-    let credential = spl_transport::pairing::pair(&endpoints, nonce, &server_pin, label)
-        .await
-        .unwrap();
+    let credential = spl_transport::pairing::pair(
+        &endpoints,
+        nonce,
+        &server_pin,
+        label,
+        &serde_json::Map::new(),
+    )
+    .await
+    .unwrap();
     assert_eq!(credential.instance_id, PAIR_EXAMPLE_INSTANCE_ID);
     assert_eq!(credential.home_label, PAIR_EXAMPLE_HOME_LABEL);
+    assert_eq!(
+        credential.home_attestation.as_deref(),
+        Some(PAIR_EXAMPLE_HOME_ATTESTATION)
+    );
+    assert_eq!(
+        credential.local_endpoints,
+        Some(serde_json::json!([{
+            "ip": "192.168.1.10",
+            "port": 7657,
+            "scope": "lan",
+        }]))
+    );
     assert!(credential.client_cert_pem.contains("BEGIN CERTIFICATE"));
     let credential_key = KeyPair::from_pem(&credential.client_key_pem).unwrap();
     let credential_leaf = spl_transport::tls::parse_certs(&credential.client_cert_pem)
@@ -850,6 +934,84 @@ async fn observer_contract_authority_direct_pairing_uses_real_crypto_and_request
         1,
     );
     assert!(!pair_capture_matches(mutated.as_bytes(), nonce, label));
+}
+
+#[tokio::test]
+async fn linked_system_pair_additional_fields_reach_direct_wire() {
+    let mut ca_params = CertificateParams::new(Vec::<String>::new()).unwrap();
+    ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+    ca_params.key_usages.push(KeyUsagePurpose::DigitalSignature);
+    ca_params.key_usages.push(KeyUsagePurpose::KeyCertSign);
+    let signing_key = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).unwrap();
+    let signing_cert = ca_params.self_signed(&signing_key).unwrap();
+
+    let (server_cert, server_key) = self_signed();
+    let server_pin = spl_core::ca::sha256(server_cert.as_ref())[..16].to_vec();
+    let acceptor = TlsAcceptor::from(Arc::new(server_config(server_cert, server_key)));
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let server = tokio::spawn(serve_one_pair_response(
+        listener,
+        acceptor,
+        signing_cert,
+        signing_key,
+        PairCertificateMode::SubmittedCsr,
+    ));
+    let endpoints = [Endpoint {
+        host: "127.0.0.1".to_owned(),
+        port,
+    }];
+    let device_label = "d".repeat(80);
+    let mut additional_fields = serde_json::Map::new();
+    additional_fields.insert(
+        "sender_instance_id".into(),
+        serde_json::json!("consumer-instance"),
+    );
+
+    spl_transport::pairing::pair(
+        &endpoints,
+        PAIR_EXAMPLE_NONCE,
+        &server_pin,
+        &device_label,
+        &additional_fields,
+    )
+    .await
+    .unwrap();
+
+    let request = server.await.unwrap();
+    let body = request_body(&request);
+    assert_eq!(
+        body["sender_instance_id"],
+        serde_json::json!("consumer-instance")
+    );
+    assert_eq!(body["device_label"], device_label);
+    assert!(
+        body["csr"]
+            .as_str()
+            .is_some_and(|csr| csr.contains("BEGIN CERTIFICATE REQUEST"))
+    );
+}
+
+#[tokio::test]
+async fn linked_system_can_implement_public_direct_pairing_seam() {
+    let endpoints = [Endpoint {
+        host: "consumer-transport.invalid".into(),
+        port: 7657,
+    }];
+
+    let credential = spl_transport::pairing::pair_with_seam(
+        &endpoints,
+        PAIR_EXAMPLE_NONCE,
+        &[0x22; 16],
+        PAIR_EXAMPLE_DEVICE_LABEL,
+        Arc::new(ConsumerDirectPairingSeam),
+        &serde_json::Map::new(),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(credential.instance_id, PAIR_EXAMPLE_INSTANCE_ID);
+    assert!(credential.client_cert_pem.contains("BEGIN CERTIFICATE"));
 }
 
 #[tokio::test]
@@ -907,6 +1069,7 @@ async fn direct_pairing_key_mismatch_is_terminal_after_first_written_request() {
         "00112233445566778899aabbccddeeff",
         &server_pin,
         "win-test",
+        &serde_json::Map::new(),
     )
     .await
     .unwrap_err();

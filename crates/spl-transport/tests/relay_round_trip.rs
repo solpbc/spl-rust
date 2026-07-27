@@ -155,6 +155,8 @@ fn relay_credential(
             host: "127.0.0.1".into(),
             port: lan_port,
         }],
+        home_attestation: None,
+        local_endpoints: None,
         relay_origin: Some(relay_origin),
         device_token: Some(token),
         device_token_expires_at: expires_at,

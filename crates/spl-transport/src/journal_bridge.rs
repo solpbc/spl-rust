@@ -59,6 +59,8 @@ pub struct BridgePolicy {
     /// Whether requests require a minted capability.
     pub capability_gate: CapabilityGate,
     /// Predicate selecting responses that are delivered incrementally.
+    /// Selected requests forward their real method and body; the default
+    /// bodyless `GET /sse/events` is unchanged, while a GET with a body forwards it.
     pub stream_response: Arc<dyn Fn(&RequestHead) -> bool + Send + Sync>,
     /// Policy for forwarding non-cookie request headers.
     pub request_headers: RequestHeaderPolicy,
@@ -368,7 +370,11 @@ async fn handle_conn(mut stream: TcpStream, runtime: Arc<BridgeRuntime>) {
             runtime.port,
             &runtime.bridge_names,
         ),
-        CapabilityState::Disabled => bridge::check_loopback_host(&request_head, runtime.port),
+        CapabilityState::Disabled => {
+            // A gate-off host failure deliberately retains the
+            // local_capability_reject category below for diagnostic stability.
+            bridge::check_loopback_host(&request_head, runtime.port)
+        }
     };
     if let Err(reason) = authorization {
         log_capability_reject(reason);
@@ -803,12 +809,16 @@ mod tests {
         assert_eq!(capability_gate, CapabilityGate::Enabled);
         assert_eq!(
             request_headers,
-            RequestHeaderPolicy::Allow(
-                DEFAULT_REQUEST_HEADERS
-                    .iter()
-                    .map(|name| (*name).to_string())
-                    .collect()
-            )
+            RequestHeaderPolicy::Allow(vec![
+                "accept".to_string(),
+                "accept-language".to_string(),
+                "content-type".to_string(),
+                "cache-control".to_string(),
+                "if-none-match".to_string(),
+                "if-modified-since".to_string(),
+                "range".to_string(),
+                "user-agent".to_string(),
+            ])
         );
         assert_eq!(max_request_body_bytes, 8 * 1024 * 1024);
 

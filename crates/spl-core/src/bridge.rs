@@ -15,16 +15,18 @@ pub struct BridgeNames {
     /// name used to set that cookie; a mismatch makes authorization reject it.
     pub capability_cookie_name: String,
     /// Prefix applied to upstream cookie names before returning them locally.
-    /// It must be nonempty: an empty prefix forwards every non-capability
-    /// request cookie upstream and returns response cookies without namespacing.
+    /// Empty is supported: every non-capability request cookie is forwarded
+    /// under its original name and response cookies return without namespacing.
     pub upstream_cookie_prefix: String,
     /// Header name reserved for consumer-specific caller authentication. It
-    /// must be lowercase; any other case cannot match normalized request names
-    /// and therefore bypasses caller-auth rejection for this header.
+    /// must be lowercase for caller-auth rejection to match normalized request
+    /// names. Any other case bypasses that rejection, but request forwarding
+    /// strips the configured name case-insensitively under either policy.
     pub observer_header_name: String,
     /// Header name reserved for the consumer's protocol version. It must be
-    /// lowercase; any other case cannot match normalized request names and
-    /// therefore bypasses caller-auth rejection for this header.
+    /// lowercase for caller-auth rejection to match normalized request names.
+    /// Any other case bypasses that rejection, but request forwarding strips
+    /// the configured name case-insensitively under either policy.
     pub protocol_version_header_name: String,
 }
 
@@ -811,7 +813,13 @@ mod tests {
                 ("X-Solstone-Protocol-Version", "caller"),
                 ("Content-Length", "4"),
                 ("Connection", "close"),
+                ("Keep-Alive", "timeout=5"),
+                ("Proxy-Authenticate", "Basic realm=test"),
+                ("Proxy-Authorization", "Basic caller"),
+                ("TE", "trailers"),
+                ("Trailer", "x-checksum"),
                 ("Transfer-Encoding", "chunked"),
+                ("Upgrade", "websocket"),
             ],
         );
 

@@ -1408,15 +1408,18 @@ async fn journal_bridge_disabled_gate_still_rejects_wrong_host() {
 
 #[tokio::test]
 async fn journal_bridge_custom_request_body_bound_rejects_oversize_body() {
+    const BODY_BOUND: usize = 3;
+    const AT_BOUND_BODY: &[u8; BODY_BOUND] = b"fit";
+
     let policy = BridgePolicy {
         capability_gate: CapabilityGate::Disabled,
-        max_request_body_bytes: 3,
+        max_request_body_bytes: BODY_BOUND,
         ..BridgePolicy::default()
     };
-    let (handle, server) = start_bridge_with_persistent_server_policy(policy).await;
+    let (handle, mut server) = start_bridge_with_persistent_server_policy(policy).await;
     let port = handle.port();
 
-    let response = raw_bridge_request(
+    let oversize_response = raw_bridge_request(
         port,
         "POST",
         "/objects",
@@ -1427,9 +1430,26 @@ async fn journal_bridge_custom_request_body_bound_rejects_oversize_body() {
     )
     .await;
 
-    assert!(response.is_empty());
+    assert!(oversize_response.is_empty());
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     assert_eq!(server.accepted_carriers(), 0);
+
+    let accepted_response = tokio::spawn(raw_bridge_request(
+        port,
+        "POST",
+        "/objects",
+        Some(loopback_host(port)),
+        None,
+        &[],
+        AT_BOUND_BODY,
+    ));
+    let request = server.next_request().await;
+    assert!(String::from_utf8_lossy(&request.bytes).ends_with("\r\n\r\nfit"));
+    server.send_http(request.stream_id, "200 OK", b"accepted");
+
+    let accepted_response = accepted_response.await.unwrap();
+    assert_eq!(response_status(&accepted_response), 200);
+    assert_eq!(response_body(&accepted_response), "accepted");
     handle.shutdown_and_wait().await;
     server.abort();
 }

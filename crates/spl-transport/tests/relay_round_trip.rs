@@ -545,6 +545,12 @@ where
     let mut request = Vec::new();
     let mut stream_id = 1u32;
     let mut closed = false;
+    #[expect(
+        clippy::cast_possible_wrap,
+        reason = "the protocol window constant is fixed well within i64"
+    )]
+    let mut recv_credit: i64 = INITIAL_WINDOW as i64;
+    let mut unacked: i64 = 0;
     let mut buf = [0u8; 4096];
     while !closed {
         let n = tls.read(&mut buf).await.unwrap();
@@ -555,7 +561,36 @@ where
         for frame in decoder.drain().unwrap() {
             stream_id = frame.stream_id;
             if frame.flags & FLAG_DATA != 0 {
+                #[expect(
+                    clippy::cast_possible_wrap,
+                    reason = "the bounded test frame payload is well within i64"
+                )]
+                let len = frame.payload.len() as i64;
+                if len > recv_credit {
+                    let reset = Frame::new(stream_id, FLAG_RESET, vec![0x03]);
+                    tls.write_all(&reset.encode().unwrap()).await.unwrap();
+                    tls.flush().await.unwrap();
+                    return request;
+                }
+                recv_credit -= len;
+                unacked += len;
                 request.extend_from_slice(&frame.payload);
+                #[expect(
+                    clippy::cast_possible_wrap,
+                    reason = "the protocol window constant is fixed well within i64"
+                )]
+                if unacked >= (INITIAL_WINDOW as i64) / 2 {
+                    #[expect(
+                        clippy::cast_sign_loss,
+                        reason = "the nonnegative threshold keeps the grant within the protocol's u32 window"
+                    )]
+                    let grant = unacked as u32;
+                    recv_credit += unacked;
+                    unacked = 0;
+                    let window = Frame::new(stream_id, FLAG_WINDOW, grant.to_be_bytes().to_vec());
+                    tls.write_all(&window.encode().unwrap()).await.unwrap();
+                    tls.flush().await.unwrap();
+                }
             }
             if frame.flags & FLAG_CLOSE != 0 {
                 closed = true;
@@ -1435,6 +1470,54 @@ async fn relay_fallbacks_after_lan_unreachable() {
         assert!(request_text.starts_with("POST /app/observer/ingest/event HTTP/1.1\r\n"));
     }
     handle.shutdown_and_wait().await;
+    relay.abort();
+}
+
+#[tokio::test]
+async fn relay_bridge_streams_body_beyond_initial_window_byte_exactly() {
+    // Protocol: `.proto-ref/framing.md`, "relationship to the relay" — the
+    // relay is an opaque pump and framing flow control remains between the two
+    // TLS endpoints.
+    const TARGET: &str = "/app/observer/ingest/large";
+    let (pin, acceptor) = tls_pair_with_pin();
+    let now = epoch_secs();
+    let token = mint_jwt(now, now + 10_000);
+    let relay = spawn_combined_relay(acceptor, CombinedWsMode::AcceptAny, token.clone()).await;
+    let credential = relay_credential(pin, 9, relay.origin.clone(), token);
+    let handle = start_relay_bridge(credential, None).await;
+    let cap = capability_from(&handle);
+    let body = (0..INITIAL_WINDOW + 193_771)
+        .map(|index| (index % 239) as u8)
+        .collect::<Vec<_>>();
+
+    let response = raw_bridge_request_with_method(handle.port(), "POST", TARGET, &cap, &body).await;
+    assert_eq!(response_status(&response), 200);
+    assert_eq!(response_body(&response), "{\"status\":\"ok\"}");
+
+    {
+        let requests = relay.state.inner_requests.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        let request = &requests[0];
+        let split = request
+            .windows(4)
+            .position(|window| window == b"\r\n\r\n")
+            .unwrap()
+            + 4;
+        let expected_head = spl_core::http::build_request_head(
+            "POST",
+            TARGET,
+            &[
+                ("x-test-observer".into(), "test-key".into()),
+                ("x-test-protocol".into(), "2".into()),
+            ],
+            body.len(),
+        );
+        assert_eq!(&request[..split], expected_head);
+        assert_eq!(&request[split..], body);
+    }
+
+    let status = handle.shutdown_and_wait().await;
+    assert_eq!(status.active_requests, 0);
     relay.abort();
 }
 

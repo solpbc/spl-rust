@@ -4,9 +4,12 @@
 //! Pure transforms for the local journal bridge loopback proxy.
 
 use crate::http;
+use thiserror::Error;
 
 /// Local route that exchanges a bootstrap query capability for a cookie.
 pub const BOOTSTRAP_ROUTE: &str = "/_bridge/bootstrap";
+/// Maximum accepted HTTP request-head size, including the terminating empty line.
+pub const MAX_REQUEST_HEAD_BYTES: usize = 64 * 1024;
 
 /// Consumer-selected names used by the pure loopback bridge transforms.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -61,6 +64,47 @@ pub struct RequestHead {
     pub headers: Vec<(String, String)>,
 }
 
+/// A structurally validated HTTP request head and its declared body length.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ValidatedRequestHead {
+    /// Parsed request-line and normalized headers.
+    pub head: RequestHead,
+    /// The single valid `Content-Length`, or zero when it is absent.
+    pub content_length: usize,
+}
+
+/// Framing errors found while validating a local HTTP request head.
+#[derive(Debug, Error, Clone, Copy, PartialEq, Eq)]
+pub enum RequestFramingError {
+    /// The terminating empty line ends beyond [`MAX_REQUEST_HEAD_BYTES`].
+    #[error("HTTP request head exceeds the size limit")]
+    HeadTooLarge,
+    /// The request head has no terminating empty line.
+    #[error("HTTP request head missing terminator")]
+    MissingTerminator,
+    /// The request head is not valid UTF-8.
+    #[error("HTTP request head is not valid UTF-8")]
+    InvalidEncoding,
+    /// The request line has no nonempty method and target.
+    #[error("invalid HTTP request line")]
+    InvalidRequestLine,
+    /// A header line is malformed.
+    #[error("invalid HTTP request header")]
+    InvalidHeader,
+    /// Request transfer coding is unsupported.
+    #[error("transfer-encoding is unsupported")]
+    TransferEncoding,
+    /// More than one `Content-Length` header was supplied.
+    #[error("duplicate content-length")]
+    DuplicateContentLength,
+    /// `Content-Length` is not a nonempty ASCII decimal value representable as `usize`.
+    #[error("invalid content-length")]
+    InvalidContentLength,
+    /// An expectation was supplied, but the bridge does not send interim responses.
+    #[error("expectation is unsupported")]
+    Expectation,
+}
+
 impl RequestHead {
     /// Return the first `Host` header value.
     pub fn host(&self) -> Option<&str> {
@@ -113,42 +157,102 @@ impl RequestHead {
     }
 }
 
-/// Parse an HTTP request head into its method, target, and normalized headers.
+/// Parse and validate an HTTP request head.
 ///
-/// Returns `None` when the request line has no nonempty method and target.
-#[expect(
-    clippy::map_unwrap_or,
-    reason = "the explicit map keeps the header-boundary slice visible"
-)]
-pub fn parse_request_head(raw: &[u8]) -> Option<RequestHead> {
-    let head_bytes = http::find_subsequence(raw, b"\r\n\r\n")
-        .map(|split| &raw[..split])
-        .unwrap_or(raw);
-    let text = String::from_utf8_lossy(head_bytes);
-    let mut lines = text.split("\r\n");
-    let request_line = lines.next()?;
-    let mut parts = request_line.split_whitespace();
-    let method = parts.next()?.to_string();
-    let target = parts.next()?.to_string();
-
-    if method.is_empty() || target.is_empty() {
-        return None;
+/// Header names are matched case-insensitively. A request may have at most one
+/// `Content-Length`, may not use `Transfer-Encoding`, and may not carry
+/// `Expect` because the bridge does not implement interim responses.
+///
+/// # Errors
+///
+/// Returns [`RequestFramingError`] for an oversized or malformed head,
+/// unsupported transfer coding or expectation, or invalid body framing.
+pub fn parse_request_head(raw: &[u8]) -> Result<ValidatedRequestHead, RequestFramingError> {
+    let Some(split) = http::find_subsequence(raw, b"\r\n\r\n") else {
+        return Err(if raw.len() > MAX_REQUEST_HEAD_BYTES {
+            RequestFramingError::HeadTooLarge
+        } else {
+            RequestFramingError::MissingTerminator
+        });
+    };
+    let head_end = split + 4;
+    if head_end > MAX_REQUEST_HEAD_BYTES {
+        return Err(RequestFramingError::HeadTooLarge);
     }
 
+    let head_bytes = &raw[..split];
+    let text =
+        core::str::from_utf8(head_bytes).map_err(|_| RequestFramingError::InvalidEncoding)?;
+    let mut lines = text.split("\r\n");
+    let request_line = lines
+        .next()
+        .ok_or(RequestFramingError::InvalidRequestLine)?;
+    let mut parts = request_line.split_whitespace();
+    let method = parts
+        .next()
+        .filter(|part| !part.is_empty())
+        .ok_or(RequestFramingError::InvalidRequestLine)?
+        .to_string();
+    let target = parts
+        .next()
+        .filter(|part| !part.is_empty())
+        .ok_or(RequestFramingError::InvalidRequestLine)?
+        .to_string();
+
     let mut headers = Vec::new();
+    let mut content_lengths = Vec::new();
+    let mut has_transfer_encoding = false;
+    let mut has_expectation = false;
     for line in lines {
-        let Some(colon) = line.find(':') else {
-            continue;
-        };
+        let colon = line.find(':').ok_or(RequestFramingError::InvalidHeader)?;
         let key = line[..colon].trim().to_ascii_lowercase();
+        if key.is_empty() {
+            return Err(RequestFramingError::InvalidHeader);
+        }
         let value = line[colon + 1..].trim().to_string();
+        if key == "content-length" {
+            content_lengths.push(value.clone());
+        } else if key == "transfer-encoding" {
+            has_transfer_encoding = true;
+        } else if key == "expect" {
+            has_expectation = true;
+        }
         headers.push((key, value));
     }
 
-    Some(RequestHead {
-        method,
-        target,
-        headers,
+    if has_transfer_encoding {
+        return Err(RequestFramingError::TransferEncoding);
+    }
+    if content_lengths.len() > 1 {
+        return Err(RequestFramingError::DuplicateContentLength);
+    }
+    let content_length = match content_lengths.first() {
+        Some(value) => parse_content_length(value)?,
+        None => 0,
+    };
+    if has_expectation {
+        return Err(RequestFramingError::Expectation);
+    }
+
+    Ok(ValidatedRequestHead {
+        head: RequestHead {
+            method,
+            target,
+            headers,
+        },
+        content_length,
+    })
+}
+
+fn parse_content_length(value: &str) -> Result<usize, RequestFramingError> {
+    if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err(RequestFramingError::InvalidContentLength);
+    }
+    value.bytes().try_fold(0usize, |length, byte| {
+        length
+            .checked_mul(10)
+            .and_then(|length| length.checked_add((byte - b'0') as usize))
+            .ok_or(RequestFramingError::InvalidContentLength)
     })
 }
 
@@ -580,7 +684,101 @@ mod tests {
             raw.push_str("\r\n");
         }
         raw.push_str("\r\n");
-        parse_request_head(raw.as_bytes()).unwrap()
+        parse_request_head(raw.as_bytes()).unwrap().head
+    }
+
+    #[test]
+    fn request_head_validation_returns_single_declared_length() {
+        let parsed = parse_request_head(
+            b"POST /objects HTTP/1.1\r\nHoSt: local\r\nContent-Length: 0007\r\n\r\n",
+        )
+        .unwrap();
+        assert_eq!(parsed.head.method, "POST");
+        assert_eq!(parsed.head.target, "/objects");
+        assert_eq!(parsed.head.host(), Some("local"));
+        assert_eq!(parsed.content_length, 7);
+
+        let bodyless = parse_request_head(b"GET /objects HTTP/1.1\r\nHost: local\r\n\r\n").unwrap();
+        assert_eq!(bodyless.content_length, 0);
+    }
+
+    #[test]
+    fn request_head_validation_rejects_duplicate_lengths_and_transfer_coding() {
+        for raw in [
+            "POST / HTTP/1.1\r\nContent-Length: 1\r\ncontent-length: 1\r\n\r\n",
+            "POST / HTTP/1.1\r\nContent-Length: 1\r\nContent-Length: 2\r\n\r\n",
+        ] {
+            assert_eq!(
+                parse_request_head(raw.as_bytes()),
+                Err(RequestFramingError::DuplicateContentLength)
+            );
+        }
+
+        assert_eq!(
+            parse_request_head(b"POST / HTTP/1.1\r\ntRaNsFeR-EnCoDiNg: chunked\r\n\r\n"),
+            Err(RequestFramingError::TransferEncoding)
+        );
+    }
+
+    #[test]
+    fn request_head_validation_rejects_invalid_lengths() {
+        for value in [
+            "",
+            "+1",
+            "-1",
+            "1.0",
+            "1 0",
+            "18446744073709551616000000000000000000",
+        ] {
+            let raw = format!("POST / HTTP/1.1\r\nContent-Length: {value}\r\n\r\n");
+            assert_eq!(
+                parse_request_head(raw.as_bytes()),
+                Err(RequestFramingError::InvalidContentLength),
+                "{value:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn request_head_validation_checks_expectation_after_body_framing() {
+        assert_eq!(
+            parse_request_head(
+                b"POST / HTTP/1.1\r\nContent-Length: 1\r\nExpect: 100-continue\r\n\r\n"
+            ),
+            Err(RequestFramingError::Expectation)
+        );
+        assert_eq!(
+            parse_request_head(
+                b"POST / HTTP/1.1\r\nContent-Length: bad\r\nExpect: 100-continue\r\n\r\n"
+            ),
+            Err(RequestFramingError::InvalidContentLength)
+        );
+        assert_eq!(
+            parse_request_head(
+                b"POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\nExpect: 100-continue\r\n\r\n"
+            ),
+            Err(RequestFramingError::TransferEncoding)
+        );
+    }
+
+    #[test]
+    fn request_head_limit_uses_delimiter_end_boundary() {
+        const EXPECTED_HEAD_LIMIT: usize = 65_536;
+
+        let prefix = "GET / HTTP/1.1\r\nX-Pad: ";
+        let suffix = "\r\n\r\n";
+        assert_eq!(MAX_REQUEST_HEAD_BYTES, EXPECTED_HEAD_LIMIT);
+        let at_limit_padding = EXPECTED_HEAD_LIMIT - prefix.len() - suffix.len();
+        let at_limit = format!("{prefix}{}{suffix}", "a".repeat(at_limit_padding));
+        assert_eq!(at_limit.len(), EXPECTED_HEAD_LIMIT);
+        assert!(parse_request_head(at_limit.as_bytes()).is_ok());
+
+        let past_limit = format!("{prefix}{}{suffix}", "a".repeat(at_limit_padding + 1));
+        assert_eq!(past_limit.len(), EXPECTED_HEAD_LIMIT + 1);
+        assert_eq!(
+            parse_request_head(past_limit.as_bytes()),
+            Err(RequestFramingError::HeadTooLarge)
+        );
     }
 
     fn authed_request(
@@ -802,7 +1000,7 @@ mod tests {
     #[test]
     fn upstream_request_headers_forward_all_keeps_only_unreserved() {
         let names = names();
-        let head = request(
+        let mut head = request(
             "PUT",
             "/",
             Some("127.0.0.1:49152"),
@@ -818,10 +1016,13 @@ mod tests {
                 ("Proxy-Authorization", "Basic caller"),
                 ("TE", "trailers"),
                 ("Trailer", "x-checksum"),
-                ("Transfer-Encoding", "chunked"),
                 ("Upgrade", "websocket"),
             ],
         );
+        // Exercise the pure filtering function with a manually constructed
+        // impossible-after-validation reserved header.
+        head.headers
+            .push(("transfer-encoding".to_string(), "chunked".to_string()));
 
         let headers = upstream_request_headers(&head, &names, &RequestHeaderPolicy::ForwardAll);
 

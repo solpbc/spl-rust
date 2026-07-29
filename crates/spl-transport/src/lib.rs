@@ -39,8 +39,12 @@
 //! response streaming, authorized local responses, attribution headers, request
 //! header forwarding, and request-body limit. [`journal_bridge::JournalBridgeHandle`]
 //! returns an owned coherent status snapshot. The bridge always owns exact
-//! loopback `Host` validation and reserved-header stripping; credential storage,
-//! retry supervision, and service lifetime remain consumer-owned.
+//! loopback `Host` validation and reserved-header stripping. Bridge requests
+//! require one valid `Content-Length` and reject `Transfer-Encoding`; their bodies
+//! stream through bounded queues that apply carrier backpressure to the local
+//! socket. A request is not replayed after the carrier starts consuming it.
+//! Credential storage, retry and idempotency policy, and service lifetime remain
+//! consumer-owned. Response buffering remains selected by the response path.
 
 #![forbid(unsafe_code)]
 #![cfg_attr(

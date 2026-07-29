@@ -48,7 +48,7 @@ const READ_BUF: usize = 64 * 1024;
 
 /// Send one HTTP request over a fresh PL connection and return the response.
 /// `headers` are the caller's extra headers (auth, content-type); framing-owned
-/// headers are added by [`http::build_request`].
+/// headers are added by [`http::build_request_head`].
 ///
 /// # Errors
 ///
@@ -101,8 +101,9 @@ where
 {
     let mut dialer = FrameDialer::default();
     let stream_id = dialer.allocate();
-    let request_bytes = http::build_request(method, path, headers, body);
-    let mut upload = WindowedUpload::new(stream_id, &request_bytes);
+    let request_head = http::build_request_head(method, path, headers, body.len());
+    let mut upload = WindowedUpload::new(stream_id, &request_head, body.len());
+    let mut body_offset = 0;
     let mut assembler = ResponseAssembler::new(stream_id);
 
     let mut buf = vec![0u8; READ_BUF];
@@ -112,10 +113,21 @@ where
         // in which case there is nothing more worth sending.
         if !assembler.is_closed() {
             let mut wrote = false;
-            while let Some(frame) = upload
-                .poll_send()
-                .map_err(|e| TransportError::Mux(MuxError::Frame(e)))?
-            {
+            loop {
+                let capacity = upload.body_capacity();
+                if capacity > 0 && body_offset < body.len() {
+                    let end = (body_offset + capacity).min(body.len());
+                    upload.feed_body(&body[body_offset..end]).map_err(|error| {
+                        TransportError::Io(io::Error::new(io::ErrorKind::InvalidInput, error))
+                    })?;
+                    body_offset = end;
+                }
+                let Some(frame) = upload
+                    .poll_send()
+                    .map_err(|e| TransportError::Mux(MuxError::Frame(e)))?
+                else {
+                    break;
+                };
                 write_all_with_timeout(
                     &mut stream,
                     &frame,

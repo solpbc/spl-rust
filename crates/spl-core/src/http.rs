@@ -204,14 +204,14 @@ fn is_framing_owned(name: &str) -> bool {
         || name.eq_ignore_ascii_case("accept")
 }
 
-/// Build the HTTP/1.1 request bytes for a single PL stream. `headers` are the
+/// Build the HTTP/1.1 request head for a single PL stream. `headers` are the
 /// caller's extra headers (e.g. auth, content-type); `host`, `content-length`,
 /// and a default `accept` are added by the transport, `accept` overridable.
-pub fn build_request(
+pub fn build_request_head(
     method: &str,
     path: &str,
     headers: &[(String, String)],
-    body: &[u8],
+    content_length: usize,
 ) -> Vec<u8> {
     let mut head = String::new();
     head.push_str(method);
@@ -243,10 +243,23 @@ pub fn build_request(
     }
 
     head.push_str("content-length: ");
-    head.push_str(&body.len().to_string());
+    head.push_str(&content_length.to_string());
     head.push_str("\r\n\r\n");
 
-    let mut out = head.into_bytes();
+    head.into_bytes()
+}
+
+/// Build the complete HTTP/1.1 request bytes for a single PL stream.
+///
+/// This is the complete-body convenience wrapper around
+/// [`build_request_head`].
+pub fn build_request(
+    method: &str,
+    path: &str,
+    headers: &[(String, String)],
+    body: &[u8],
+) -> Vec<u8> {
+    let mut out = build_request_head(method, path, headers, body.len());
     out.extend_from_slice(body);
     out
 }
@@ -393,6 +406,22 @@ mod tests {
         assert!(!text.contains("host: evil"));
         assert!(!text.contains("content-length: 999"));
         assert!(text.ends_with("\r\n\r\npayload"));
+    }
+
+    #[test]
+    fn request_builder_is_head_builder_plus_body() {
+        let headers = vec![
+            ("Accept".to_string(), "text/plain".to_string()),
+            (
+                "Content-Type".to_string(),
+                "application/octet-stream".to_string(),
+            ),
+        ];
+        let body = b"payload";
+        let mut expected = build_request_head("POST", "/objects", &headers, body.len());
+        expected.extend_from_slice(body);
+
+        assert_eq!(build_request("POST", "/objects", &headers, body), expected);
     }
 
     #[test]

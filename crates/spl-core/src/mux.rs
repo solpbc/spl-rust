@@ -20,7 +20,7 @@
 //! one-shot response path consumes at decode; the persistent carrier consumes
 //! body-attributed wire bytes only when its local consumer drains them.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 
 use crate::frame::{
     FLAG_CLOSE, FLAG_DATA, FLAG_OPEN, FLAG_PING, FLAG_PONG, FLAG_RESET, FLAG_WINDOW, Frame,
@@ -34,6 +34,8 @@ use thiserror::Error;
 /// [`WindowedUpload`] and inbound [`RecvWindow`]. Byte-identical to
 /// the SPL framing contract.
 pub const INITIAL_WINDOW: usize = 1 << 20;
+/// Maximum request-body bytes retained by one [`WindowedUpload`].
+pub const UPLOAD_BODY_STAGE_CAPACITY: usize = 256 * 1024;
 const RECEIVE_GRANT_THRESHOLD: u64 = (INITIAL_WINDOW / 2) as u64;
 /// Robustness cap for assembled response bytes. Only the pinned journal can send
 /// these bytes, but a bad peer must not grow memory without bound.
@@ -139,18 +141,33 @@ impl Default for RecvWindow {
     }
 }
 
+/// Errors returned when request-body bytes cannot enter an upload stage.
+#[derive(Debug, Error, Clone, Copy, PartialEq, Eq)]
+pub enum UploadBodyError {
+    /// The supplied bytes would exceed the declared request-body length.
+    #[error("request body exceeds its declared length")]
+    DeclaredLengthExceeded,
+    /// The supplied bytes exceed the currently available bounded stage space.
+    #[error("request body exceeds the available upload stage capacity")]
+    StageCapacityExceeded,
+}
+
 /// Send-side flow control for one dialer stream.
 ///
-/// Emits the HTTP request as `OPEN|DATA…` frames followed by a half-closing
-/// `CLOSE`, never letting the in-flight (un-granted) DATA payload exceed the
-/// peer's advertised window. The transport pumps [`poll_send`](Self::poll_send)
-/// to drain everything the window currently permits, then reads inbound frames
-/// and feeds any [`grant`](Self::grant)s back before pumping again — full-duplex,
-/// exactly the credit loop required by the SPL framing contract.
+/// Emits a nonempty HTTP request head and incrementally fed body as
+/// `OPEN|DATA…` frames followed by a half-closing `CLOSE`, never letting the
+/// in-flight (un-granted) DATA payload exceed the peer's advertised window.
+/// The transport pumps [`poll_send`](Self::poll_send) to drain everything the
+/// window currently permits, then reads inbound frames and feeds any
+/// [`grant`](Self::grant)s back before pumping again.
 pub struct WindowedUpload {
     stream_id: u32,
-    request: Vec<u8>,
-    offset: usize,
+    head: Vec<u8>,
+    head_offset: usize,
+    body: VecDeque<u8>,
+    declared_body_len: usize,
+    fed_body_len: usize,
+    emitted_body_len: usize,
     /// Bytes of DATA payload we may still send before waiting for a grant.
     send_credit: usize,
     opened: bool,
@@ -158,17 +175,56 @@ pub struct WindowedUpload {
 }
 
 impl WindowedUpload {
-    /// Begin uploading `request` (the full HTTP/1.1 bytes — head + body; the
-    /// journal counts every DATA payload byte against the window) on `stream_id`.
-    pub fn new(stream_id: u32, request: &[u8]) -> Self {
+    /// Begin uploading a nonempty HTTP request head and a body of the declared
+    /// length on `stream_id`.
+    pub fn new(stream_id: u32, request_head: &[u8], declared_body_len: usize) -> Self {
         Self {
             stream_id,
-            request: request.to_vec(),
-            offset: 0,
+            head: request_head.to_vec(),
+            head_offset: 0,
+            body: VecDeque::with_capacity(declared_body_len.min(UPLOAD_BODY_STAGE_CAPACITY)),
+            declared_body_len,
+            fed_body_len: 0,
+            emitted_body_len: 0,
             send_credit: INITIAL_WINDOW,
             opened: false,
             closed: false,
         }
+    }
+
+    /// Return the number of body bytes that can be fed without exceeding either
+    /// the fixed stage bound or the declared body length.
+    pub fn body_capacity(&self) -> usize {
+        let stage_capacity = UPLOAD_BODY_STAGE_CAPACITY - self.body.len();
+        let declared_remaining = self.declared_body_len - self.fed_body_len;
+        stage_capacity.min(declared_remaining)
+    }
+
+    /// Feed body bytes into the bounded upload stage.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`UploadBodyError::DeclaredLengthExceeded`] when `bytes` would
+    /// exceed the declared body length, or
+    /// [`UploadBodyError::StageCapacityExceeded`] when they do not fit in the
+    /// currently available stage space. Either error leaves the upload
+    /// unchanged.
+    pub fn feed_body(&mut self, bytes: &[u8]) -> Result<(), UploadBodyError> {
+        let declared_remaining = self.declared_body_len - self.fed_body_len;
+        if bytes.len() > declared_remaining {
+            return Err(UploadBodyError::DeclaredLengthExceeded);
+        }
+        if bytes.len() > UPLOAD_BODY_STAGE_CAPACITY - self.body.len() {
+            return Err(UploadBodyError::StageCapacityExceeded);
+        }
+        self.body.extend(bytes);
+        self.fed_body_len += bytes.len();
+        Ok(())
+    }
+
+    /// Return the cumulative number of request-body bytes emitted in DATA frames.
+    pub fn emitted_body_len(&self) -> usize {
+        self.emitted_body_len
     }
 
     /// Credit an inbound `WINDOW` grant without allowing remaining credit to
@@ -203,41 +259,45 @@ impl WindowedUpload {
     ///
     /// Returns [`FrameError`] if an emitted frame cannot be encoded.
     pub fn poll_send(&mut self) -> Result<Option<Vec<u8>>, FrameError> {
-        // Empty request (e.g. a bodyless GET): a single OPEN|CLOSE.
-        if self.request.is_empty() {
-            if self.closed {
-                return Ok(None);
-            }
-            self.opened = true;
-            self.closed = true;
-            return Ok(Some(
-                Frame::new(self.stream_id, FLAG_OPEN | FLAG_CLOSE, Vec::new()).encode()?,
-            ));
-        }
-
-        let remaining = self.request.len() - self.offset;
-        if remaining > 0 {
+        let head_remaining = self.head.len() - self.head_offset;
+        let available = if head_remaining > 0 {
+            head_remaining
+        } else {
+            self.body.len()
+        };
+        if available > 0 {
             if self.send_credit == 0 {
                 return Ok(None); // blocked: wait for a WINDOW grant
             }
-            let n = remaining
+            let n = available
                 .min(RECOMMENDED_CHUNK)
                 .min(MAX_PAYLOAD)
                 .min(self.send_credit);
-            let chunk = self.request[self.offset..self.offset + n].to_vec();
+            let chunk = if head_remaining > 0 {
+                let chunk = self.head[self.head_offset..self.head_offset + n].to_vec();
+                self.head_offset += n;
+                chunk
+            } else {
+                let chunk = self.body.drain(..n).collect();
+                self.emitted_body_len += n;
+                chunk
+            };
             let flags = if self.opened {
                 FLAG_DATA
             } else {
                 FLAG_OPEN | FLAG_DATA
             };
             self.opened = true;
-            self.offset += n;
             self.send_credit -= n;
             return Ok(Some(Frame::new(self.stream_id, flags, chunk).encode()?));
         }
 
-        // Body fully sent — emit the half-closing CLOSE exactly once.
-        if !self.closed {
+        // The declared body has been fully supplied and sent — emit the
+        // half-closing CLOSE exactly once.
+        if !self.closed
+            && self.fed_body_len == self.declared_body_len
+            && self.emitted_body_len == self.declared_body_len
+        {
             self.closed = true;
             return Ok(Some(
                 Frame::new(self.stream_id, FLAG_CLOSE, Vec::new()).encode()?,
@@ -255,7 +315,9 @@ impl WindowedUpload {
     /// read an inbound `WINDOW` grant before [`poll_send`](Self::poll_send) will
     /// produce anything. (Distinguishes "blocked" from "done" for callers/tests.)
     pub fn is_blocked(&self) -> bool {
-        !self.closed && self.offset < self.request.len() && self.send_credit == 0
+        !self.closed
+            && self.send_credit == 0
+            && (self.head_offset < self.head.len() || !self.body.is_empty())
     }
 }
 
@@ -912,6 +974,26 @@ mod tests {
         dec.drain().unwrap()
     }
 
+    fn pump_source(
+        up: &mut WindowedUpload,
+        body: &[u8],
+        body_offset: &mut usize,
+        decoder: &mut FrameDecoder,
+    ) {
+        loop {
+            let capacity = up.body_capacity();
+            if capacity > 0 && *body_offset < body.len() {
+                let end = (*body_offset + capacity).min(body.len());
+                up.feed_body(&body[*body_offset..end]).unwrap();
+                *body_offset = end;
+            }
+            let Some(bytes) = up.poll_send().unwrap() else {
+                break;
+            };
+            decoder.feed(&bytes);
+        }
+    }
+
     fn encode_frames(frames: &[Frame]) -> Vec<u8> {
         let mut wire = Vec::new();
         for frame in frames {
@@ -972,67 +1054,75 @@ mod tests {
     }
 
     #[test]
-    fn small_request_opens_data_then_closes_in_one_pass() {
-        let request = http::build_request("GET", "/healthz", &[], b"");
-        let mut up = WindowedUpload::new(1, &request);
+    fn declared_zero_uses_head_then_exactly_one_close() {
+        // Protocol: `.proto-ref/framing.md`, "stream lifecycle" — OPEN starts
+        // the stream and CLOSE half-closes it exactly once.
+        let head = http::build_request_head("GET", "/healthz", &[], 0);
+        let mut up = WindowedUpload::new(1, &head, 0);
         let frames = drain_permitted(&mut up);
         assert!(up.is_done());
         assert_eq!(frames[0].flags, FLAG_OPEN | FLAG_DATA);
         assert_eq!(frames.last().unwrap().flags, FLAG_CLOSE);
         let reassembled: Vec<u8> = frames.iter().flat_map(|f| f.payload.clone()).collect();
-        assert_eq!(reassembled, request);
-    }
-
-    #[test]
-    fn empty_request_is_a_single_open_close() {
-        let mut up = WindowedUpload::new(7, b"");
-        let frames = drain_permitted(&mut up);
-        assert_eq!(frames.len(), 1);
-        assert_eq!(frames[0].flags, FLAG_OPEN | FLAG_CLOSE);
-        assert!(up.is_done());
+        assert_eq!(reassembled, head);
+        assert_eq!(
+            frames
+                .iter()
+                .filter(|frame| frame.flags == FLAG_CLOSE)
+                .count(),
+            1
+        );
+        assert!(up.poll_send().unwrap().is_none());
+        assert!(up.poll_send().unwrap().is_none());
     }
 
     #[test]
     fn body_within_initial_window_sends_without_blocking() {
         // 2 chunks + change, all well under the 1 MiB initial window.
         let body = vec![0xABu8; RECOMMENDED_CHUNK * 2 + 17];
-        let request = http::build_request("POST", "/app/observer/ingest", &[], &body);
-        let mut up = WindowedUpload::new(5, &request);
+        let head = http::build_request_head("POST", "/app/observer/ingest", &[], body.len());
+        let mut up = WindowedUpload::new(5, &head, body.len());
+        up.feed_body(&body).unwrap();
         let frames = drain_permitted(&mut up);
         assert!(up.is_done(), "small body completes in one credit pass");
         assert!(frames[0].flags & FLAG_OPEN != 0);
         assert!(frames.iter().filter(|f| f.flags & FLAG_DATA != 0).count() >= 3);
         let reassembled: Vec<u8> = frames.iter().flat_map(|f| f.payload.clone()).collect();
-        assert_eq!(reassembled, request);
+        assert_eq!(
+            reassembled,
+            http::build_request("POST", "/app/observer/ingest", &[], &body)
+        );
+        assert_eq!(up.emitted_body_len(), body.len());
     }
 
     #[test]
     fn body_over_window_blocks_until_granted_then_completes() {
+        // Protocol: `.proto-ref/framing.md`, "flow control and backpressure"
+        // and "fragmentation" — head and body share credit, zero credit blocks
+        // DATA, and frames stay within the recommended chunk size.
         // 2.5 MiB body — far past the 1 MiB initial window, so the upload must
-        // pause and resume on WINDOW grants (the >1 MiB path encoded segments hit).
+        // pause and resume on WINDOW grants.
         let body = vec![0x5Au8; INITIAL_WINDOW * 2 + INITIAL_WINDOW / 2];
-        let request = http::build_request("POST", "/app/observer/ingest", &[], &body);
-        let mut up = WindowedUpload::new(3, &request);
+        let head = http::build_request_head("POST", "/app/observer/ingest", &[], body.len());
+        let mut up = WindowedUpload::new(3, &head, body.len());
 
         let mut all = FrameDecoder::new();
+        let mut body_offset = 0;
         // First pass drains exactly the initial window, then blocks (body remains).
-        while let Some(bytes) = up.poll_send().unwrap() {
-            all.feed(&bytes);
-        }
+        pump_source(&mut up, &body, &mut body_offset, &mut all);
         assert!(
             up.is_blocked(),
             "exhausting the window must block, not finish"
         );
         assert!(!up.is_done());
+        assert_eq!(up.emitted_body_len(), INITIAL_WINDOW - head.len());
 
         // Grant credit in 512 KiB slices (the journal's replenishment grain)
         // until the whole body — plus the half-closing CLOSE — is out.
         let mut guard = 0;
         while !up.is_done() {
             up.grant((INITIAL_WINDOW / 2) as u32).unwrap();
-            while let Some(bytes) = up.poll_send().unwrap() {
-                all.feed(&bytes);
-            }
+            pump_source(&mut up, &body, &mut body_offset, &mut all);
             guard += 1;
             assert!(guard < 100, "should converge well before this");
         }
@@ -1041,7 +1131,10 @@ mod tests {
         assert_eq!(frames.last().unwrap().flags, FLAG_CLOSE);
         // Every byte of the request made it out, in order, exactly once.
         let reassembled: Vec<u8> = frames.iter().flat_map(|f| f.payload.clone()).collect();
-        assert_eq!(reassembled, request);
+        assert_eq!(
+            reassembled,
+            http::build_request("POST", "/app/observer/ingest", &[], &body)
+        );
         // No single DATA frame exceeded the recommended chunk.
         assert!(
             frames
@@ -1052,8 +1145,54 @@ mod tests {
     }
 
     #[test]
+    fn windowed_upload_respects_split_grants_and_chunk_bound() {
+        // Protocol: `.proto-ref/framing.md`, "flow control and backpressure"
+        // and "fragmentation" — DATA never exceeds current credit or the
+        // recommended chunk.
+        let head = b"request head";
+        let remaining_after_initial = RECOMMENDED_CHUNK + 8;
+        let body_len = INITIAL_WINDOW - head.len() + remaining_after_initial;
+        let body = vec![b'x'; body_len];
+        let mut upload = WindowedUpload::new(15, head, body.len());
+        let mut decoder = FrameDecoder::new();
+        let mut body_offset = 0;
+        pump_source(&mut upload, &body, &mut body_offset, &mut decoder);
+        let initial_frames = decoder.drain().unwrap();
+        assert_eq!(
+            initial_frames
+                .iter()
+                .map(|frame| frame.payload.len())
+                .sum::<usize>(),
+            INITIAL_WINDOW
+        );
+        assert!(
+            initial_frames
+                .iter()
+                .all(|frame| frame.payload.len() <= RECOMMENDED_CHUNK)
+        );
+        assert!(upload.is_blocked());
+        assert!(!upload.is_done());
+
+        upload.grant(7).unwrap();
+        let seven = decode_single(&upload.poll_send().unwrap().unwrap());
+        assert_eq!(seven.payload.len(), 7);
+        assert!(upload.poll_send().unwrap().is_none());
+        assert!(upload.is_blocked());
+
+        upload.grant((RECOMMENDED_CHUNK + 1) as u32).unwrap();
+        let chunk = decode_single(&upload.poll_send().unwrap().unwrap());
+        let final_byte = decode_single(&upload.poll_send().unwrap().unwrap());
+        let close = decode_single(&upload.poll_send().unwrap().unwrap());
+        assert_eq!(chunk.payload.len(), RECOMMENDED_CHUNK);
+        assert_eq!(final_byte.payload.len(), 1);
+        assert_eq!(close.flags, FLAG_CLOSE);
+        assert!(upload.is_done());
+        assert!(upload.poll_send().unwrap().is_none());
+    }
+
+    #[test]
     fn windowed_upload_accepts_max_remaining_credit_and_rejects_one_over() {
-        let mut upload = WindowedUpload::new(7, b"request");
+        let mut upload = WindowedUpload::new(7, b"request", 0);
         upload
             .grant((i32::MAX as usize - INITIAL_WINDOW) as u32)
             .unwrap();
@@ -1072,8 +1211,8 @@ mod tests {
 
     #[test]
     fn windowed_upload_credit_cap_excludes_consumed_credit() {
-        let request = vec![b'x'; INITIAL_WINDOW + 1];
-        let mut upload = WindowedUpload::new(9, &request);
+        let head = vec![b'x'; RECOMMENDED_CHUNK];
+        let mut upload = WindowedUpload::new(9, &head, 0);
         let first = decode_single(&upload.poll_send().unwrap().unwrap());
         assert_eq!(first.payload.len(), RECOMMENDED_CHUNK);
         let remaining = INITIAL_WINDOW - RECOMMENDED_CHUNK;
@@ -1081,6 +1220,68 @@ mod tests {
 
         upload.grant(grant as u32).unwrap();
         assert_eq!(upload.send_credit, i32::MAX as usize);
+    }
+
+    #[test]
+    fn windowed_upload_waits_for_exact_body_and_rejects_overfeed() {
+        // Protocol: `.proto-ref/framing.md`, "stream lifecycle" — CLOSE means
+        // the sender will write no more bytes, so it follows the exact body.
+        let head = b"request head";
+        let mut upload = WindowedUpload::new(11, head, 5);
+        upload.feed_body(b"ab").unwrap();
+
+        let partial = drain_permitted(&mut upload);
+        assert_eq!(
+            partial
+                .iter()
+                .flat_map(|frame| frame.payload.clone())
+                .collect::<Vec<_>>(),
+            [head.as_slice(), b"ab"].concat()
+        );
+        assert!(!upload.is_done());
+        assert!(!upload.is_blocked(), "the source, not credit, is exhausted");
+        assert_eq!(upload.emitted_body_len(), 2);
+        assert!(upload.poll_send().unwrap().is_none());
+
+        assert_eq!(
+            upload.feed_body(b"cdef"),
+            Err(UploadBodyError::DeclaredLengthExceeded)
+        );
+        assert_eq!(upload.body_capacity(), 3);
+        upload.feed_body(b"cde").unwrap();
+        assert_eq!(
+            upload.feed_body(b"f"),
+            Err(UploadBodyError::DeclaredLengthExceeded)
+        );
+
+        let finished = drain_permitted(&mut upload);
+        assert_eq!(finished.len(), 2);
+        assert_eq!(finished[0].payload, b"cde");
+        assert_eq!(finished[1].flags, FLAG_CLOSE);
+        assert_eq!(upload.emitted_body_len(), 5);
+        assert!(upload.is_done());
+        assert!(upload.poll_send().unwrap().is_none());
+        assert!(upload.poll_send().unwrap().is_none());
+    }
+
+    #[test]
+    fn windowed_upload_stage_is_fixed_and_overflow_is_non_mutating() {
+        let declared = UPLOAD_BODY_STAGE_CAPACITY + 1;
+        let mut upload = WindowedUpload::new(13, b"request head", declared);
+        let over_capacity = vec![b'x'; declared];
+        assert_eq!(
+            upload.feed_body(&over_capacity),
+            Err(UploadBodyError::StageCapacityExceeded)
+        );
+        assert_eq!(upload.body_capacity(), UPLOAD_BODY_STAGE_CAPACITY);
+        assert!(upload.body.is_empty());
+
+        upload
+            .feed_body(&over_capacity[..UPLOAD_BODY_STAGE_CAPACITY])
+            .unwrap();
+        assert_eq!(upload.body_capacity(), 0);
+        assert_eq!(upload.body.len(), UPLOAD_BODY_STAGE_CAPACITY);
+        assert!(upload.body.len() < declared);
     }
 
     #[test]

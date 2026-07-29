@@ -529,6 +529,15 @@ struct PersistentRequest {
     bytes: Vec<u8>,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct PersistentFrameEvent {
+    carrier_index: usize,
+    stream_id: u32,
+    flags: u8,
+    payload_len: usize,
+    cumulative_data: usize,
+}
+
 enum PersistentWrite {
     Frame(Vec<u8>),
     CloseCarrier,
@@ -537,6 +546,7 @@ enum PersistentWrite {
 struct PersistentBridgeServer {
     accepts: Arc<AtomicUsize>,
     requests: mpsc::Receiver<PersistentRequest>,
+    frames: mpsc::UnboundedReceiver<PersistentFrameEvent>,
     writes: mpsc::UnboundedSender<PersistentWrite>,
     task: JoinHandle<()>,
 }
@@ -547,6 +557,26 @@ impl PersistentBridgeServer {
             .await
             .expect("timed out waiting for upstream mux request")
             .expect("persistent upstream closed before request")
+    }
+
+    async fn next_frame(&mut self) -> PersistentFrameEvent {
+        tokio::time::timeout(std::time::Duration::from_secs(3), self.frames.recv())
+            .await
+            .expect("timed out waiting for upstream mux frame")
+            .expect("persistent upstream closed before frame")
+    }
+
+    async fn await_cumulative(&mut self, stream_id: u32, bytes: usize) -> PersistentFrameEvent {
+        loop {
+            let event = self.next_frame().await;
+            if event.stream_id == stream_id && event.cumulative_data >= bytes {
+                return event;
+            }
+        }
+    }
+
+    fn send_window(&self, stream_id: u32, bytes: u32) {
+        self.send_frame(stream_id, FLAG_WINDOW, &bytes.to_be_bytes());
     }
 
     fn send_http(&self, stream_id: u32, status: &str, body: &[u8]) {
@@ -615,6 +645,94 @@ async fn start_bridge_with_persistent_server()
     start_bridge_with_persistent_server_policy(BridgePolicy::default()).await
 }
 
+async fn handle_persistent_carrier(
+    tls: tokio_rustls::server::TlsStream<tokio::net::TcpStream>,
+    carrier_index: usize,
+    request_tx: &mpsc::Sender<PersistentRequest>,
+    frame_tx: &mpsc::UnboundedSender<PersistentFrameEvent>,
+    write_rx: &mut mpsc::UnboundedReceiver<PersistentWrite>,
+) -> bool {
+    let (mut read, mut write) = tokio::io::split(tls);
+    let mut decoder = FrameDecoder::new();
+    let mut requests: HashMap<u32, Vec<u8>> = HashMap::new();
+    let mut cumulative_data: HashMap<u32, usize> = HashMap::new();
+    let mut buf = [0u8; 4096];
+    loop {
+        tokio::select! {
+            read_result = read.read(&mut buf) => {
+                let Ok(n) = read_result else {
+                    return true;
+                };
+                if n == 0 {
+                    return true;
+                }
+                decoder.feed(&buf[..n]);
+                for frame in decoder.drain().unwrap() {
+                    let cumulative = if frame.flags & FLAG_DATA != 0 {
+                        let total = cumulative_data.entry(frame.stream_id).or_default();
+                        *total += frame.payload.len();
+                        *total
+                    } else {
+                        cumulative_data
+                            .get(&frame.stream_id)
+                            .copied()
+                            .unwrap_or_default()
+                    };
+                    frame_tx
+                        .send(PersistentFrameEvent {
+                            carrier_index,
+                            stream_id: frame.stream_id,
+                            flags: frame.flags,
+                            payload_len: frame.payload.len(),
+                            cumulative_data: cumulative,
+                        })
+                        .unwrap();
+                    if let Some(pong) = frame.control_pong() {
+                        let bytes = pong.encode().unwrap();
+                        write.write_all(&bytes).await.unwrap();
+                        write.flush().await.unwrap();
+                        continue;
+                    }
+                    if frame.flags & FLAG_DATA != 0 {
+                        requests
+                            .entry(frame.stream_id)
+                            .or_default()
+                            .extend_from_slice(&frame.payload);
+                    }
+                    if frame.flags & FLAG_CLOSE != 0 {
+                        let bytes = requests.remove(&frame.stream_id).unwrap_or_default();
+                        cumulative_data.remove(&frame.stream_id);
+                        request_tx
+                            .send(PersistentRequest {
+                                carrier_index,
+                                stream_id: frame.stream_id,
+                                bytes,
+                            })
+                            .await
+                            .unwrap();
+                    }
+                }
+            }
+            write_command = write_rx.recv() => {
+                match write_command {
+                    Some(PersistentWrite::Frame(bytes)) => {
+                        if write.write_all(&bytes).await.is_err()
+                            || write.flush().await.is_err()
+                        {
+                            return true;
+                        }
+                    }
+                    Some(PersistentWrite::CloseCarrier) => {
+                        let _ = write.shutdown().await;
+                        return true;
+                    }
+                    None => return false,
+                }
+            }
+        }
+    }
+}
+
 async fn start_bridge_with_persistent_server_policy(
     policy: BridgePolicy,
 ) -> (journal_bridge::JournalBridgeHandle, PersistentBridgeServer) {
@@ -625,6 +743,7 @@ async fn start_bridge_with_persistent_server_policy(
     let upstream_port = listener.local_addr().unwrap().port();
     let accepts = Arc::new(AtomicUsize::new(0));
     let (request_tx, request_rx) = mpsc::channel(16);
+    let (frame_tx, frame_rx) = mpsc::unbounded_channel();
     let (write_tx, mut write_rx) = mpsc::unbounded_channel::<PersistentWrite>();
     let task = tokio::spawn({
         let accepts = accepts.clone();
@@ -635,61 +754,16 @@ async fn start_bridge_with_persistent_server_policy(
                 };
                 let carrier_index = accepts.fetch_add(1, Ordering::SeqCst) + 1;
                 let tls = acceptor.accept(tcp).await.unwrap();
-                let (mut read, mut write) = tokio::io::split(tls);
-                let mut decoder = FrameDecoder::new();
-                let mut requests: HashMap<u32, Vec<u8>> = HashMap::new();
-                let mut buf = [0u8; 4096];
-                loop {
-                    tokio::select! {
-                        read_result = read.read(&mut buf) => {
-                            let Ok(n) = read_result else {
-                                break;
-                            };
-                            if n == 0 {
-                                break;
-                            }
-                            decoder.feed(&buf[..n]);
-                            for frame in decoder.drain().unwrap() {
-                                if let Some(pong) = frame.control_pong() {
-                                    let bytes = pong.encode().unwrap();
-                                    write.write_all(&bytes).await.unwrap();
-                                    write.flush().await.unwrap();
-                                    continue;
-                                }
-                                if frame.flags & FLAG_DATA != 0 {
-                                    requests
-                                        .entry(frame.stream_id)
-                                        .or_default()
-                                        .extend_from_slice(&frame.payload);
-                                }
-                                if frame.flags & FLAG_CLOSE != 0 {
-                                    let bytes = requests.remove(&frame.stream_id).unwrap_or_default();
-                                    request_tx
-                                        .send(PersistentRequest {
-                                            carrier_index,
-                                            stream_id: frame.stream_id,
-                                            bytes,
-                                        })
-                                        .await
-                                        .unwrap();
-                                }
-                            }
-                        }
-                        write_command = write_rx.recv() => {
-                            match write_command {
-                                Some(PersistentWrite::Frame(bytes)) => {
-                                    if write.write_all(&bytes).await.is_err() || write.flush().await.is_err() {
-                                        break;
-                                    }
-                                }
-                                Some(PersistentWrite::CloseCarrier) => {
-                                    let _ = write.shutdown().await;
-                                    break;
-                                }
-                                None => return,
-                            }
-                        }
-                    }
+                if !handle_persistent_carrier(
+                    tls,
+                    carrier_index,
+                    &request_tx,
+                    &frame_tx,
+                    &mut write_rx,
+                )
+                .await
+                {
+                    return;
                 }
             }
         }
@@ -700,6 +774,7 @@ async fn start_bridge_with_persistent_server_policy(
         PersistentBridgeServer {
             accepts,
             requests: request_rx,
+            frames: frame_rx,
             writes: write_tx,
             task,
         },
@@ -728,6 +803,49 @@ async fn raw_bridge_request(
         body,
     )
     .await;
+    let mut response = Vec::new();
+    stream.read_to_end(&mut response).await.unwrap();
+    response
+}
+
+async fn raw_bridge_bytes(port: u16, request: &[u8]) -> Vec<u8> {
+    let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", port))
+        .await
+        .unwrap();
+    stream.write_all(request).await.unwrap();
+    stream.flush().await.unwrap();
+    let mut response = Vec::new();
+    stream.read_to_end(&mut response).await.unwrap();
+    response
+}
+
+async fn partial_body_bridge_request(
+    port: u16,
+    target: &str,
+    content_type: &str,
+    body: Arc<Vec<u8>>,
+    write_sizes: &[usize],
+) -> Vec<u8> {
+    let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", port))
+        .await
+        .unwrap();
+    let head = format!(
+        "POST {target} HTTP/1.1\r\nHost: {}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\n\r\n",
+        loopback_host(port),
+        body.len()
+    );
+    stream.write_all(head.as_bytes()).await.unwrap();
+    let mut offset = 0usize;
+    let mut size_index = 0usize;
+    while offset < body.len() {
+        let size = write_sizes[size_index % write_sizes.len()];
+        let end = (offset + size).min(body.len());
+        stream.write_all(&body[offset..end]).await.unwrap();
+        stream.flush().await.unwrap();
+        offset = end;
+        size_index += 1;
+        tokio::task::yield_now().await;
+    }
     let mut response = Vec::new();
     stream.read_to_end(&mut response).await.unwrap();
     response
@@ -1430,7 +1548,8 @@ async fn journal_bridge_custom_request_body_bound_rejects_oversize_body() {
     )
     .await;
 
-    assert!(oversize_response.is_empty());
+    assert_eq!(response_status(&oversize_response), 413);
+    assert!(response_text(&oversize_response).starts_with("HTTP/1.1 413 Payload Too Large\r\n"));
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     assert_eq!(server.accepted_carriers(), 0);
 
@@ -1450,6 +1569,148 @@ async fn journal_bridge_custom_request_body_bound_rejects_oversize_body() {
     let accepted_response = accepted_response.await.unwrap();
     assert_eq!(response_status(&accepted_response), 200);
     assert_eq!(response_body(&accepted_response), "accepted");
+    handle.shutdown_and_wait().await;
+    server.abort();
+}
+
+#[tokio::test]
+async fn journal_bridge_rejects_invalid_request_framing_before_dial() {
+    // Protocol: `.proto-ref/framing.md`, "stream lifecycle" — a stream exists
+    // only after an OPEN frame, so locally rejected input must not reach one.
+    let policy = BridgePolicy {
+        capability_gate: CapabilityGate::Disabled,
+        ..BridgePolicy::default()
+    };
+    let (handle, server) = start_bridge_with_persistent_server_policy(policy).await;
+    let port = handle.port();
+    let host = loopback_host(port);
+    let cases = [
+        (
+            "matching duplicate content length",
+            format!(
+                "POST /objects HTTP/1.1\r\nHost: {host}\r\nContent-Length: 0\r\ncontent-length: 0\r\n\r\n"
+            ),
+        ),
+        (
+            "disagreeing duplicate content length",
+            format!(
+                "POST /objects HTTP/1.1\r\nHost: {host}\r\nContent-Length: 0\r\nContent-Length: 1\r\n\r\n"
+            ),
+        ),
+        (
+            "transfer encoding",
+            format!("POST /objects HTTP/1.1\r\nHost: {host}\r\nTransfer-Encoding: chunked\r\n\r\n"),
+        ),
+        (
+            "invalid content length",
+            format!("POST /objects HTTP/1.1\r\nHost: {host}\r\nContent-Length: +1\r\n\r\n"),
+        ),
+    ];
+
+    for (label, request) in cases {
+        let response = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            raw_bridge_bytes(port, request.as_bytes()),
+        )
+        .await
+        .expect(label);
+        assert_eq!(response_status(&response), 400, "{label}");
+        assert_eq!(server.accepted_carriers(), 0, "{label}");
+    }
+
+    handle.shutdown_and_wait().await;
+    server.abort();
+}
+
+#[tokio::test]
+async fn journal_bridge_rejects_head_past_limit_before_dial() {
+    // Protocol: `.proto-ref/framing.md`, "stream lifecycle" — local HTTP
+    // validation precedes the first OPEN frame.
+    let policy = BridgePolicy {
+        capability_gate: CapabilityGate::Disabled,
+        ..BridgePolicy::default()
+    };
+    let (handle, server) = start_bridge_with_persistent_server_policy(policy).await;
+    let port = handle.port();
+    let prefix = format!(
+        "GET /objects HTTP/1.1\r\nHost: {}\r\nX-Pad: ",
+        loopback_host(port)
+    );
+    let suffix = "\r\n\r\n";
+    let padding_len = spl_core::bridge::MAX_REQUEST_HEAD_BYTES + 1 - prefix.len() - suffix.len();
+    let request = format!("{prefix}{}{suffix}", "a".repeat(padding_len));
+    assert_eq!(request.len(), spl_core::bridge::MAX_REQUEST_HEAD_BYTES + 1);
+
+    let response = tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        raw_bridge_bytes(port, request.as_bytes()),
+    )
+    .await
+    .expect("oversized head did not receive a prompt local rejection");
+    assert_eq!(response_status(&response), 400);
+    assert_eq!(server.accepted_carriers(), 0);
+
+    handle.shutdown_and_wait().await;
+    server.abort();
+}
+
+#[tokio::test]
+async fn journal_bridge_accepts_head_ending_at_limit() {
+    // Protocol: `.proto-ref/framing.md`, "stream lifecycle" — accepted local
+    // input reaches one OPEN stream, while the companion test pins rejection
+    // one byte later.
+    let policy = BridgePolicy {
+        capability_gate: CapabilityGate::Disabled,
+        ..BridgePolicy::default()
+    };
+    let (handle, mut server) = start_bridge_with_persistent_server_policy(policy).await;
+    let port = handle.port();
+    let prefix = format!(
+        "GET /objects HTTP/1.1\r\nHost: {}\r\nX-Pad: ",
+        loopback_host(port)
+    );
+    let suffix = "\r\n\r\n";
+    let padding_len = spl_core::bridge::MAX_REQUEST_HEAD_BYTES - prefix.len() - suffix.len();
+    let request = format!("{prefix}{}{suffix}", "a".repeat(padding_len));
+    assert_eq!(request.len(), spl_core::bridge::MAX_REQUEST_HEAD_BYTES);
+
+    let response = tokio::spawn(async move { raw_bridge_bytes(port, request.as_bytes()).await });
+    let forwarded = server.next_request().await;
+    server.send_http(forwarded.stream_id, "200 OK", b"accepted");
+    let response = response.await.unwrap();
+
+    assert_eq!(response_status(&response), 200);
+    assert_eq!(server.accepted_carriers(), 1);
+
+    handle.shutdown_and_wait().await;
+    server.abort();
+}
+
+#[tokio::test]
+async fn journal_bridge_rejects_expect_without_waiting_for_body_or_dialing() {
+    // Protocol: `.proto-ref/framing.md`, "stream lifecycle" — rejection before
+    // OPEN means no carrier stream is allocated.
+    let policy = BridgePolicy {
+        capability_gate: CapabilityGate::Disabled,
+        ..BridgePolicy::default()
+    };
+    let (handle, server) = start_bridge_with_persistent_server_policy(policy).await;
+    let port = handle.port();
+    let request = format!(
+        "POST /objects HTTP/1.1\r\nHost: {}\r\nContent-Length: 4\r\nExpect: 100-continue\r\n\r\n",
+        loopback_host(port)
+    );
+
+    let response = tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        raw_bridge_bytes(port, request.as_bytes()),
+    )
+    .await
+    .expect("417 response must arrive before the client sends a body");
+    assert_eq!(response_status(&response), 417);
+    assert!(response_text(&response).starts_with("HTTP/1.1 417 Expectation Failed\r\n"));
+    assert_eq!(server.accepted_carriers(), 0);
+
     handle.shutdown_and_wait().await;
     server.abort();
 }
@@ -2592,6 +2853,382 @@ async fn journal_bridge_logs_redacted_failure_categories_only() {
     assert!(!logs.contains("/secret/path"));
     assert!(!logs.contains("owner-secret"));
     assert!(!logs.contains("body-secret"));
+}
+
+#[tokio::test]
+async fn journal_bridge_streams_partial_multipart_body_byte_exactly() {
+    // Protocol: `.proto-ref/framing.md`, "fragmentation" — application writes
+    // do not map 1:1 to frames, while "ordering guarantees" requires strict
+    // FIFO within one stream.
+    const TARGET: &str = "/uploads/multipart";
+    const CONTENT_TYPE: &str = "multipart/form-data; boundary=test-boundary";
+    let policy = BridgePolicy {
+        capability_gate: CapabilityGate::Disabled,
+        ..BridgePolicy::default()
+    };
+    let (handle, mut server) = start_bridge_with_persistent_server_policy(policy).await;
+    let body = Arc::new(
+        (0..INITIAL_WINDOW + 257_131)
+            .map(|index| (index % 251) as u8)
+            .collect::<Vec<_>>(),
+    );
+    let body_for_client = body.clone();
+    let port = handle.port();
+    let client = tokio::spawn(async move {
+        partial_body_bridge_request(
+            port,
+            TARGET,
+            CONTENT_TYPE,
+            body_for_client,
+            &[1, 31, 4093, 65_519, 777],
+        )
+        .await
+    });
+
+    let first = server.next_frame().await;
+    assert_eq!(first.carrier_index, 1);
+    assert_ne!(first.flags & FLAG_DATA, 0);
+    assert!(first.payload_len > 0);
+    let stream_id = first.stream_id;
+    let mut event = first;
+    let mut granted_at = 0usize;
+    loop {
+        if event.stream_id == stream_id
+            && event.flags & FLAG_DATA != 0
+            && event.cumulative_data.saturating_sub(granted_at) >= INITIAL_WINDOW / 2
+        {
+            let grant = event.cumulative_data - granted_at;
+            server.send_window(stream_id, u32::try_from(grant).unwrap());
+            granted_at = event.cumulative_data;
+        }
+        if event.stream_id == stream_id && event.flags & FLAG_CLOSE != 0 {
+            break;
+        }
+        event = server.next_frame().await;
+    }
+
+    let request = server.next_request().await;
+    assert_eq!(request.carrier_index, 1);
+    assert_eq!(request.stream_id, stream_id);
+    let split = request
+        .bytes
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")
+        .unwrap()
+        + 4;
+    let expected_head = spl_core::http::build_request_head(
+        "POST",
+        TARGET,
+        &[
+            ("content-type".into(), CONTENT_TYPE.into()),
+            (TEST_OBSERVER_HEADER_NAME.into(), TEST_OBSERVER_KEY.into()),
+            (
+                "Authorization".into(),
+                format!("Bearer {TEST_OBSERVER_KEY}"),
+            ),
+            (TEST_PROTOCOL_HEADER_NAME.into(), "2".into()),
+        ],
+        body.len(),
+    );
+    assert_eq!(&request.bytes[..split], expected_head);
+    assert_eq!(&request.bytes[split..], body.as_slice());
+
+    server.send_http(stream_id, "200 OK", b"stored");
+    let response = client.await.unwrap();
+    assert_eq!(response_status(&response), 200);
+    assert_eq!(response_body(&response), "stored");
+    assert_eq!(server.accepted_carriers(), 1);
+
+    let status = handle.shutdown_and_wait().await;
+    assert_eq!(status.active_requests, 0);
+    server.abort();
+}
+
+#[tokio::test]
+async fn journal_bridge_small_request_completes_during_large_upload() {
+    // Protocol: `.proto-ref/framing.md`, "ordering guarantees" — "emit at most
+    // one frame per stream before scheduling another stream — round-robin, not
+    // greedy."
+    const LARGE_TARGET: &str = "/uploads/large";
+    let policy = BridgePolicy {
+        capability_gate: CapabilityGate::Disabled,
+        ..BridgePolicy::default()
+    };
+    let (handle, mut server) = start_bridge_with_persistent_server_policy(policy).await;
+    let port = handle.port();
+    let large_body = Arc::new(vec![b'L'; INITIAL_WINDOW * 2 + 333_333]);
+    let large_for_client = large_body.clone();
+    let large_client = tokio::spawn(async move {
+        partial_body_bridge_request(
+            port,
+            LARGE_TARGET,
+            "application/octet-stream",
+            large_for_client,
+            &[16_381, 7777, 65_521],
+        )
+        .await
+    });
+
+    let first = server.next_frame().await;
+    let large_stream_id = first.stream_id;
+    assert_ne!(first.flags & spl_core::frame::FLAG_OPEN, 0);
+    server.send_window(large_stream_id, u32::try_from(INITIAL_WINDOW / 2).unwrap());
+
+    let small_client = tokio::spawn(raw_bridge_request(
+        port,
+        "GET",
+        "/small",
+        Some(loopback_host(port)),
+        None,
+        &[],
+        b"",
+    ));
+    let small_request = server.next_request().await;
+    assert_ne!(small_request.stream_id, large_stream_id);
+    assert_eq!(small_request.carrier_index, first.carrier_index);
+    assert!(String::from_utf8_lossy(&small_request.bytes).starts_with("GET /small HTTP/1.1\r\n"));
+    server.send_http(small_request.stream_id, "200 OK", b"small-first");
+    let small_response = tokio::time::timeout(std::time::Duration::from_secs(1), small_client)
+        .await
+        .expect("small request should finish while the large upload remains open")
+        .unwrap();
+    assert_eq!(response_status(&small_response), 200);
+    assert_eq!(response_body(&small_response), "small-first");
+    assert!(
+        server.requests.try_recv().is_err(),
+        "large upload must still be open when the small response completes"
+    );
+
+    server.send_window(large_stream_id, u32::try_from(large_body.len()).unwrap());
+    let large_request = server.next_request().await;
+    assert_eq!(large_request.stream_id, large_stream_id);
+    assert!(large_request.bytes.ends_with(large_body.as_slice()));
+    server.send_http(large_stream_id, "200 OK", b"large-done");
+    let large_response = tokio::time::timeout(std::time::Duration::from_secs(3), large_client)
+        .await
+        .expect("large request should finish after further credit")
+        .unwrap();
+    assert_eq!(response_status(&large_response), 200);
+    assert_eq!(response_body(&large_response), "large-done");
+    assert_eq!(server.accepted_carriers(), 1);
+
+    let status = handle.shutdown_and_wait().await;
+    assert_eq!(status.active_requests, 0);
+    server.abort();
+}
+
+#[tokio::test]
+async fn journal_bridge_shutdown_waits_for_head_and_credit_blocked_requests() {
+    // Protocol: `.proto-ref/framing.md`, "flow control and backpressure" — a
+    // sender with zero credit MUST NOT send DATA.
+    let policy = BridgePolicy {
+        capability_gate: CapabilityGate::Disabled,
+        ..BridgePolicy::default()
+    };
+    let (handle, mut server) = start_bridge_with_persistent_server_policy(policy).await;
+    let port = handle.port();
+
+    let mut head_waiter = tokio::net::TcpStream::connect(("127.0.0.1", port))
+        .await
+        .unwrap();
+    head_waiter
+        .write_all(
+            format!(
+                "GET /waiting-head HTTP/1.1\r\nHost: {}\r\n",
+                loopback_host(port)
+            )
+            .as_bytes(),
+        )
+        .await
+        .unwrap();
+    head_waiter.flush().await.unwrap();
+
+    let mut upload = tokio::net::TcpStream::connect(("127.0.0.1", port))
+        .await
+        .unwrap();
+    let declared = INITIAL_WINDOW * 2;
+    upload
+        .write_all(
+            format!(
+                "POST /waiting-credit HTTP/1.1\r\nHost: {}\r\nContent-Length: {declared}\r\n\r\n",
+                loopback_host(port)
+            )
+            .as_bytes(),
+        )
+        .await
+        .unwrap();
+    let upload_writer = tokio::spawn(async move {
+        let result = upload.write_all(&vec![b'Q'; declared]).await;
+        (upload, result)
+    });
+
+    let first = server.next_frame().await;
+    let upload_stream_id = first.stream_id;
+    let last = server
+        .await_cumulative(upload_stream_id, INITIAL_WINDOW)
+        .await;
+    assert_eq!(last.cumulative_data, INITIAL_WINDOW);
+    assert_eq!(handle.status().active_requests, 2);
+
+    let final_status = tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        handle.shutdown_and_wait(),
+    )
+    .await
+    .expect("shutdown should wake head and credit-blocked requests");
+    assert_eq!(final_status.active_requests, 0);
+    assert!(!final_status.listener_active);
+
+    let mut head_tail = Vec::new();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        head_waiter.read_to_end(&mut head_tail),
+    )
+    .await
+    .expect("head-blocked local socket should close")
+    .unwrap();
+    assert!(head_tail.is_empty());
+
+    let (mut upload, _) = upload_writer.await.unwrap();
+    let mut upload_tail = Vec::new();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        upload.read_to_end(&mut upload_tail),
+    )
+    .await
+    .expect("credit-blocked local socket should close")
+    .unwrap();
+    assert!(upload_tail.is_empty());
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(50), server.frames.recv())
+            .await
+            .is_err(),
+        "no stream activity may continue after shutdown returns"
+    );
+    server.abort();
+}
+
+#[tokio::test]
+async fn journal_bridge_local_disconnect_stops_inflight_upload() {
+    // Protocol: `.proto-ref/framing.md`, "stream lifecycle" — RESET fully
+    // closes the stream, including both request and response directions.
+    let policy = BridgePolicy {
+        capability_gate: CapabilityGate::Disabled,
+        ..BridgePolicy::default()
+    };
+    let (handle, mut server) = start_bridge_with_persistent_server_policy(policy).await;
+    let port = handle.port();
+    let mut local = tokio::net::TcpStream::connect(("127.0.0.1", port))
+        .await
+        .unwrap();
+    let declared = INITIAL_WINDOW * 2;
+    local
+        .write_all(
+            format!(
+                "POST /cancel-response HTTP/1.1\r\nHost: {}\r\nContent-Length: {declared}\r\n\r\n",
+                loopback_host(port)
+            )
+            .as_bytes(),
+        )
+        .await
+        .unwrap();
+    local.write_all(&vec![b'C'; 64 * 1024]).await.unwrap();
+    local.flush().await.unwrap();
+
+    let first = server.next_frame().await;
+    let stream_id = first.stream_id;
+    drop(local);
+
+    let stopped_at = loop {
+        let event = server.next_frame().await;
+        if event.stream_id == stream_id && event.flags & FLAG_RESET != 0 {
+            break event.cumulative_data;
+        }
+    };
+    assert!(stopped_at < declared);
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(50), server.frames.recv())
+            .await
+            .is_err(),
+        "request body consumption must stop after local cancellation"
+    );
+
+    let status = handle.shutdown_and_wait().await;
+    assert_eq!(status.active_requests, 0);
+    server.abort();
+}
+
+async fn early_final_response(
+    server: &mut PersistentBridgeServer,
+    port: u16,
+    target: &'static str,
+    upstream_status: &'static str,
+) -> (u32, Vec<u8>) {
+    let client = tokio::spawn(async move {
+        let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .unwrap();
+        let declared = INITIAL_WINDOW;
+        let head = format!(
+            "POST {target} HTTP/1.1\r\nHost: {}\r\nContent-Length: {declared}\r\n\r\n",
+            loopback_host(port)
+        );
+        stream.write_all(head.as_bytes()).await.unwrap();
+        stream.write_all(&vec![b'P'; 32 * 1024]).await.unwrap();
+        stream.flush().await.unwrap();
+        let mut response = Vec::new();
+        stream.read_to_end(&mut response).await.unwrap();
+        response
+    });
+    let first = server.next_frame().await;
+    let stream_id = first.stream_id;
+    assert!(first.cumulative_data < INITIAL_WINDOW);
+    server.send_http(stream_id, upstream_status, b"early");
+    let response = tokio::time::timeout(std::time::Duration::from_secs(1), client)
+        .await
+        .expect("early final response should terminate the local request")
+        .unwrap();
+    loop {
+        let event = server.next_frame().await;
+        if event.stream_id == stream_id && event.flags & FLAG_RESET != 0 {
+            assert_eq!(event.payload_len, 1);
+            break;
+        }
+    }
+    (stream_id, response)
+}
+
+#[tokio::test]
+async fn journal_bridge_maps_early_final_responses_and_resets_once() {
+    // Protocol: `.proto-ref/framing.md`, "stream lifecycle" — either side's
+    // RESET fully closes the stream; late terminal frames must not create a
+    // second termination.
+    let policy = BridgePolicy {
+        capability_gate: CapabilityGate::Disabled,
+        ..BridgePolicy::default()
+    };
+    let (handle, mut server) = start_bridge_with_persistent_server_policy(policy).await;
+    let port = handle.port();
+
+    let (failed_stream, failure) =
+        early_final_response(&mut server, port, "/early-failure", "409 Conflict").await;
+    assert_eq!(response_status(&failure), 409);
+    let (success_stream, success) =
+        early_final_response(&mut server, port, "/early-success", "200 OK").await;
+    assert_eq!(response_status(&success), 502);
+
+    let mut reset_counts = HashMap::from([(failed_stream, 1usize), (success_stream, 1usize)]);
+    while let Ok(event) = server.frames.try_recv() {
+        if event.flags & FLAG_RESET != 0 {
+            *reset_counts.entry(event.stream_id).or_default() += 1;
+        }
+    }
+    assert_eq!(reset_counts.get(&failed_stream), Some(&1));
+    assert_eq!(reset_counts.get(&success_stream), Some(&1));
+
+    let status = handle.shutdown_and_wait().await;
+    assert_eq!(status.active_requests, 0);
+    server.abort();
 }
 
 /// A flow-control-enforcing peer, byte-identical in policy to the journal's

@@ -9,11 +9,11 @@
 //! HTTP request as `OPEN|DATA…|CLOSE` frames but never sends more un-granted DATA
 //! payload than the peer's advertised window ([`WindowedUpload`]), reading
 //! inbound frames between bursts to pick up `WINDOW` grants (which unblock more
-//! sending), answer control `PING`s with `PONG`s, and assemble the response —
-//! full-duplex, so a multi-MiB body streams correctly instead of stalling at
-//! the 1 MiB initial window. Connection-per-request keeps the mux trivially
-//! correct (no concurrent-stream bookkeeping); persistent multiplexing belongs
-//! to this crate's journal bridge carrier.
+//! sending), answer control `PING`s with `PONG`s, and assemble the response.
+//! Caller-owned request bodies remain completely buffered, but are fragmented on
+//! the wire and paced beyond the 1 MiB initial window. Connection-per-request
+//! keeps the mux trivially correct (no concurrent-stream bookkeeping); persistent
+//! multiplexing belongs to this crate's journal bridge carrier.
 
 use std::io;
 use std::sync::Arc;

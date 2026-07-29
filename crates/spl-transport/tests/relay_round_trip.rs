@@ -29,7 +29,9 @@ use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use rustls::{ClientConfig, ServerConfig};
 use serde_json::json;
 use spl_core::bridge::BridgeNames;
-use spl_core::frame::{FLAG_CLOSE, FLAG_DATA, FLAG_RESET, FLAG_WINDOW, Frame, FrameDecoder};
+use spl_core::frame::{
+    FLAG_CLOSE, FLAG_DATA, FLAG_RESET, FLAG_WINDOW, Frame, FrameDecoder, RESET_FLOW_CONTROL_ERROR,
+};
 use spl_core::http::HttpResponse;
 use spl_core::mux::INITIAL_WINDOW;
 use spl_transport::client::{DialedCarrier, TokenPersistHook, TransportClient};
@@ -567,7 +569,7 @@ where
                 )]
                 let len = frame.payload.len() as i64;
                 if len > recv_credit {
-                    let reset = Frame::new(stream_id, FLAG_RESET, vec![0x03]);
+                    let reset = Frame::new(stream_id, FLAG_RESET, vec![RESET_FLOW_CONTROL_ERROR]);
                     tls.write_all(&reset.encode().unwrap()).await.unwrap();
                     tls.flush().await.unwrap();
                     return request;
@@ -689,7 +691,7 @@ where
                 )]
                 let len = frame.payload.len() as i64;
                 if len > recv_credit {
-                    let reset = Frame::new(stream_id, FLAG_RESET, vec![0x03]);
+                    let reset = Frame::new(stream_id, FLAG_RESET, vec![RESET_FLOW_CONTROL_ERROR]);
                     tls.write_all(&reset.encode().unwrap()).await.unwrap();
                     tls.flush().await.unwrap();
                     return request;

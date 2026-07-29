@@ -18,6 +18,7 @@ use spl_core::mux::{
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt, ReadHalf, WriteHalf, split};
 use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore, mpsc, oneshot};
+use tokio::task::JoinHandle;
 use tokio::time::{Instant, MissedTickBehavior};
 
 #[cfg(test)]
@@ -31,6 +32,9 @@ const READ_BUF_BYTES: usize = 64 * 1024;
 const COMMAND_QUEUE: usize = 64;
 const STREAM_QUEUE: usize = 16;
 const WRITER_QUEUE: usize = 256;
+// One coordinator pass can coalesce a keepalive burst with stream-local WINDOW
+// and RESET output; 32 slots leaves normal control batches clear of upload DATA.
+const CONTROL_RESERVE: usize = 32;
 const BODY_QUEUE: usize = 4;
 
 type CarrierRead = ReadHalf<Box<dyn CarrierIo>>;
@@ -394,6 +398,12 @@ impl MuxCarrier {
             handle.alive.store(false, Ordering::SeqCst);
             mark_carrier_dead(&self.status, &handle.status_identity);
             let _ = handle.commands.send(CarrierCommand::Shutdown).await;
+            if let Some(tasks) = handle.tasks.lock().await.take() {
+                tasks.writer.abort();
+                tasks.coordinator.abort();
+                let _ = tasks.writer.await;
+                let _ = tasks.coordinator.await;
+            }
         }
     }
 
@@ -418,36 +428,38 @@ impl MuxCarrier {
         let (cancel_tx, cancel_rx) = mpsc::unbounded_channel();
         let alive = Arc::new(AtomicBool::new(true));
         let status_identity = Arc::new(());
-        let handle = Arc::new(CarrierHandle {
-            commands: commands_tx,
-            body_ready: body_ready_tx,
-            cancel: cancel_tx,
-            alive: alive.clone(),
-            status_identity: status_identity.clone(),
-        });
-
         let mut status = lock_status(&self.status);
-        tokio::spawn(writer_task(
+        let writer = tokio::spawn(writer_task(
             write,
             writer_rx,
             writer_events_tx,
             CarrierLiveGuard::new(alive.clone(), self.status.clone(), status_identity.clone()),
         ));
-        tokio::spawn(coordinator_task(
+        let coordinator = tokio::spawn(coordinator_task(
             read,
             CoordinatorChannels {
                 commands: commands_rx,
-                command_sender: handle.commands.clone(),
+                command_sender: commands_tx.clone(),
                 body_ready: body_ready_rx,
                 cancels: cancel_rx,
-                cancel_sender: handle.cancel.clone(),
+                cancel_sender: cancel_tx.clone(),
                 writer_tx,
                 writer_events: writer_events_rx,
             },
             kind,
             self.keepalive,
-            CarrierLiveGuard::new(alive, self.status.clone(), status_identity.clone()),
+            CarrierLiveGuard::new(alive.clone(), self.status.clone(), status_identity.clone()),
         ));
+        let handle = Arc::new(CarrierHandle {
+            commands: commands_tx,
+            body_ready: body_ready_tx,
+            alive: alive.clone(),
+            status_identity: status_identity.clone(),
+            tasks: Mutex::new(Some(CarrierTasks {
+                writer,
+                coordinator,
+            })),
+        });
 
         *slot = Some(handle.clone());
         status.current_carrier = Some(status_identity);
@@ -511,9 +523,14 @@ enum OpenFailure {
 pub(crate) struct CarrierHandle {
     commands: mpsc::Sender<CarrierCommand>,
     body_ready: mpsc::UnboundedSender<u32>,
-    cancel: mpsc::UnboundedSender<u32>,
     alive: Arc<AtomicBool>,
     status_identity: Arc<()>,
+    tasks: Mutex<Option<CarrierTasks>>,
+}
+
+struct CarrierTasks {
+    writer: JoinHandle<()>,
+    coordinator: JoinHandle<()>,
 }
 
 fn stopped_after_claim_error() -> TransportError {
@@ -686,7 +703,6 @@ struct StreamState {
     body: mpsc::Receiver<BodyChunk>,
     budget: Arc<BodyBudget>,
     staged_leases: VecDeque<BodyLease>,
-    writer_body_bytes: usize,
     delivery: mpsc::Sender<DeliveryEvent>,
     ready_queued: bool,
 }
@@ -705,21 +721,11 @@ struct OutstandingProbe {
 
 struct WriterPacket {
     bytes: Vec<u8>,
-    stream_id: Option<u32>,
     body_leases: Vec<BodyLease>,
 }
 
-impl WriterPacket {
-    fn body_bytes(&self) -> usize {
-        self.body_leases.iter().map(BodyLease::len).sum()
-    }
-}
-
 enum WriterEvent {
-    Drained {
-        stream_id: Option<u32>,
-        body_bytes: usize,
-    },
+    Drained,
     Stopped,
 }
 
@@ -738,7 +744,7 @@ impl CoordinatorWriter {
     }
 
     fn has_upload_room(&self) -> bool {
-        self.inflight + 1 < WRITER_QUEUE
+        self.inflight < WRITER_QUEUE - CONTROL_RESERVE
     }
 
     fn send(&mut self, packet: WriterPacket) -> Result<(), TransportError> {
@@ -778,23 +784,16 @@ async fn writer_task(
     carrier_guard: CarrierLiveGuard,
 ) {
     while let Some(packet) = rx.recv().await {
-        if write.write_all(&packet.bytes).await.is_err() || write.flush().await.is_err() {
+        let WriterPacket { bytes, body_leases } = packet;
+        if write.write_all(&bytes).await.is_err() || write.flush().await.is_err() {
             break;
         }
-        let body_bytes = packet.body_bytes();
         #[cfg(test)]
-        for lease in &packet.body_leases {
+        for lease in &body_leases {
             lease.note_drained();
         }
-        let stream_id = packet.stream_id;
-        drop(packet);
-        if events
-            .send(WriterEvent::Drained {
-                stream_id,
-                body_bytes,
-            })
-            .is_err()
-        {
+        drop(body_leases);
+        if events.send(WriterEvent::Drained).is_err() {
             break;
         }
     }
@@ -948,14 +947,8 @@ async fn coordinator_task(
             }
             event = writer_events.recv() => {
                 match event {
-                    Some(WriterEvent::Drained { stream_id, body_bytes }) => {
+                    Some(WriterEvent::Drained) => {
                         writer.drained();
-                        if let Some(stream_id) = stream_id
-                            && let Some(state) = streams.get_mut(&stream_id)
-                        {
-                            state.writer_body_bytes =
-                                state.writer_body_bytes.saturating_sub(body_bytes);
-                        }
                         CoordinatorStep::Continue
                     }
                     Some(WriterEvent::Stopped) | None => {
@@ -1033,10 +1026,10 @@ fn handle_read(
         log_frame_violation(violation);
     }
     for pong in out.pongs {
-        send_writer(writer, pong, None, Vec::new())?;
+        send_writer(writer, pong, Vec::new())?;
     }
     for frame in out.emit_frames {
-        send_writer(writer, frame, None, Vec::new())?;
+        send_writer(writer, frame, Vec::new())?;
     }
     for nonce in out.inbound_pongs {
         #[expect(
@@ -1063,7 +1056,7 @@ fn handle_read(
                 let reset = Frame::reset(stream_id, RESET_FLOW_CONTROL_ERROR)
                     .encode()
                     .map_err(|error| TransportError::Mux(MuxError::Frame(error)))?;
-                send_writer(writer, reset, Some(stream_id), Vec::new())?;
+                send_writer(writer, reset, Vec::new())?;
                 demux.remove_stream(stream_id);
                 deliver_stream_item(
                     stream_id,
@@ -1092,7 +1085,7 @@ fn consume_stream(
     writer: &mut CoordinatorWriter,
 ) -> Result<(), TransportError> {
     if let Some(frame) = demux.consume(stream_id, bytes)? {
-        send_writer(writer, frame, Some(stream_id), Vec::new())?;
+        send_writer(writer, frame, Vec::new())?;
     }
     Ok(())
 }
@@ -1121,7 +1114,6 @@ fn open_stream_on_carrier(
         body: input.body,
         budget: input.budget,
         staged_leases: VecDeque::new(),
-        writer_body_bytes: 0,
         delivery,
         ready_queued: true,
     };
@@ -1245,7 +1237,7 @@ fn pump_ready(
             continue;
         };
         state.ready_queued = false;
-        let emitted = pump_upload_once(stream_id, writer, state)?;
+        let emitted = pump_upload_once(writer, state)?;
         if emitted && !state.upload.is_done() && !state.upload.is_blocked() {
             state.ready_queued = true;
             ready.push_back(stream_id);
@@ -1255,7 +1247,6 @@ fn pump_ready(
 }
 
 fn pump_upload_once(
-    stream_id: u32,
     writer: &mut CoordinatorWriter,
     state: &mut StreamState,
 ) -> Result<bool, TransportError> {
@@ -1272,8 +1263,7 @@ fn pump_upload_once(
         .emitted_body_len()
         .saturating_sub(emitted_before);
     let body_leases = take_body_leases(&mut state.staged_leases, body_bytes)?;
-    send_writer(writer, frame, Some(stream_id), body_leases)?;
-    state.writer_body_bytes += body_bytes;
+    send_writer(writer, frame, body_leases)?;
     Ok(true)
 }
 
@@ -1326,7 +1316,7 @@ fn reset_active_stream(
     let frame = Frame::reset(stream_id, RESET_CANCEL)
         .encode()
         .map_err(|e| TransportError::Mux(MuxError::Frame(e)))?;
-    send_writer(writer, frame, Some(stream_id), Vec::new())
+    send_writer(writer, frame, Vec::new())
 }
 
 fn fanout_eof(streams: &mut HashMap<u32, StreamState>) {
@@ -1359,7 +1349,7 @@ fn handle_keepalive(
     let nonce = next_nonce.to_be_bytes();
     *next_nonce = next_nonce.saturating_add(1);
     let frame = Frame::control_ping(nonce).encode().map_err(|_| ())?;
-    send_writer(writer, frame, None, Vec::new()).map_err(|_| ())?;
+    send_writer(writer, frame, Vec::new()).map_err(|_| ())?;
     *outstanding = Some(OutstandingProbe {
         nonce,
         deadline: now + keepalive.deadline,
@@ -1370,12 +1360,10 @@ fn handle_keepalive(
 fn send_writer(
     writer: &mut CoordinatorWriter,
     frame: Vec<u8>,
-    stream_id: Option<u32>,
     body_leases: Vec<BodyLease>,
 ) -> Result<(), TransportError> {
     writer.send(WriterPacket {
         bytes: frame,
-        stream_id,
         body_leases,
     })
 }
@@ -1749,6 +1737,22 @@ mod tests {
         assert_eq!(body, expected_body);
     }
 
+    fn drain_writer_frames_with_flag(
+        writer: &mut CoordinatorWriter,
+        writer_rx: &mut mpsc::Receiver<WriterPacket>,
+        flag: u8,
+    ) -> usize {
+        let mut decoder = FrameDecoder::new();
+        let mut matches = 0usize;
+        while let Ok(packet) = writer_rx.try_recv() {
+            decoder.feed(&packet.bytes);
+            let frame = decoder.next_frame().unwrap().unwrap();
+            matches += usize::from(frame.flags == flag);
+            writer.drained();
+        }
+        matches
+    }
+
     async fn assert_stream_eof(rx: &mut StreamRx) {
         match tokio::time::timeout(Duration::from_secs(1), rx.recv())
             .await
@@ -2115,7 +2119,6 @@ mod tests {
                 body: body_rx,
                 budget,
                 staged_leases: VecDeque::new(),
-                writer_body_bytes: 0,
                 delivery,
                 ready_queued: false,
             },
@@ -2651,6 +2654,105 @@ mod tests {
         let response = http_response(b"ok");
         send_frame(&mut server, 1, FLAG_DATA | FLAG_CLOSE, &response).await;
         assert_stream_completes(&mut rx, b"ok").await;
+    }
+
+    #[tokio::test]
+    async fn carrier_reserves_writer_headroom_for_ping_burst() {
+        // `.proto-ref/framing.md` "initiator behavior": receivers MUST tolerate
+        // PING at any cadence, including bursts, without rate-limiting.
+        const PING_COUNT: usize = 8;
+
+        let (writer_tx, mut writer_rx) = mpsc::channel(WRITER_QUEUE);
+        let mut writer = CoordinatorWriter::new(writer_tx);
+        let mut demux = CarrierDemux::new();
+        let mut dialer = FrameDialer::default();
+        let mut streams = HashMap::new();
+        let mut ready = VecDeque::new();
+        let (commands, _command_rx) = mpsc::channel(COMMAND_QUEUE);
+        let (cancel, _cancels) = mpsc::unbounded_channel();
+        let (_body_a, body_rx_a) = mpsc::channel(BODY_QUEUE);
+        let (_body_b, body_rx_b) = mpsc::channel(BODY_QUEUE);
+        let mut rx_a = open_stream_on_carrier(
+            OpenStreamInput {
+                method: "GET".to_string(),
+                target: "/a".to_string(),
+                headers: Vec::new(),
+                declared_body_len: 0,
+                body: body_rx_a,
+                budget: BodyBudget::new(),
+            },
+            &mut dialer,
+            &mut demux,
+            &mut streams,
+            &mut ready,
+            commands.clone(),
+            cancel.clone(),
+        );
+        let mut rx_b = open_stream_on_carrier(
+            OpenStreamInput {
+                method: "GET".to_string(),
+                target: "/b".to_string(),
+                headers: Vec::new(),
+                declared_body_len: 0,
+                body: body_rx_b,
+                budget: BodyBudget::new(),
+            },
+            &mut dialer,
+            &mut demux,
+            &mut streams,
+            &mut ready,
+            commands,
+            cancel,
+        );
+        pump_ready(&mut writer, &mut streams, &mut ready).unwrap();
+        while writer_rx.try_recv().is_ok() {
+            writer.drained();
+        }
+
+        let upload_frame = Frame::new(1, FLAG_DATA, vec![b'x']).encode().unwrap();
+        while writer.has_upload_room() {
+            send_writer(&mut writer, upload_frame.clone(), Vec::new()).unwrap();
+        }
+        assert_eq!(writer.inflight, WRITER_QUEUE - CONTROL_RESERVE);
+
+        let mut burst = Vec::new();
+        for nonce in 0..PING_COUNT {
+            burst.extend_from_slice(&Frame::control_ping([nonce as u8; 8]).encode().unwrap());
+        }
+        let mut outstanding = None;
+        let mut missed = 0;
+        handle_read(
+            &mut demux,
+            &mut streams,
+            &mut ready,
+            &mut writer,
+            &burst,
+            &mut outstanding,
+            &mut missed,
+        )
+        .unwrap();
+
+        assert_eq!(
+            drain_writer_frames_with_flag(&mut writer, &mut writer_rx, FLAG_PONG),
+            PING_COUNT
+        );
+
+        let response = Frame::new(3, FLAG_DATA | FLAG_CLOSE, http_response(b"ok"))
+            .encode()
+            .unwrap();
+        handle_read(
+            &mut demux,
+            &mut streams,
+            &mut ready,
+            &mut writer,
+            &response,
+            &mut outstanding,
+            &mut missed,
+        )
+        .unwrap();
+        assert_stream_completes(&mut rx_b, b"ok").await;
+        assert!(streams.contains_key(&rx_a.stream_id));
+        rx_a.cancel();
     }
 
     #[tokio::test(start_paused = true)]

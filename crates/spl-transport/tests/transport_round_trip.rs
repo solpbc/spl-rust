@@ -547,6 +547,7 @@ struct PersistentBridgeServer {
     accepts: Arc<AtomicUsize>,
     requests: mpsc::Receiver<PersistentRequest>,
     frames: mpsc::UnboundedReceiver<PersistentFrameEvent>,
+    carrier_closes: mpsc::UnboundedReceiver<usize>,
     writes: mpsc::UnboundedSender<PersistentWrite>,
     task: JoinHandle<()>,
 }
@@ -564,6 +565,16 @@ impl PersistentBridgeServer {
             .await
             .expect("timed out waiting for upstream mux frame")
             .expect("persistent upstream closed before frame")
+    }
+
+    async fn next_carrier_close(&mut self) -> usize {
+        tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            self.carrier_closes.recv(),
+        )
+        .await
+        .expect("timed out waiting for upstream carrier close")
+        .expect("persistent upstream stopped before carrier close")
     }
 
     async fn await_cumulative(&mut self, stream_id: u32, bytes: usize) -> PersistentFrameEvent {
@@ -744,6 +755,7 @@ async fn start_bridge_with_persistent_server_policy(
     let accepts = Arc::new(AtomicUsize::new(0));
     let (request_tx, request_rx) = mpsc::channel(16);
     let (frame_tx, frame_rx) = mpsc::unbounded_channel();
+    let (carrier_close_tx, carrier_close_rx) = mpsc::unbounded_channel();
     let (write_tx, mut write_rx) = mpsc::unbounded_channel::<PersistentWrite>();
     let task = tokio::spawn({
         let accepts = accepts.clone();
@@ -754,15 +766,16 @@ async fn start_bridge_with_persistent_server_policy(
                 };
                 let carrier_index = accepts.fetch_add(1, Ordering::SeqCst) + 1;
                 let tls = acceptor.accept(tcp).await.unwrap();
-                if !handle_persistent_carrier(
+                let keep_serving = handle_persistent_carrier(
                     tls,
                     carrier_index,
                     &request_tx,
                     &frame_tx,
                     &mut write_rx,
                 )
-                .await
-                {
+                .await;
+                carrier_close_tx.send(carrier_index).unwrap();
+                if !keep_serving {
                     return;
                 }
             }
@@ -775,6 +788,7 @@ async fn start_bridge_with_persistent_server_policy(
             accepts,
             requests: request_rx,
             frames: frame_rx,
+            carrier_closes: carrier_close_rx,
             writes: write_tx,
             task,
         },
@@ -3078,6 +3092,7 @@ async fn journal_bridge_shutdown_waits_for_head_and_credit_blocked_requests() {
     .expect("shutdown should wake head and credit-blocked requests");
     assert_eq!(final_status.active_requests, 0);
     assert!(!final_status.listener_active);
+    assert!(!final_status.carrier_live);
 
     let mut head_tail = Vec::new();
     tokio::time::timeout(
@@ -3099,6 +3114,7 @@ async fn journal_bridge_shutdown_waits_for_head_and_credit_blocked_requests() {
     .expect("credit-blocked local socket should close")
     .unwrap();
     assert!(upload_tail.is_empty());
+    assert_eq!(server.next_carrier_close().await, 1);
     assert!(
         tokio::time::timeout(std::time::Duration::from_millis(50), server.frames.recv())
             .await

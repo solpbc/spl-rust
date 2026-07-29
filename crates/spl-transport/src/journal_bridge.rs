@@ -9,11 +9,18 @@
 //! capability gate permits every method, while exact loopback `Host` validation
 //! and bridge-reserved header stripping remain mandatory.
 //!
-//! Requests use known-length framing: exactly one valid `Content-Length` and no
-//! `Transfer-Encoding`. Request bodies are streamed through a fixed-size stage;
-//! carrier credit and bounded queues propagate backpressure to the local socket.
-//! Once any part of a request is consumed by a carrier it is never replayed.
-//! Application code owns any later retry and the associated idempotency policy.
+//! Requests use known-length framing: at most one valid `Content-Length` (absent
+//! means no body) and no `Transfer-Encoding`. Request bodies are streamed through
+//! a fixed-size stage; carrier credit and bounded queues propagate backpressure to
+//! the local socket. Once any request bytes are accepted by a carrier they are
+//! never replayed. Application code owns retry and the associated idempotency
+//! policy.
+//!
+//! Limitations: request bodies stream incrementally within a fixed per-stream
+//! memory bound. Buffered upstream-response paths remain buffered, and
+//! `connection::request_once` remains caller-buffered. Ordinary short bodies,
+//! disconnects, and early responses are cancelled; fully saturated internal
+//! queues rely on reserved capacity rather than an exhaustive scheduling contract.
 
 use std::future::Future;
 use std::pin::Pin;

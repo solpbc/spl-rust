@@ -206,7 +206,7 @@ With the byte pipe open, the mobile initiates TLS 1.3 toward the home. The mobil
 
 ### 8. application traffic
 
-After TLS, the mobile speaks HTTP (with multiplexed streams per [`framing.md`](framing.md)) toward the home's app — convey on solstone, the reference test server in `home/src/spl/home/app.py` in this repo, or any other HTTP server the operator runs.
+After TLS, the mobile speaks HTTP (with multiplexed streams per [`framing.md`](framing.md)) toward the home's app — convey on solstone, or any other HTTP server the operator runs.
 
 The link service on the home side is a **dumb byte pipe**. For each incoming stream it opens a plain TCP connection to `127.0.0.1:<app_port>` and pumps bytes bidirectionally:
 
@@ -317,7 +317,7 @@ The listen WS may disconnect for any reason — network flap on the home machine
 - Initial delay: 1 s.
 - Multiplier: 2× each failed attempt.
 - Cap: 60 s.
-- Reset to 1 s on a successful reconnect.
+- Reset to 1 s only after the reconnected listen WS remains established without transport failure for 60 s. Connection establishment alone does not reset backoff; a connection that fails before the stability interval advances to the next delay.
 - Jitter: ±25% on each delay to avoid synchronized reconnect storms after a CF deploy.
 
 While the listen WS is down, the home cannot receive `incoming` signals. By default (`PRESENCE_HOLD_ENABLED` off), new dials from a paired mobile fail at the relay (the DO marks the home as not-ready and the dial returns 503). With `PRESENCE_HOLD_ENABLED` enabled, the relay holds the dial WS open and brokers it when the home's listen WS reconnects. The mobile's reconnect logic handles this; the user sees `LITERAL: "Reconnecting…"` for the brief outage and `LITERAL: "Offline — check your connection."` if it persists past a small grace window.
@@ -331,7 +331,7 @@ The mobile dial-turned-tunnel WS disconnects on:
 - TLS-handshake failure (revocation).
 - `spl-relay` deploy.
 
-For non-revocation disconnects, the mobile reconnects on next user-visible activity (foreground, scroll, tap). Backoff is: 1 s, then 5 s, then 10 s, capped at 30 s, with the same ±25% jitter. The mobile's UX handles "Reconnecting…" / "Offline" banners.
+For non-revocation disconnects, the mobile reconnects on next user-visible activity (foreground, scroll, tap). Backoff is: 1 s, then 5 s, then 10 s, capped at 30 s, with the same ±25% jitter. Connection establishment alone does not reset backoff. The dialer retains its current attempt until a tunnel generation remains connected without transport or keepalive failure for 60 s; only then does the next automatic reconnect start again at 1 s. An explicit user-initiated start or stop begins a fresh backoff sequence. The home and mobile use different delay schedules, but the same demonstrated-stability reset condition. The mobile's UX handles "Reconnecting…" / "Offline" banners.
 
 For TLS-handshake failure (revocation), the mobile does **not** retry automatically — it presents the unpaired error and requires the user to re-pair through convey.
 
@@ -362,13 +362,11 @@ Operational implication: deploy cadence on `spl-relay` is low. We don't ship fea
 
 The DO uses `getWebSockets(tag)` to look up sockets by tag. The relay tags sockets as:
 
-- `listen:<instance_id>` for the listen WS.
+- `home:<instance_id>` for the listen WS.
 - `tunnel_home:<tunnel_id>` for the home tunnel WS.
 - `tunnel_mobile:<tunnel_id>` for the mobile dial-turned-tunnel WS.
-- `pair_window` for the one active pairing window in an RK-addressed DO.
-- `pair_owner:<instance_id>` for every pairing socket owned by that instance in an RK-addressed DO.
 
-The `listen`, `tunnel_home`, `tunnel_mobile`, and `pair_window` tags MUST each resolve to exactly one active WebSocket in their scope. If a duplicate WS attaches under one of these tags (e.g., a home reconnects without the previous WS having been observed as closed), the relay closes the duplicate and keeps the most recently attached. `pair_owner` is intentionally many-valued so retirement can discover the window and both sides of every pairing tunnel owned by an instance. Prototype finding §11.4 — the API doesn't enforce cardinality, the application must.
+Each tag MUST resolve to exactly one WebSocket. If a duplicate WS attaches under any of these tags (e.g., a home reconnects without the previous WS having been observed as closed), the relay closes the duplicate and keeps the most recently attached. Prototype finding §11.4 — the API doesn't enforce cardinality, the application must.
 
 Presence-hold also uses `waiting_dial:<instance_id>` as a many-valued discovery tag for held dials. It is intentionally excluded from the exact-one cardinality invariant: one instance may have N waiting dials.
 
@@ -395,8 +393,6 @@ Both sides may close at any time. The relay propagates close events across the p
 
 The listen WS closing does **not** close active tunnel WSes — those continue until either side hangs up. The relay does, however, refuse new dials while the listen WS is down.
 
-Irreversible instance retirement is the administrative exception. After the revoked state is established, the relay refuses every new listen, dial, tunnel, pair-window, pair-dial, and pairing-tunnel admission for that instance. It closes every already accepted socket it can discover, including hibernated sockets and sockets in RK-addressed pairing DOs, with application close code `4403` and the fixed reason `instance_retired`. Clients must treat 4403 as terminal for the instance rather than reconnecting with an old token.
-
 ## what `spl-relay` logs about a session
 
 For audit and debugging, the Worker emits structured log events at session boundaries. Logged fields are an exhaustive list:
@@ -404,18 +400,14 @@ For audit and debugging, the Worker emits structured log events at session bound
 - `tunnel_id` (uuid)
 - `instance_id` (uuid)
 - `direction` (one of `home → mobile`, `mobile → home`, or `meta`)
-- `event` (one of `listen_open`, `listen_close`, `dial_open`, `dial_close`, `tunnel_home_open`, `tunnel_home_close`, `tunnel_mobile_open`, `tunnel_mobile_close`, `pair`, `fwd`, `pending_buffer`, `pending_buffer_overflow`, `unauthorized`, `cardinality_violation`, `enroll_home`, `enroll_device`, `enroll_device_remint`, `device_refresh`, `enroll_home_rotate`, `enroll_rejected`, `pair_window_open`, `pair_window_close`, `pair_dial_open`, `pair_dial_rejected`, `entitlement_set`, `entitlement_pending`, `entitlement_revoke`, `pending_grant_claimed`, `admin_instances_list`, `admin_instance_show`, `instance_retire`, `instance_retire_failed`, `not_entitled`, `internal_error`)
+- `event` (one of `listen_open`, `listen_close`, `dial_open`, `dial_close`, `pair_window_open`, `pair_window_close`, `pair_dial_open`, `pair_dial_rejected`, `tunnel_home_open`, `tunnel_home_close`, `tunnel_mobile_close`, `pair`, `fwd`, `pending_buffer`, `pending_buffer_overflow`, `unauthorized`, `cardinality_violation`, `not_entitled`)
 - `byte_count` (when applicable)
-- `count` (aggregate socket or instance count, when applicable)
 - `close_code` (when applicable)
 - `reason` (on close/error events; a relay-authored classification drawn from a fixed closed set)
 - `duration_ms` (on close events)
-- `route` (the fixed relay route classification, when applicable)
-- `jti` (the non-credential token identifier used as a correlation handle, when applicable)
-- `queued_frames` and `queued_bytes` (pending-buffer occupancy, when applicable)
 - `timestamp`
 
-**Never** a payload byte. **Never** a token value; `jti` is deliberately logged as a non-credential correlation handle. **Never** a TLS handshake message. **Never** an `Authorization` header value. **Never** `S`, `RK`, the pair-link fragment, or the home-side nonce. This is enforced by code review; the framework does not protect us from a sloppy `console.log`.
+**Never** a payload byte. **Never** a token claim. **Never** a TLS handshake message. **Never** an `Authorization` header value. **Never** `S`, `RK`, the pair-link fragment, a token value, or the home-side nonce. This is enforced by code review; the framework does not protect us from a sloppy `console.log`.
 The peer-supplied WebSocket close-reason string is never logged and cannot select
 the relay-authored close classification.
 

@@ -6,7 +6,7 @@ use spl_core::pairlink::{self, PairLinkError, ParsedPairLink};
 use std::error::Error;
 use std::path::{Path, PathBuf};
 
-pub(crate) const PROTOCOL_REVISION: &str = "92b54d057d445d60b06b0fbe6f0c6b14120148ff";
+pub(crate) const PROTOCOL_REVISION: &str = "0f49108dbe64f6d3ae906fa6f415182c10c83bc4";
 const VECTORS_PATH_FROM_MANIFEST: &str = "../../conformance/bundle/vectors.json";
 
 #[derive(Deserialize)]

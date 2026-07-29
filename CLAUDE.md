@@ -30,4 +30,5 @@ This repo is the SPL (solstone private link) client library for Rust consumers â
 - **The MSRV floor is the lowest consuming product's toolchain.** Raising `rust-version` breaks a consumer's build silently. Treat it as a contract, not a convenience.
 - **No GitHub workflows.** CI is operator-run locally; do not add `.github/workflows/`.
 - **No pushes to consumer repositories from here.** Migrating a consumer onto this package is separate, operator-driven work with that product's own release gates.
+- **Before tagging a release, run the full-circle integration gate on every platform that has one.** Running a consumer's gate is validation, not a push to its repository. A change to wire behavior is not validated by this repository's own tests â€” they run against mocks of the peer, and the defects that have actually shipped were disagreements between real implementations.
 - Releases (tags) are operator approval only.

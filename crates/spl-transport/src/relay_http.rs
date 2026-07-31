@@ -15,6 +15,10 @@ use tokio_rustls::TlsConnector;
 use crate::{TransportError, relay};
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+/// Upper bound on the control-plane TLS handshake. This leg crosses the public
+/// internet rather than a LAN, so it carries the same budget as the relay carrier's
+/// inner handshake rather than the tighter direct-dial one.
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
 #[expect(
     clippy::duration_suboptimal_units,
     reason = "the copied relay timeout remains expressed in protocol-facing seconds"
@@ -60,10 +64,23 @@ pub(crate) async fn relay_https_post_json(
             let server_name = ServerName::try_from(origin.host.clone())
                 .map_err(|_| TransportError::Tls("relay server name".into()))?;
             let connector = TlsConnector::from(relay::outer_config());
-            let tls = connector
-                .connect(server_name, tcp)
-                .await
-                .map_err(|e| TransportError::Tls(format!("relay control tls: {e}")))?;
+            // Bounded for the same reason the carrier's handshake is: reaching the peer
+            // and completing a handshake with it are separate things, and a peer that
+            // accepts the connection then goes silent must not park a control request
+            // for longer than the request itself is allowed.
+            let tls =
+                match tokio::time::timeout(HANDSHAKE_TIMEOUT, connector.connect(server_name, tcp))
+                    .await
+                {
+                    Err(_) => {
+                        return Err(TransportError::Io(io::Error::new(
+                            io::ErrorKind::TimedOut,
+                            "relay control tls handshake timed out",
+                        )));
+                    }
+                    Ok(result) => result
+                        .map_err(|e| TransportError::Tls(format!("relay control tls: {e}")))?,
+                };
             #[expect(
                 clippy::large_futures,
                 reason = "the copied transport future keeps its established stack layout; this site goes red if a later refactor shrinks it"

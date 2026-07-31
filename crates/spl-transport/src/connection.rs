@@ -31,6 +31,10 @@ use crate::TransportError;
 use crate::tls::pinned_server_name;
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+/// Upper bound on the TLS handshake that follows a successful connect. A LAN or
+/// direct peer that is healthy handshakes in well under a second; the same budget as
+/// the connect is generous and keeps a dial's total cost bounded and predictable.
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 /// Upper bound on outbound writes. A stalled write means the peer is dead or no
 /// longer draining; fail fast and leave retry policy to the caller.
 const WRITE_TIMEOUT: Duration = Duration::from_secs(30);
@@ -82,11 +86,43 @@ pub(crate) async fn dial_tls(
         })??;
     tcp.set_nodelay(true).ok();
 
-    let connector = TlsConnector::from(config);
-    connector
-        .connect(pinned_server_name(), tcp)
-        .await
-        .map_err(|e| TransportError::Tls(format!("handshake to {host}:{port}: {e}")))
+    handshake_tls(TlsConnector::from(config), tcp, host, port).await
+}
+
+/// Bound the TLS handshake the way every other stage of a dial is bounded.
+///
+/// `CONNECT_TIMEOUT` only covers reaching the peer. A peer that completes the TCP
+/// handshake and then never speaks TLS — a captive portal, a wedged listener, a load
+/// balancer with no backend — leaves the handshake pending indefinitely, so the dial
+/// runs for as long as its caller allows instead of failing over to another endpoint
+/// or transport. The relay's inner handshake is already bounded this way.
+///
+/// The timeout is an `Io` error, matching the connect timeout above: callers that
+/// classify an endpoint as unreachable must treat a peer that never handshakes the
+/// same as one that never answers.
+async fn handshake_tls<S>(
+    connector: TlsConnector,
+    stream: S,
+    host: &str,
+    port: u16,
+) -> Result<TlsStream<S>, TransportError>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    match tokio::time::timeout(
+        HANDSHAKE_TIMEOUT,
+        connector.connect(pinned_server_name(), stream),
+    )
+    .await
+    {
+        Err(_) => Err(TransportError::Io(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            format!("tls handshake to {host}:{port} timed out"),
+        ))),
+        Ok(result) => {
+            result.map_err(|e| TransportError::Tls(format!("handshake to {host}:{port}: {e}")))
+        }
+    }
 }
 
 pub(crate) async fn run_request_over_stream<S>(
@@ -268,6 +304,61 @@ mod tests {
 
         fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
             Poll::Ready(Ok(()))
+        }
+    }
+
+    /// A peer that completes the TCP handshake, accepts everything written to it, and
+    /// never sends a byte back — a captive portal, a wedged listener, a load balancer
+    /// with no backend. The `ClientHello` leaves; no `ServerHello` ever arrives.
+    #[derive(Debug)]
+    struct SilentPeerStream;
+
+    impl AsyncRead for SilentPeerStream {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            _buf: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            Poll::Pending
+        }
+    }
+
+    impl AsyncWrite for SilentPeerStream {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            Poll::Ready(Ok(buf.len()))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    // Falsified against the pre-fix shape: with the handshake awaited directly instead of
+    // bounded, this test does not fail — it hangs, and was killed at a 25 s wall clock.
+    // That is the defect stated exactly: an unbounded wait produces no observation to
+    // assert on. Under `start_paused` the bounded form resolves in virtual time, so the
+    // passing test costs nothing.
+    #[tokio::test(start_paused = true)]
+    async fn tls_handshake_against_a_silent_peer_times_out() {
+        let config = crate::relay::outer_config();
+        let err = handshake_tls(TlsConnector::from(config), SilentPeerStream, "silent", 7657)
+            .await
+            .unwrap_err();
+
+        match err {
+            TransportError::Io(error) => {
+                assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+                assert!(error.to_string().contains("silent:7657"));
+            }
+            other => panic!("expected a timed out io error, got {other:?}"),
         }
     }
 

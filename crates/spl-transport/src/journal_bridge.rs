@@ -30,7 +30,7 @@ use spl_core::bridge::{
     self, BOOTSTRAP_ROUTE, BridgeNames, FailureCategory, RejectReason, RequestFramingError,
     RequestHead, RequestHeaderPolicy,
 };
-use spl_core::mux::StreamItem;
+use spl_core::mux::{StreamEnd, StreamItem};
 use tokio::io::{AsyncReadExt, AsyncWrite, AsyncWriteExt, Interest};
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::{TcpListener, TcpStream};
@@ -859,6 +859,7 @@ enum DriverInput {
 enum ResponseControl {
     Continue,
     Complete,
+    Incomplete,
     Handled,
 }
 
@@ -900,7 +901,8 @@ impl<'a> ResponseForwarder<'a> {
         match item {
             StreamItem::Head(head) => self.handle_head(head, rx, upload, shutdown).await,
             StreamItem::Body(bytes) => self.handle_body(&bytes, rx, shutdown).await,
-            StreamItem::End(_) => ResponseControl::Complete,
+            StreamItem::End(StreamEnd::Close) => ResponseControl::Complete,
+            StreamItem::End(StreamEnd::Reset(_) | StreamEnd::Eof) => ResponseControl::Incomplete,
         }
     }
 
@@ -1018,6 +1020,18 @@ impl<'a> ResponseForwarder<'a> {
             .await;
             return;
         };
+        if self.request_head.method != "HEAD"
+            && upstream_content_length(&head.headers)
+                .is_some_and(|declared| declared != self.body.len())
+        {
+            log_upstream_io_failure();
+            let _ = until_shutdown(
+                shutdown,
+                write_local(&mut self.write, 502, b"journal unreachable", "text/plain"),
+            )
+            .await;
+            return;
+        }
         let headers = bridge::response_headers(
             &head.headers,
             &self.runtime.journal_hosts,
@@ -1047,6 +1061,24 @@ impl<'a> ResponseForwarder<'a> {
         .await;
         if !matches!(write_result, Some(Ok(()))) {
             rx.cancel();
+        }
+    }
+
+    async fn fail(
+        mut self,
+        rx: &mut crate::journal_bridge_carrier::StreamRx,
+        shutdown: &mut watch::Receiver<bool>,
+    ) {
+        log_upstream_io_failure();
+        rx.cancel();
+        if matches!(self.mode, ResponseMode::Streaming) && self.head_written {
+            let _ = until_shutdown(shutdown, self.write.shutdown()).await;
+        } else {
+            let _ = until_shutdown(
+                shutdown,
+                write_local(&mut self.write, 502, b"journal unreachable", "text/plain"),
+            )
+            .await;
         }
     }
 }
@@ -1096,7 +1128,7 @@ async fn forward_upstream(
     let (mut read, write) = stream.into_split();
     let mut upload = LocalBodyUpload::new(body, request.body_prefix, request.declared_body_len);
     let mut forwarder = ResponseForwarder::new(write, runtime, request.head, request.response_mode);
-    loop {
+    let completed = loop {
         let input = if upload.is_active() {
             tokio::select! {
                 biased;
@@ -1140,16 +1172,21 @@ async fn forward_upstream(
             DriverInput::Upstream(item) => item,
         };
         let Some(item) = item else {
-            break;
+            break false;
         };
         match forwarder.handle(item, &mut rx, &mut upload, shutdown).await {
             ResponseControl::Continue => {}
-            ResponseControl::Complete => break,
+            ResponseControl::Complete => break true,
+            ResponseControl::Incomplete => break false,
             ResponseControl::Handled => return,
         }
-    }
+    };
     upload.stop();
-    forwarder.finish(&mut rx, shutdown).await;
+    if completed {
+        forwarder.finish(&mut rx, shutdown).await;
+    } else {
+        forwarder.fail(&mut rx, shutdown).await;
+    }
 }
 
 async fn write_early_failure(

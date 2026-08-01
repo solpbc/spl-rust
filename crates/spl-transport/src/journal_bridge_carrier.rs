@@ -586,16 +586,17 @@ impl StreamRx {
                 return Some(StreamItem::Head(head));
             }
         };
-        if event.wire_cost != 0 {
-            debug_assert!(matches!(event.item, StreamItem::Body(_)));
-            let _ = self
-                .commands
-                .send(CarrierCommand::Consume {
-                    stream_id: self.stream_id,
-                    bytes: event.wire_cost,
-                })
-                .await;
-        }
+        debug_assert!(event.wire_cost == 0 || matches!(event.item, StreamItem::Body(_)));
+        // Every drain wakes the coordinator, including zero-cost Head and End
+        // events. A full per-stream delivery queue may have a bounded pending
+        // event waiting for exactly this newly available slot.
+        let _ = self
+            .commands
+            .send(CarrierCommand::Consume {
+                stream_id: self.stream_id,
+                bytes: event.wire_cost,
+            })
+            .await;
         if matches!(event.item, StreamItem::End(_)) {
             self.terminal = true;
         }
@@ -704,6 +705,7 @@ struct StreamState {
     budget: Arc<BodyBudget>,
     staged_leases: VecDeque<BodyLease>,
     delivery: mpsc::Sender<DeliveryEvent>,
+    pending_delivery: VecDeque<DeliveryEvent>,
     ready_queued: bool,
 }
 
@@ -966,6 +968,12 @@ async fn coordinator_task(
 
         match step {
             CoordinatorStep::Continue => {
+                if let Err(error) = flush_pending_deliveries(&mut demux, &mut streams, &mut writer)
+                {
+                    fanout_eof(&mut streams);
+                    log_carrier_teardown(&kind, &transport_error_code(&error));
+                    break;
+                }
                 if let Err(error) = pump_ready(&mut writer, &mut streams, &mut ready) {
                     fanout_eof(&mut streams);
                     log_carrier_teardown(&kind, &transport_error_code(&error));
@@ -1115,6 +1123,7 @@ fn open_stream_on_carrier(
         budget: input.budget,
         staged_leases: VecDeque::new(),
         delivery,
+        pending_delivery: VecDeque::new(),
         ready_queued: true,
     };
     demux.open_stream(stream_id);
@@ -1152,9 +1161,13 @@ fn deliver_stream_item(
     }
 
     let ended = matches!(event.item, StreamItem::End(_));
-    let Some(state) = streams.get(&stream_id) else {
+    let Some(state) = streams.get_mut(&stream_id) else {
         return Ok(());
     };
+    if !state.pending_delivery.is_empty() {
+        enqueue_pending_delivery(state, DeliveryEvent::Stream(event));
+        return Ok(());
+    }
     let sent = state.delivery.try_send(DeliveryEvent::Stream(event));
 
     match sent {
@@ -1163,12 +1176,87 @@ fn deliver_stream_item(
                 streams.remove(&stream_id);
             }
         }
-        Err(_) => {
-            if ended {
-                streams.remove(&stream_id);
-            } else {
-                reset_active_stream(stream_id, demux, streams, writer)?;
+        Err(mpsc::error::TrySendError::Full(event)) => {
+            if let Some(state) = streams.get_mut(&stream_id) {
+                enqueue_pending_delivery(state, event);
             }
+        }
+        Err(mpsc::error::TrySendError::Closed(_)) => {
+            reset_active_stream(stream_id, demux, streams, writer)?;
+        }
+    }
+    Ok(())
+}
+
+fn enqueue_pending_delivery(state: &mut StreamState, event: DeliveryEvent) {
+    match event {
+        DeliveryEvent::Stream(StreamEvent {
+            item: StreamItem::Body(mut bytes),
+            wire_cost,
+        }) => {
+            if let Some(DeliveryEvent::Stream(StreamEvent {
+                item: StreamItem::Body(buffered),
+                wire_cost: buffered_cost,
+            })) = state.pending_delivery.back_mut()
+            {
+                buffered.append(&mut bytes);
+                *buffered_cost += wire_cost;
+            } else {
+                state
+                    .pending_delivery
+                    .push_back(DeliveryEvent::Stream(StreamEvent {
+                        item: StreamItem::Body(bytes),
+                        wire_cost,
+                    }));
+            }
+        }
+        event => state.pending_delivery.push_back(event),
+    }
+}
+
+fn flush_pending_deliveries(
+    demux: &mut CarrierDemux,
+    streams: &mut HashMap<u32, StreamState>,
+    writer: &mut CoordinatorWriter,
+) -> Result<(), TransportError> {
+    let stream_ids: Vec<u32> = streams
+        .iter()
+        .filter_map(|(&stream_id, state)| (!state.pending_delivery.is_empty()).then_some(stream_id))
+        .collect();
+    for stream_id in stream_ids {
+        let mut remove = false;
+        let mut reset = false;
+        if let Some(state) = streams.get_mut(&stream_id) {
+            while let Some(event) = state.pending_delivery.pop_front() {
+                let ended = matches!(
+                    event,
+                    DeliveryEvent::Stream(StreamEvent {
+                        item: StreamItem::End(_),
+                        ..
+                    })
+                );
+                match state.delivery.try_send(event) {
+                    Ok(()) => {
+                        if ended {
+                            remove = true;
+                            break;
+                        }
+                    }
+                    Err(mpsc::error::TrySendError::Full(event)) => {
+                        state.pending_delivery.push_front(event);
+                        break;
+                    }
+                    Err(mpsc::error::TrySendError::Closed(_)) => {
+                        reset = true;
+                        break;
+                    }
+                }
+            }
+        }
+        if reset {
+            reset_active_stream(stream_id, demux, streams, writer)?;
+        } else if remove {
+            streams.remove(&stream_id);
         }
     }
     Ok(())
@@ -2120,6 +2208,7 @@ mod tests {
                 budget,
                 staged_leases: VecDeque::new(),
                 delivery,
+                pending_delivery: VecDeque::new(),
                 ready_queued: false,
             },
         );
@@ -2789,10 +2878,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn carrier_slow_consumer_resets_only_that_stream() {
-        let (commands, _alive, mut server) = spawn_duplex_carrier(test_keepalive(3), 512 * 1024);
+    async fn carrier_delivery_queue_pressure_preserves_complete_stream() {
+        let (commands, _alive, mut server) =
+            spawn_duplex_carrier(KeepaliveConfig::default(), 512 * 1024);
         let mut decoder = FrameDecoder::new();
-        let _rx_a = open_test_stream(&commands, "/slow", Vec::new()).await;
+        let mut rx_a = open_test_stream(&commands, "/pressured", Vec::new()).await;
         let mut rx_b = open_test_stream(&commands, "/ok", Vec::new()).await;
         read_request_close(&mut server, &mut decoder, 1).await;
         read_request_close(&mut server, &mut decoder, 3).await;
@@ -2807,7 +2897,17 @@ mod tests {
         for _ in 0..(STREAM_QUEUE + 4) {
             send_frame(&mut server, 1, FLAG_DATA, b"x").await;
         }
-        read_until_reset(&mut server, &mut decoder, 1).await;
+        send_frame(&mut server, 1, FLAG_CLOSE, b"").await;
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(100),
+                next_frame(&mut server, &mut decoder)
+            )
+            .await
+            .is_err(),
+            "scheduler pressure must not reset a valid response stream"
+        );
+        assert_stream_completes(&mut rx_a, &[b'x'; STREAM_QUEUE + 4]).await;
 
         let response = http_response(b"b-ok");
         send_frame(&mut server, 3, FLAG_DATA | FLAG_CLOSE, &response).await;

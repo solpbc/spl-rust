@@ -2574,6 +2574,12 @@ async fn journal_bridge_reset_isolates_one_stream_on_shared_carrier() {
     assert!(String::from_utf8_lossy(&reset_req.bytes).starts_with("GET /reset-me HTTP/1.1\r\n"));
     assert!(String::from_utf8_lossy(&ok_req.bytes).starts_with("GET /still-ok HTTP/1.1\r\n"));
 
+    server.send_stream_head(
+        reset_req.stream_id,
+        "200 OK",
+        &[("Content-Type", "text/plain"), ("Content-Length", "64")],
+    );
+    server.send_body(reset_req.stream_id, b"partial");
     server.reset_stream(reset_req.stream_id);
     server.send_http(ok_req.stream_id, "200 OK", b"survived");
 
@@ -2583,6 +2589,41 @@ async fn journal_bridge_reset_isolates_one_stream_on_shared_carrier() {
     assert_eq!(response_status(&ok_response), 200);
     assert_eq!(response_body(&ok_response), "survived");
     assert_eq!(server.accepted_carriers(), 1);
+
+    handle.shutdown_and_wait().await;
+    server.abort();
+}
+
+#[tokio::test]
+async fn journal_bridge_rejects_normal_close_before_declared_content_length() {
+    let (handle, mut server) = start_bridge_with_persistent_server().await;
+    let port = handle.port();
+    let cap = capability_from(&handle);
+
+    let client = tokio::spawn(async move {
+        raw_bridge_request(
+            port,
+            "GET",
+            "/truncated",
+            Some(loopback_host(port)),
+            Some(cap_cookie(&cap)),
+            &[],
+            b"",
+        )
+        .await
+    });
+    let request = server.next_request().await;
+    server.send_stream_head(
+        request.stream_id,
+        "200 OK",
+        &[("Content-Type", "text/plain"), ("Content-Length", "64")],
+    );
+    server.send_body(request.stream_id, b"partial");
+    server.close_stream(request.stream_id);
+
+    let response = client.await.unwrap();
+    assert_eq!(response_status(&response), 502);
+    assert_eq!(response_body(&response), "journal unreachable");
 
     handle.shutdown_and_wait().await;
     server.abort();

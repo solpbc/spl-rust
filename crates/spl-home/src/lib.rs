@@ -10,7 +10,7 @@
 //! an application listener socket.
 //! Inbound stream bytes are bounded by the configured stream cap times the
 //! protocol's 1 MiB receive window, plus the independent decoder ceiling and
-//! driver-owned outbound staging.
+//! [`MAX_STAGED_WRITE_BYTES_PER_STREAM`] of outbound staging per live stream.
 
 #![forbid(unsafe_code)]
 
@@ -21,7 +21,8 @@ mod mux;
 
 /// Listener mux configuration and protocol-mandated default limits.
 pub use config::{
-    DEFAULT_DECODER_BUFFER_BYTES, DEFAULT_MAX_CONCURRENT_STREAMS, HomeConfig, MuxLimits,
+    DEFAULT_DECODER_BUFFER_BYTES, DEFAULT_MAX_CONCURRENT_STREAMS, HomeConfig,
+    MAX_STAGED_WRITE_BYTES_PER_STREAM, MuxLimits,
 };
 /// Tokio listener connection and per-stream I/O handles.
 pub use connection::{HomeConnection, HomeStream};

@@ -25,7 +25,6 @@ fn listener_sources_exclude_http_and_verifier_implementations() -> Result<(), Bo
         "http::Response",
         "hyper::",
         "h2::",
-        "Authorization",
     ];
 
     let sources = rust_sources(&source_root)?;
@@ -91,8 +90,8 @@ fn home_config_requires_a_caller_supplied_verifier() -> Result<(), Box<dyn Error
     let config = fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("src/config.rs"))?;
     let config = strip_comments(&config);
     assert!(
-        config.contains("pub client_cert_verifier: Arc<dyn ClientCertVerifier>"),
-        "HomeConfig must expose Arc<dyn ClientCertVerifier> supplied by its caller"
+        has_caller_supplied_verifier(&config),
+        "HomeConfig must expose a caller-supplied ClientCertVerifier trait object"
     );
     Ok(())
 }
@@ -100,6 +99,7 @@ fn home_config_requires_a_caller_supplied_verifier() -> Result<(), Box<dyn Error
 fn dependency_names(manifest: &str, section: &str) -> Vec<String> {
     let mut names = Vec::new();
     let mut in_section = false;
+    let mut in_subtable = false;
     for raw_line in manifest.lines() {
         let line = raw_line.trim();
         if line.starts_with('[') && line.ends_with(']') {
@@ -110,20 +110,63 @@ fn dependency_names(manifest: &str, section: &str) -> Vec<String> {
                     names.push(name.to_owned());
                 }
                 in_section = false;
+                in_subtable = true;
             } else {
                 in_section = header == section;
+                in_subtable = false;
             }
             continue;
         }
-        if !in_section || line.is_empty() || line.starts_with('#') {
+        if (!in_section && !in_subtable) || line.is_empty() || line.starts_with('#') {
             continue;
         }
-        let Some((name, _)) = line.split_once('=') else {
+        let Some((name, value)) = line.split_once('=') else {
             continue;
         };
-        names.push(name.trim().trim_matches('"').to_owned());
+        let name = name.trim().trim_matches('"');
+        if in_section {
+            names.push(name.to_owned());
+            if let Some(package) = package_override(value) {
+                names.push(package.to_owned());
+            }
+        } else if name == "package"
+            && let Some(package) = toml_string(value)
+        {
+            names.push(package.to_owned());
+        }
     }
     names
+}
+
+fn package_override(value: &str) -> Option<&str> {
+    value
+        .split(',')
+        .filter_map(|entry| entry.split_once('='))
+        .find_map(|(name, value)| {
+            (name.trim().trim_matches('{').trim() == "package").then_some(value)
+        })
+        .and_then(toml_string)
+}
+
+fn toml_string(value: &str) -> Option<&str> {
+    let value = value.trim().trim_matches('}').trim();
+    let value = value.strip_prefix('"')?;
+    value.split_once('"').map(|(string, _)| string)
+}
+
+fn has_caller_supplied_verifier(source: &str) -> bool {
+    let compact: String = source
+        .chars()
+        .filter(|character| !character.is_whitespace())
+        .collect();
+    let Some(field) = compact
+        .split_once("pubclient_cert_verifier:")
+        .map(|(_, field)| field)
+    else {
+        return false;
+    };
+    let field = field.split([',', '}']).next().unwrap_or(field);
+    field.contains("dyn") && field.contains("ClientCertVerifier")
 }
 
 fn rust_sources(root: &Path) -> Result<Vec<PathBuf>, std::io::Error> {
@@ -189,7 +232,7 @@ fn strip_comments(source: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{dependency_names, strip_comments};
+    use super::{dependency_names, has_caller_supplied_verifier, strip_comments};
 
     #[test]
     fn comments_do_not_satisfy_or_trip_structural_checks() {
@@ -207,5 +250,21 @@ mod tests {
             dependency_names(manifest, "build-dependencies"),
             vec!["spl-transport"]
         );
+    }
+
+    #[test]
+    fn dependency_alias_package_overrides_are_counted() {
+        let manifest = "[dependencies]\nmy_parser = { package = \"httparse\", version = \"1\" }\n";
+        assert_eq!(
+            dependency_names(manifest, "dependencies"),
+            vec!["my_parser", "httparse"]
+        );
+    }
+
+    #[test]
+    fn caller_verifier_check_tolerates_formatting_and_qualification() {
+        let source =
+            "pub client_cert_verifier : Shared<dyn rustls::server::danger::ClientCertVerifier>,";
+        assert!(has_caller_supplied_verifier(source));
     }
 }

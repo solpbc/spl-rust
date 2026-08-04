@@ -355,7 +355,8 @@ async fn rejected_client_certificate_surfaces_access_denied_to_dialer() {
 
 #[tokio::test]
 async fn partial_frame_eof_ends_the_driver_as_peer_gone() {
-    // Protocol framing.md:29-36: EOF in a partial frame is carrier loss.
+    // Protocol framing.md:185 requires complete frames. Classifying carrier
+    // EOF with partial local bytes as peer loss is local carrier policy.
     let fixture = fixture();
     let (dialer_io, home_io) = tokio::io::duplex(64 * 1024);
     let home = tokio::spawn(HomeConnection::accept(
@@ -374,6 +375,68 @@ async fn partial_frame_eof_ends_the_driver_as_peer_gone() {
         tokio::time::timeout(std::time::Duration::from_millis(100), home.accept_stream()).await,
         Ok(Err(spl_home::HomeError::PeerGone))
     ));
+}
+
+#[tokio::test]
+async fn reset_discards_buffered_data_without_ending_other_streams() {
+    // Protocol framing.md:75-97: RESET abandons a stream, not its carrier.
+    let fixture = fixture();
+    let (dialer_io, home_io) = tokio::io::duplex(64 * 1024);
+    let home = tokio::spawn(HomeConnection::accept(
+        home_io,
+        config(&fixture, verifier(fixture.ca.clone())),
+    ));
+    let connector = TlsConnector::from(Arc::new(client_config(&fixture)));
+    let mut dialer = connector
+        .connect(ServerName::try_from("spl.local").unwrap(), dialer_io)
+        .await
+        .unwrap();
+    let mut home = home.await.unwrap().unwrap();
+    let mut ids = FrameDialer::default();
+    let first = ids.allocate();
+    let second = ids.allocate();
+    dialer
+        .write_all(&wire(Frame::new(
+            first,
+            FLAG_OPEN | FLAG_DATA,
+            b"stale".to_vec(),
+        )))
+        .await
+        .unwrap();
+    dialer
+        .write_all(&wire(Frame::new(second, FLAG_OPEN, Vec::new())))
+        .await
+        .unwrap();
+
+    let mut first_stream = home.accept_stream().await.unwrap();
+    let mut second_stream = home.accept_stream().await.unwrap();
+    let mut admitted = [0u8; 1];
+    first_stream.read_exact(&mut admitted).await.unwrap();
+    assert_eq!(admitted, [b's']);
+
+    dialer
+        .write_all(&wire(Frame::reset(first, RESET_CANCEL)))
+        .await
+        .unwrap();
+    dialer
+        .write_all(&wire(Frame::new(second, FLAG_DATA, b"request".to_vec())))
+        .await
+        .unwrap();
+
+    let mut request = [0u8; 7];
+    second_stream.read_exact(&mut request).await.unwrap();
+    assert_eq!(request, *b"request");
+    let reset = first_stream.read(&mut admitted).await.unwrap_err();
+    assert_eq!(reset.kind(), io::ErrorKind::ConnectionReset);
+
+    second_stream.write_all(b"response").await.unwrap();
+    let mut decoder = FrameDecoder::new();
+    let mut frames = Vec::new();
+    while !frames.iter().any(|frame: &Frame| {
+        frame.stream_id == second && frame.flags == FLAG_DATA && frame.payload == b"response"
+    }) {
+        frames.extend(read_frames(&mut dialer, &mut decoder).await);
+    }
 }
 
 #[test]

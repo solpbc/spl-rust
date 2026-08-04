@@ -4,6 +4,7 @@
 //! Pure listener-side SPL mux state machine.
 
 use std::collections::HashMap;
+use std::fmt;
 
 use spl_core::frame::{
     CONTROL_NONCE_LEN, FLAG_CLOSE, FLAG_DATA, FLAG_OPEN, FLAG_PING, FLAG_PONG, FLAG_RESET,
@@ -27,11 +28,12 @@ pub struct MuxAcceptor {
     discarded_payload_remaining: Option<usize>,
     peer_high_water: Option<u32>,
     streams: HashMap<u32, StreamState>,
+    #[cfg(test)]
     next_listener_id: Option<u32>,
 }
 
 /// Frames to write and application-visible events produced by one mux action.
-#[derive(Debug, Default, PartialEq, Eq)]
+#[derive(Default, PartialEq, Eq)]
 pub struct MuxOutput {
     /// Frames that the carrier writer must send, in priority order.
     pub frames: Vec<Frame>,
@@ -39,10 +41,11 @@ pub struct MuxOutput {
     pub events: Vec<MuxEvent>,
     /// Header-only classifications for peer frames refused by this endpoint.
     pub refusals: Vec<Refusal>,
+    writable_streams: Vec<u32>,
 }
 
 /// An application-visible event from the peer-facing mux.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(PartialEq, Eq)]
 pub enum MuxEvent {
     /// The peer opened a stream.
     Opened {
@@ -73,6 +76,79 @@ pub enum MuxEvent {
         /// Whether locally counted undecoded bytes prove frame truncation.
         truncated: bool,
     },
+}
+
+impl MuxOutput {
+    /// Return stream ids whose peer send credit increased in this output.
+    pub(crate) fn writable_streams(&self) -> &[u32] {
+        &self.writable_streams
+    }
+}
+
+impl fmt::Debug for MuxOutput {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("MuxOutput")
+            .field("frames", &FramesDebug(&self.frames))
+            .field("events", &self.events)
+            .field("refusals", &self.refusals)
+            .field("writable_streams", &self.writable_streams)
+            .finish()
+    }
+}
+
+impl fmt::Debug for MuxEvent {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Opened { stream_id } => formatter
+                .debug_struct("Opened")
+                .field("stream_id", stream_id)
+                .finish(),
+            Self::Data { stream_id, bytes } => formatter
+                .debug_struct("Data")
+                .field("stream_id", stream_id)
+                .field("length", &bytes.len())
+                .finish(),
+            Self::ReadClosed { stream_id } => formatter
+                .debug_struct("ReadClosed")
+                .field("stream_id", stream_id)
+                .finish(),
+            Self::Reset { stream_id, reason } => formatter
+                .debug_struct("Reset")
+                .field("stream_id", stream_id)
+                .field("reason", reason)
+                .finish(),
+            Self::PeerGone { truncated } => formatter
+                .debug_struct("PeerGone")
+                .field("truncated", truncated)
+                .finish(),
+        }
+    }
+}
+
+struct FramesDebug<'a>(&'a [Frame]);
+
+impl fmt::Debug for FramesDebug<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut list = formatter.debug_list();
+        for frame in self.0 {
+            list.entry(&FrameDebug(frame));
+        }
+        list.finish()
+    }
+}
+
+struct FrameDebug<'a>(&'a Frame);
+
+impl fmt::Debug for FrameDebug<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("Frame")
+            .field("stream_id", &self.0.stream_id)
+            .field("flags", &format_args!("{:#x}", self.0.flags))
+            .field("payload_length", &self.0.payload.len())
+            .finish()
+    }
 }
 
 /// A SPL reset reason, including the specified fallback for unknown values.
@@ -118,6 +194,7 @@ impl MuxAcceptor {
             discarded_payload_remaining: None,
             peer_high_water: None,
             streams: HashMap::new(),
+            #[cfg(test)]
             next_listener_id: Some(2),
         })
     }
@@ -280,19 +357,12 @@ impl MuxAcceptor {
             frames: vec![Frame::new(stream_id, FLAG_DATA, bytes)],
             events: Vec::new(),
             refusals: Vec::new(),
+            writable_streams: Vec::new(),
         }))
     }
 
-    /// Reserve the next listener-owned even identifier for a future stream.
-    ///
-    /// This deliberately allocates only an identifier; listener-originated
-    /// stream lifecycle is not exposed in this pass.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`HomeError::StreamIdExhausted`] rather than wrapping or
-    /// recycling an identifier.
-    pub fn reserve_listener_id(&mut self) -> Result<u32, HomeError> {
+    #[cfg(test)]
+    fn reserve_listener_id(&mut self) -> Result<u32, HomeError> {
         let stream_id = self.next_listener_id.ok_or(HomeError::StreamIdExhausted)?;
         self.next_listener_id = stream_id.checked_add(2);
         Ok(stream_id)
@@ -346,6 +416,7 @@ impl MuxAcceptor {
             frames: Vec::new(),
             events: vec![MuxEvent::PeerGone { truncated }],
             refusals: Vec::new(),
+            writable_streams: Vec::new(),
         }
     }
 
@@ -540,7 +611,9 @@ impl MuxAcceptor {
                 stream.send_credit = next;
                 true
             });
-        if !credit_ok {
+        if credit_ok {
+            output.writable_streams.push(frame.stream_id);
+        } else {
             self.refuse(frame, RefusalClass::FlowControl, output);
         }
     }
@@ -634,7 +707,6 @@ impl ResetReason {
             RefusalClass::StreamLimit => Self::StreamLimitExceeded,
             RefusalClass::FlowControl => Self::FlowControlError,
             RefusalClass::Internal => Self::InternalError,
-            RefusalClass::Cancelled => Self::Cancel,
         }
     }
 }
@@ -675,6 +747,24 @@ mod tests {
     fn reset_code(output: &MuxOutput) -> u8 {
         assert_eq!(output.frames.len(), 1, "expected exactly one RESET frame");
         output.frames[0].payload[0]
+    }
+
+    #[test]
+    fn mux_output_debug_redacts_peer_payloads() {
+        let marker = b"SPL-HOME-SECRET-MARKER";
+        let output = MuxOutput {
+            frames: vec![Frame::new(1, FLAG_DATA, marker.to_vec())],
+            events: vec![MuxEvent::Data {
+                stream_id: 1,
+                bytes: marker.to_vec(),
+            }],
+            ..MuxOutput::default()
+        };
+
+        assert!(
+            !format!("{output:?}").contains(&format!("{marker:?}")),
+            "Debug output must not contain a peer payload"
+        );
     }
 
     #[test]
@@ -993,7 +1083,8 @@ mod tests {
 
     #[test]
     fn partial_carrier_frame_is_classified_as_peer_gone() {
-        // Protocol framing.md:29-36 makes a frame atomic; EOF mid-frame is carrier loss.
+        // Protocol framing.md:185 requires complete frames. Classifying EOF
+        // with partial local bytes as peer loss is local carrier policy.
         let mut acceptor = acceptor(MuxLimits::default());
         acceptor.feed(&[0, 0, 0]).unwrap();
         assert_eq!(

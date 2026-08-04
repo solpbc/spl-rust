@@ -3,20 +3,12 @@
 
 //! Secret-safe listener errors and peer-refusal classifications.
 
-use std::io::ErrorKind;
-
 use spl_core::frame::{FrameError, FrameViolation};
 use thiserror::Error;
 
 /// Errors returned by the home-side SPL implementation.
 #[derive(Debug, PartialEq, Eq, Error)]
 pub enum HomeError {
-    /// An I/O operation failed; only its stable kind is retained.
-    #[error("I/O failure")]
-    Io {
-        /// Stable category of the underlying I/O failure.
-        kind: ErrorKind,
-    },
     /// A TLS handshake failed without retaining peer-controlled diagnostics.
     #[error("TLS failure")]
     Tls,
@@ -87,8 +79,6 @@ pub enum RefusalClass {
     FlowControl,
     /// Local stream accounting or state failed independently of peer payload.
     Internal,
-    /// The local application cancelled a stream.
-    Cancelled,
 }
 
 impl std::fmt::Display for RefusalClass {
@@ -98,7 +88,6 @@ impl std::fmt::Display for RefusalClass {
             Self::StreamLimit => "stream limit",
             Self::FlowControl => "flow control",
             Self::Internal => "internal",
-            Self::Cancelled => "cancelled",
         };
         formatter.write_str(text)
     }

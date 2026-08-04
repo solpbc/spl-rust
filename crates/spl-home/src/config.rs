@@ -9,6 +9,7 @@ use rustls::ServerConfig;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rustls::server::danger::ClientCertVerifier;
 use spl_core::frame::{HEADER_LEN, MAX_PAYLOAD};
+use spl_core::mux::INITIAL_WINDOW;
 
 use crate::ConfigError;
 
@@ -20,13 +21,19 @@ pub const DEFAULT_MAX_CONCURRENT_STREAMS: usize = 256;
 ///
 /// Protocol: `.proto-ref/framing.md`, “frame layout”, lines 29-36.
 pub const DEFAULT_DECODER_BUFFER_BYTES: usize = 16_777_223;
+/// Maximum bytes the Tokio driver stages for one live stream before applying
+/// local write backpressure.
+///
+/// This matches the protocol's 1 MiB initial receive window, so each stream's
+/// outbound staging has a fixed, documented bound.
+pub const MAX_STAGED_WRITE_BYTES_PER_STREAM: usize = INITIAL_WINDOW;
 
 /// Per-connection listener limits for the pure mux state machine.
 ///
 /// Inbound stream data is bounded by each stream's protocol-mandated
 /// 1 MiB receive window times [`Self::max_concurrent_streams`]. The separate
-/// decoder ceiling limits unframed carrier bytes; application outbound staging
-/// is owned by the Tokio driver.
+/// decoder ceiling limits unframed carrier bytes. The Tokio driver additionally
+/// caps outbound staging at [`MAX_STAGED_WRITE_BYTES_PER_STREAM`] per stream.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MuxLimits {
     /// Maximum concurrently open peer-originated streams.

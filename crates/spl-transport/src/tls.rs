@@ -199,7 +199,7 @@ pub(crate) fn trust_all_pairing_config() -> Result<ClientConfig, TransportError>
 ///
 /// Returns a TLS configuration error when the provider, certificate chain, or
 /// private key is invalid.
-pub(crate) fn mtls_config(
+pub fn mtls_config(
     ca_fp_prefix: &[u8],
     client_cert_chain: Vec<CertificateDer<'static>>,
     client_key: PrivateKeyDer<'static>,

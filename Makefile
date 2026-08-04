@@ -54,6 +54,8 @@ deny:
 # transport tier belongs to each consumer's own release rail, which has the right
 # hosts; `cargo deny`'s [graph] targets already proves the dependency graph
 # resolves for all four here.
+# spl-home is likewise host-only. It pulls rustls/ring, whose C build script
+# needs the same real cross toolchain as spl-transport.
 CONSUMER_TARGETS = x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu aarch64-apple-darwin x86_64-pc-windows-msvc
 
 targets:
@@ -63,6 +65,8 @@ targets:
 	done
 	@echo "== spl-transport (host)"
 	@$(CARGO) check -p spl-transport
+	@echo "== spl-home (host)"
+	@$(CARGO) check -p spl-home
 
 # Records the transport tier's contribution to a consumer's binary. Evidence for
 # the release record, NOT a pass/fail threshold: its job is to make a future

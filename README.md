@@ -1,6 +1,6 @@
 # spl-rust
 
-The SPL (**solstone private link**) client library for Rust consumers. Two crates: **`spl-core`** (pure wire) and **`spl-transport`** (sockets and TLS).
+The SPL (**solstone private link**) library for Rust consumers. Three crates: **`spl-core`** (pure wire), **`spl-transport`** (client sockets and TLS), and **`spl-home`** (listener-side mux).
 
 SPL is the encrypted connection between a [solstone](https://solstone.app) client and the owner's journal: mutual TLS with a pairing-minted client certificate, carried over a direct LAN connection or a WebSocket relay when no direct path exists. Neither the relay operator nor sol pbc holds a key that can decrypt what flows inside — the relay authenticates the rendezvous, never the payload.
 
@@ -22,6 +22,7 @@ Alpha, pre-1.0. The API will change. Consumers pin an exact tag.
 |---|---|
 | **`spl-core`** | Pair-link parsing and direct-address admission, mux framing and per-stream flow control, HTTP-over-SPL, CA-fingerprint pinning, pair-window and journal-identity derivations. No I/O, no platform dependency, host-testable. |
 | **`spl-transport`** | CA-fp-pinned mutual TLS over a direct dial or a WebSocket relay, the mux carrier, and the local loopback proxy. Built on `rustls`, so it is cross-platform and host-testable. |
+| **`spl-home`** | Listener-side SPL mux acceptance and server-side mutual TLS. Inbound stream data is bounded by 1 MiB per live stream, plus decoder and outbound staging; it owns no HTTP parsing or authorization policy. |
 
 Application layers stay with the consuming product: observer registration and segment ingest, linked-system credential provisioning, credential storage, and service lifecycles are **not** in this package.
 

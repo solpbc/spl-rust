@@ -1,0 +1,23 @@
+[package]
+name = "spl-home"
+description = "Listener-side SPL mux acceptance and server-side mutual TLS. It owns no HTTP parsing or authorization policy."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+spl-core = { workspace = true }
+thiserror = { workspace = true }
+rustls = { workspace = true }
+tokio = { workspace = true, features = ["io-util", "rt", "sync", "macros"] }
+tokio-rustls = { workspace = true }
+
+[dev-dependencies]
+spl-transport = { path = "../spl-transport", version = "0.1.0" }
+rcgen = { workspace = true }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "io-util", "sync", "test-util"] }

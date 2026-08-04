@@ -10,14 +10,15 @@ use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, Waker};
 
+use rustls::ServerConfig;
 use spl_core::frame::RECOMMENDED_CHUNK;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::sync::mpsc;
 use tokio_rustls::TlsAcceptor;
 
 use crate::{
-    HomeConfig, HomeError, MAX_STAGED_WRITE_BYTES_PER_STREAM, MuxAcceptor, MuxEvent, MuxOutput,
-    ResetReason,
+    HomeConfig, HomeError, MAX_STAGED_WRITE_BYTES_PER_STREAM, MuxAcceptor, MuxEvent, MuxLimits,
+    MuxOutput, ResetReason,
 };
 
 const STREAM_LIVE: u8 = 0;
@@ -125,7 +126,18 @@ impl HomeConnection {
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
         let limits = config.mux_limits;
-        let server = TlsAcceptor::from(Arc::new(config.server_config()?));
+        Self::accept_with_server_config(io, config.server_config()?, limits).await
+    }
+
+    pub(crate) async fn accept_with_server_config<S>(
+        io: S,
+        server_config: ServerConfig,
+        limits: MuxLimits,
+    ) -> Result<Self, HomeError>
+    where
+        S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    {
+        let server = TlsAcceptor::from(Arc::new(server_config));
         let tls = server.accept(io).await.map_err(|_| HomeError::Tls)?;
         let acceptor = MuxAcceptor::new(limits)?;
         let (accept_tx, accept_rx) = mpsc::unbounded_channel();

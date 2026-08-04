@@ -10,11 +10,15 @@
 //! Both-roles-in-one-process, multi-stream listener-side protocol coverage.
 
 use std::io;
+use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::task::{Context, Poll};
+use std::time::{Duration, Instant};
 
 use rcgen::{
-    BasicConstraints, CertificateParams, ExtendedKeyUsagePurpose, IsCa, KeyPair, KeyUsagePurpose,
-    PKCS_ECDSA_P256_SHA256,
+    BasicConstraints, CertificateParams, CertificateSigningRequestParams, ExtendedKeyUsagePurpose,
+    IsCa, KeyPair, KeyUsagePurpose, PKCS_ECDSA_P256_SHA256,
 };
 use rustls::client::danger::HandshakeSignatureValid;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName, UnixTime};
@@ -23,13 +27,20 @@ use rustls::{
     AlertDescription, CertificateError, DigitallySignedStruct, Error, RootCertStore,
     SignatureScheme,
 };
+use spl_core::PairRequest;
 use spl_core::ca::sha256;
 use spl_core::frame::{
     FLAG_CLOSE, FLAG_DATA, FLAG_OPEN, FLAG_PONG, FLAG_WINDOW, Frame, FrameDecoder, FrameDialer,
     RECOMMENDED_CHUNK, RESET_CANCEL,
 };
 use spl_core::mux::INITIAL_WINDOW;
-use spl_home::{HomeConfig, HomeConnection, MuxLimits};
+use spl_core::pairlink::RelayPairLink;
+use spl_home::{
+    HomeConfig, HomeConnection, MuxLimits, PairSecret, PairWindow, PairWindowConfig,
+    PairWindowRefusal,
+};
+use spl_transport::TransportError;
+use spl_transport::relay_pairing::pair_over_carrier;
 use spl_transport::tls::mtls_config;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio_rustls::TlsConnector;
@@ -102,6 +113,175 @@ fn client_config(fixture: &Fixture) -> rustls::ClientConfig {
         fixture.client_key.clone_key(),
     )
     .unwrap()
+}
+
+struct PairFixture {
+    ca: CertificateDer<'static>,
+    ca_cert: rcgen::Certificate,
+    ca_key: KeyPair,
+    server_chain: Vec<CertificateDer<'static>>,
+    server_key: PrivateKeyDer<'static>,
+}
+
+fn pair_fixture() -> PairFixture {
+    let ca_key = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).unwrap();
+    let mut ca_params = CertificateParams::new(Vec::<String>::new()).unwrap();
+    ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+    ca_params.key_usages = vec![
+        KeyUsagePurpose::DigitalSignature,
+        KeyUsagePurpose::KeyCertSign,
+        KeyUsagePurpose::CrlSign,
+    ];
+    let ca_cert = ca_params.self_signed(&ca_key).unwrap();
+    let ca = CertificateDer::from(ca_cert.der().to_vec());
+
+    let server_key = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).unwrap();
+    let mut server_params = CertificateParams::new(vec!["spl.local".to_owned()]).unwrap();
+    server_params.is_ca = IsCa::NoCa;
+    server_params
+        .extended_key_usages
+        .push(ExtendedKeyUsagePurpose::ServerAuth);
+    let server = server_params
+        .signed_by(&server_key, &ca_cert, &ca_key)
+        .unwrap();
+
+    PairFixture {
+        ca: ca.clone(),
+        ca_cert,
+        ca_key,
+        server_chain: vec![CertificateDer::from(server.der().to_vec()), ca],
+        server_key: PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(server_key.serialize_der())),
+    }
+}
+
+fn pair_window_config(fixture: &PairFixture) -> PairWindowConfig {
+    PairWindowConfig {
+        certificate_chain: fixture.server_chain.clone(),
+        private_key: fixture.server_key.clone_key(),
+        ca_certificate: fixture.ca.clone(),
+        mux_limits: MuxLimits::default(),
+    }
+}
+
+fn pair_link(fixture: &PairFixture) -> RelayPairLink {
+    let spki = spl_core::ca::extract_spki_der(fixture.ca.as_ref()).unwrap();
+    RelayPairLink {
+        s: [0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef],
+        ca_fp_spki: sha256(&spki)[..16].to_vec(),
+        relay_origin: "https://relay.invalid".to_owned(),
+    }
+}
+
+struct CountingIo<S> {
+    inner: S,
+    written: Arc<AtomicUsize>,
+}
+
+impl<S> CountingIo<S> {
+    fn new(inner: S, written: Arc<AtomicUsize>) -> Self {
+        Self { inner, written }
+    }
+}
+
+impl<S> tokio::io::AsyncRead for CountingIo<S>
+where
+    S: tokio::io::AsyncRead + Unpin,
+{
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        context: &mut Context<'_>,
+        read_buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.inner).poll_read(context, read_buf)
+    }
+}
+
+impl<S> tokio::io::AsyncWrite for CountingIo<S>
+where
+    S: tokio::io::AsyncWrite + Unpin,
+{
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        context: &mut Context<'_>,
+        bytes: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        match Pin::new(&mut self.inner).poll_write(context, bytes) {
+            Poll::Ready(Ok(count)) => {
+                self.written.fetch_add(count, Ordering::SeqCst);
+                Poll::Ready(Ok(count))
+            }
+            Poll::Ready(Err(error)) => Poll::Ready(Err(error)),
+            Poll::Pending => Poll::Pending,
+        }
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.inner).poll_flush(context)
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.inner).poll_shutdown(context)
+    }
+}
+
+async fn serve_pair_response(
+    stream: &mut spl_home::HomeStream,
+    fixture: &PairFixture,
+    instance_id: &str,
+) {
+    let mut request = Vec::new();
+    stream.read_to_end(&mut request).await.unwrap();
+    let body_start = request
+        .windows(4)
+        .position(|bytes| bytes == b"\r\n\r\n")
+        .unwrap()
+        + 4;
+    let request: PairRequest = serde_json::from_slice(&request[body_start..]).unwrap();
+    let client_cert = CertificateSigningRequestParams::from_pem(&request.csr)
+        .unwrap()
+        .signed_by(&fixture.ca_cert, &fixture.ca_key)
+        .unwrap();
+    let response = serde_json::json!({
+        "client_cert": client_cert.pem(),
+        "ca_chain": [fixture.ca_cert.pem()],
+        "instance_id": instance_id,
+        "home_label": "Home",
+        "fingerprint": format!("sha256:{}", spl_core::ca::sha256_hex(client_cert.der())),
+        "home_attestation": "attestation"
+    });
+    let body = response.to_string();
+    let response = format!(
+        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{body}",
+        body.len()
+    );
+    stream.write_all(response.as_bytes()).await.unwrap();
+    stream.shutdown().await.unwrap();
+}
+
+async fn complete_pair_ceremony(
+    window: &mut PairWindow,
+    fixture: &PairFixture,
+    response_instance_id: &str,
+) -> Result<(), TransportError> {
+    let link = pair_link(fixture);
+    let (dialer_io, home_io) = tokio::io::duplex(64 * 1024);
+    let client = tokio::spawn(async move {
+        pair_over_carrier(
+            dialer_io,
+            &link,
+            "pair-window-test",
+            &serde_json::Map::new(),
+        )
+        .await
+    });
+    let relay_key = window.relay_key_hex();
+    let mut home = window
+        .admit(home_io, relay_key.as_str(), Instant::now())
+        .await
+        .unwrap();
+    let mut stream = home.accept_stream().await.unwrap();
+    serve_pair_response(&mut stream, fixture, response_instance_id).await;
+    client.await.unwrap().map(|_| ())
 }
 
 #[allow(
@@ -437,6 +617,139 @@ async fn reset_discards_buffered_data_without_ending_other_streams() {
     }) {
         frames.extend(read_frames(&mut dialer, &mut decoder).await);
     }
+}
+
+#[tokio::test]
+async fn pairing_window_completes_verified_ceremony_and_publishes_rk() {
+    let fixture = pair_fixture();
+    let now = Instant::now();
+    let mut window = PairWindow::open(
+        PairSecret::from([0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef]),
+        now + Duration::from_mins(1),
+        pair_window_config(&fixture),
+    )
+    .unwrap();
+    assert_eq!(
+        window.relay_key_hex().as_str(),
+        "e34481a4cde647ba9c9fb29a59e18271"
+    );
+    let instance_id = window.instance_id().to_owned();
+    complete_pair_ceremony(&mut window, &fixture, &instance_id)
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn pairing_window_client_rejects_non_jid_instance_id() {
+    let fixture = pair_fixture();
+    let now = Instant::now();
+    let mut window = PairWindow::open(
+        PairSecret::from([0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef]),
+        now + Duration::from_mins(1),
+        pair_window_config(&fixture),
+    )
+    .unwrap();
+    let error = complete_pair_ceremony(&mut window, &fixture, "not-a-jid")
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        TransportError::Pairing(message) if message == "relay instance mismatch"
+    ));
+}
+
+#[tokio::test]
+async fn pairing_window_wrong_rk_writes_no_carrier_bytes() {
+    let fixture = pair_fixture();
+    let now = Instant::now();
+    let mut window = PairWindow::open(
+        PairSecret::from([0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef]),
+        now + Duration::from_mins(1),
+        pair_window_config(&fixture),
+    )
+    .unwrap();
+    let (dialer, home_io) = tokio::io::duplex(64 * 1024);
+    drop(dialer);
+    let written = Arc::new(AtomicUsize::new(0));
+    let result = window
+        .admit(
+            CountingIo::new(home_io, written.clone()),
+            "00000000000000000000000000000000",
+            now,
+        )
+        .await;
+    assert!(matches!(
+        result,
+        Err(spl_home::HomeError::PairWindowRefused(
+            PairWindowRefusal::WrongRelayKey
+        ))
+    ));
+    assert_eq!(written.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn pairing_window_consumed_redial_writes_no_carrier_bytes() {
+    let fixture = pair_fixture();
+    let now = Instant::now();
+    let mut window = PairWindow::open(
+        PairSecret::from([0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef]),
+        now + Duration::from_mins(1),
+        pair_window_config(&fixture),
+    )
+    .unwrap();
+    let instance_id = window.instance_id().to_owned();
+    complete_pair_ceremony(&mut window, &fixture, &instance_id)
+        .await
+        .unwrap();
+
+    let relay_key = window.relay_key_hex();
+    let (dialer, home_io) = tokio::io::duplex(64 * 1024);
+    drop(dialer);
+    let written = Arc::new(AtomicUsize::new(0));
+    let result = window
+        .admit(
+            CountingIo::new(home_io, written.clone()),
+            relay_key.as_str(),
+            Instant::now(),
+        )
+        .await;
+    assert!(matches!(
+        result,
+        Err(spl_home::HomeError::PairWindowRefused(
+            PairWindowRefusal::Consumed
+        ))
+    ));
+    assert_eq!(written.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn pairing_window_expired_writes_no_carrier_bytes() {
+    let fixture = pair_fixture();
+    let now = Instant::now();
+    let mut window = PairWindow::open(
+        PairSecret::from([0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef]),
+        now,
+        pair_window_config(&fixture),
+    )
+    .unwrap();
+    let relay_key = window.relay_key_hex();
+    let (dialer, home_io) = tokio::io::duplex(64 * 1024);
+    drop(dialer);
+    let written = Arc::new(AtomicUsize::new(0));
+    let result = window
+        .admit(
+            CountingIo::new(home_io, written.clone()),
+            relay_key.as_str(),
+            now,
+        )
+        .await;
+    assert!(matches!(
+        result,
+        Err(spl_home::HomeError::PairWindowRefused(
+            PairWindowRefusal::Expired
+        ))
+    ));
+    assert_eq!(written.load(Ordering::SeqCst), 0);
 }
 
 #[test]

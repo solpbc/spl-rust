@@ -10,6 +10,7 @@ use serde::Deserialize;
 use serde_json::json;
 use spl_core::pairlink::RelayPairLink;
 use spl_core::{PAIR_PATH, PairResponse, ca};
+use tokio::io::{AsyncRead, AsyncWrite};
 
 use crate::credential::{Credential, endpoint_addrs_from_local_endpoints, generate_csr};
 use crate::pairing::{
@@ -20,6 +21,16 @@ use crate::{RelayControlEndpoint, TransportError, relay, relay_http, spki_pin, t
 #[derive(Deserialize)]
 struct EnrollResponse {
     device_token: String,
+}
+
+/// Verified ceremony material retained until relay enrollment completes.
+///
+/// This intentionally does not implement [`std::fmt::Debug`]: it holds a
+/// private key and may hold a bearer home attestation.
+pub struct PairingMaterial {
+    client_key_pem: String,
+    pair: PairResponse,
+    pinned_ca: CertificateDer<'static>,
 }
 
 /// Complete the relay-form SPL pairing ceremony.
@@ -37,15 +48,78 @@ pub async fn pair_over_relay(
     let url = spl_core::relay::pair_dial_url(&link.relay_origin)
         .map_err(|e| TransportError::PairLink(format!("relay origin: {e}")))?;
     let ws = relay::dial_pair_relay_ws(&url, &hex_lower(&rk), relay::outer_config()).await?;
+    let (duplex, termination) = relay::WsByteDuplex::new(ws);
+    let material = match pair_over_carrier(duplex, link, device_label, additional_fields).await {
+        Ok(material) => material,
+        Err(error) => {
+            if let Some(relay_error) = termination.current_error() {
+                return Err(TransportError::Relay(relay_error));
+            }
+            return Err(error);
+        }
+    };
 
+    let home_attestation =
+        material.pair.home_attestation.as_deref().ok_or_else(|| {
+            TransportError::Pairing("relay response missing home attestation".into())
+        })?;
+    #[expect(
+        clippy::large_futures,
+        reason = "the copied transport future keeps its established stack layout; this site goes red if a later refactor shrinks it"
+    )]
+    let device_token = enroll_device(
+        &link.relay_origin,
+        &material.pair.instance_id,
+        home_attestation,
+    )
+    .await?;
+    let device_token_expires_at =
+        spl_core::jwt::decode_unverified_claims(&device_token).map(|c| c.exp);
+    let ca_fp_prefix = ca::sha256(material.pinned_ca.as_ref())[..16].to_vec();
+    let endpoints = endpoint_addrs_from_local_endpoints(material.pair.local_endpoints.as_ref());
+
+    Ok(Credential {
+        client_key_pem: material.client_key_pem,
+        client_cert_pem: material.pair.client_cert,
+        ca_chain_pem: material.pair.ca_chain,
+        ca_fp_prefix,
+        instance_id: material.pair.instance_id,
+        home_label: material.pair.home_label,
+        endpoints,
+        home_attestation: material.pair.home_attestation,
+        local_endpoints: material.pair.local_endpoints,
+        relay_origin: Some(link.relay_origin.clone()),
+        device_token: Some(device_token),
+        device_token_expires_at,
+    })
+}
+
+/// Complete the inner TLS pairing ceremony over an already-connected carrier.
+///
+/// This stops before relay enrollment, after validating the pinned CA, journal
+/// identity, returned certificate fingerprint, and CSR key binding.
+///
+/// # Errors
+///
+/// Returns a TLS, mux, HTTP, JSON, pinning, identity, fingerprint, or
+/// client-certificate key-binding error when the ceremony cannot be verified.
+pub async fn pair_over_carrier<S>(
+    io: S,
+    link: &RelayPairLink,
+    device_label: &str,
+    additional_fields: &serde_json::Map<String, serde_json::Value>,
+) -> Result<PairingMaterial, TransportError>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
     let generated = generate_csr(device_label)?;
     let request = build_pair_request(generated.csr_pem, device_label, additional_fields)?;
     let body = serde_json::to_vec(&request)?;
     let headers = vec![("Content-Type".to_string(), "application/json".to_string())];
     let path = format!("{PAIR_PATH}?token={}", hex_lower(&link.s));
     let inner_config = Arc::new(tls::trust_all_pairing_config()?);
-    let (response, peer_leaf) = relay::request_once_over_ws_with_peer_leaf(
-        ws,
+    let (response, peer_leaf) = relay::request_once_over_stream_with_peer_leaf(
+        io,
         inner_config,
         relay::RELAY_HANDSHAKE_TIMEOUT,
         "POST",
@@ -101,34 +175,10 @@ pub async fn pair_over_relay(
     }
     verify_client_cert_key_binding(client_cert_der.as_ref(), &generated.public_key_spki_der)?;
 
-    let home_attestation = pair
-        .home_attestation
-        .as_deref()
-        .ok_or_else(|| TransportError::Pairing("relay response missing home attestation".into()))?;
-    #[expect(
-        clippy::large_futures,
-        reason = "the copied transport future keeps its established stack layout; this site goes red if a later refactor shrinks it"
-    )]
-    let device_token =
-        enroll_device(&link.relay_origin, &pair.instance_id, home_attestation).await?;
-    let device_token_expires_at =
-        spl_core::jwt::decode_unverified_claims(&device_token).map(|c| c.exp);
-    let ca_fp_prefix = ca::sha256(pinned_ca.as_ref())[..16].to_vec();
-    let endpoints = endpoint_addrs_from_local_endpoints(pair.local_endpoints.as_ref());
-
-    Ok(Credential {
+    Ok(PairingMaterial {
         client_key_pem: generated.key_pem,
-        client_cert_pem: pair.client_cert,
-        ca_chain_pem: pair.ca_chain,
-        ca_fp_prefix,
-        instance_id: pair.instance_id,
-        home_label: pair.home_label,
-        endpoints,
-        home_attestation: pair.home_attestation,
-        local_endpoints: pair.local_endpoints,
-        relay_origin: Some(link.relay_origin.clone()),
-        device_token: Some(device_token),
-        device_token_expires_at,
+        pair,
+        pinned_ca,
     })
 }
 

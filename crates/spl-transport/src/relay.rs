@@ -173,7 +173,9 @@ pub(crate) struct WsByteDuplex {
 }
 
 impl WsByteDuplex {
-    fn new(ws: WebSocketStream<MaybeTlsStream<TcpStream>>) -> (Self, RelayTerminationHandle) {
+    pub(crate) fn new(
+        ws: WebSocketStream<MaybeTlsStream<TcpStream>>,
+    ) -> (Self, RelayTerminationHandle) {
         let termination = RelayTerminationHandle::new();
         (
             Self {
@@ -416,32 +418,6 @@ pub async fn request_once_over_ws(
     .map(|(response, _peer_leaf)| response)
 }
 
-/// Send one relayed HTTP request and return the live inner-TLS peer leaf.
-///
-/// # Errors
-///
-/// Returns an inner TLS, mux, HTTP, timeout, or typed relay error.
-pub(crate) async fn request_once_over_ws_with_peer_leaf(
-    ws: WebSocketStream<MaybeTlsStream<TcpStream>>,
-    inner_config: Arc<ClientConfig>,
-    handshake_timeout: Duration,
-    method: &str,
-    path: &str,
-    headers: &[(String, String)],
-    body: &[u8],
-) -> Result<(HttpResponse, Option<CertificateDer<'static>>), TransportError> {
-    request_once_over_ws_inner(
-        ws,
-        inner_config,
-        handshake_timeout,
-        method,
-        path,
-        headers,
-        body,
-    )
-    .await
-}
-
 pub(crate) struct RelayCarrier {
     pub(crate) stream: TlsStream<WsByteDuplex>,
     pub(crate) termination: RelayTerminationHandle,
@@ -490,31 +466,18 @@ async fn request_once_over_ws_inner(
     body: &[u8],
 ) -> Result<(HttpResponse, Option<CertificateDer<'static>>), TransportError> {
     let (duplex, termination) = WsByteDuplex::new(ws);
-    let connector = TlsConnector::from(inner_config);
-    let tls = match tokio::time::timeout(
+    match request_once_over_stream_with_peer_leaf(
+        duplex,
+        inner_config,
         handshake_timeout,
-        connector.connect(pinned_server_name(), duplex),
+        method,
+        path,
+        headers,
+        body,
     )
     .await
     {
-        Err(_) => return Err(TransportError::Relay(RelayError::Stalled)),
-        Ok(Ok(tls)) => tls,
-        Ok(Err(e)) => {
-            if let Some(value) = termination.current() {
-                return Err(TransportError::Relay(relay_error_from_termination(value)));
-            }
-            return Err(TransportError::Tls(format!("inner relay handshake: {e}")));
-        }
-    };
-    let peer_leaf = tls
-        .get_ref()
-        .1
-        .peer_certificates()
-        .and_then(|certs| certs.first())
-        .cloned();
-
-    match run_request_over_stream(tls, method, path, headers, body).await {
-        Ok(response) => Ok((response, peer_leaf)),
+        Ok(result) => Ok(result),
         Err(error) => {
             if let Some(value) = termination.current() {
                 Err(TransportError::Relay(relay_error_from_termination(value)))
@@ -523,6 +486,41 @@ async fn request_once_over_ws_inner(
             }
         }
     }
+}
+
+pub(crate) async fn request_once_over_stream_with_peer_leaf<S>(
+    io: S,
+    inner_config: Arc<ClientConfig>,
+    handshake_timeout: Duration,
+    method: &str,
+    path: &str,
+    headers: &[(String, String)],
+    body: &[u8],
+) -> Result<(HttpResponse, Option<CertificateDer<'static>>), TransportError>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let connector = TlsConnector::from(inner_config);
+    let tls = match tokio::time::timeout(
+        handshake_timeout,
+        connector.connect(pinned_server_name(), io),
+    )
+    .await
+    {
+        Err(_) => return Err(TransportError::Relay(RelayError::Stalled)),
+        Ok(Ok(tls)) => tls,
+        Ok(Err(e)) => return Err(TransportError::Tls(format!("inner relay handshake: {e}"))),
+    };
+    let peer_leaf = tls
+        .get_ref()
+        .1
+        .peer_certificates()
+        .and_then(|certs| certs.first())
+        .cloned();
+
+    run_request_over_stream(tls, method, path, headers, body)
+        .await
+        .map(|response| (response, peer_leaf))
 }
 
 #[expect(

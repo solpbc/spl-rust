@@ -18,6 +18,7 @@ mod config;
 mod connection;
 mod error;
 mod mux;
+mod pair_window;
 
 /// Listener mux configuration and protocol-mandated default limits.
 pub use config::{
@@ -27,6 +28,8 @@ pub use config::{
 /// Tokio listener connection and per-stream I/O handles.
 pub use connection::{HomeConnection, HomeStream};
 /// Error and refusal types returned by the home-side mux.
-pub use error::{ConfigError, HomeError, Refusal, RefusalClass};
+pub use error::{ConfigError, HomeError, PairWindowRefusal, Refusal, RefusalClass};
 /// Pure listener-side frame dispatch and stream lifecycle types.
 pub use mux::{MuxAcceptor, MuxEvent, MuxOutput, ResetReason};
+/// Single-use anonymous pairing-window admission.
+pub use pair_window::{PairSecret, PairWindow, PairWindowConfig, RelayKeyHex};

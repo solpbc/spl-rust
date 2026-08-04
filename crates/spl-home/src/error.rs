@@ -15,6 +15,12 @@ pub enum HomeError {
     /// TLS configuration was rejected without retaining key or certificate data.
     #[error("TLS configuration failure")]
     TlsConfig,
+    /// The pairing-window CA could not derive a stable instance identity.
+    #[error("pairing window CA identity is invalid")]
+    PairWindowCaIdentity,
+    /// A pairing-window admission was refused before carrier I/O.
+    #[error("pairing window admission refused: {0}")]
+    PairWindowRefused(PairWindowRefusal),
     /// Mux configuration is invalid.
     #[error("invalid mux configuration: {0}")]
     Config(#[from] ConfigError),
@@ -44,6 +50,28 @@ pub enum ConfigError {
     /// The decoder cannot hold one legal maximum-size frame.
     #[error("decoder buffer is below one legal maximum-size frame")]
     DecoderBelowMaximumFrame,
+}
+
+/// Local reasons a pairing-window admission can be refused before TLS begins.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PairWindowRefusal {
+    /// The presented relay key does not match this window.
+    WrongRelayKey,
+    /// A prior successful admission has already consumed this window.
+    Consumed,
+    /// The caller-supplied time is at or after the window expiry.
+    Expired,
+}
+
+impl std::fmt::Display for PairWindowRefusal {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let text = match self {
+            Self::WrongRelayKey => "relay key mismatch",
+            Self::Consumed => "pairing window already consumed",
+            Self::Expired => "pairing window expired",
+        };
+        formatter.write_str(text)
+    }
 }
 
 /// Header-only classification of a refused operation or peer frame.

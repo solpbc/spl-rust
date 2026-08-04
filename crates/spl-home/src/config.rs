@@ -89,12 +89,24 @@ impl HomeConfig {
     /// Returns [`HomeError::TlsConfig`](crate::HomeError::TlsConfig) if rustls
     /// rejects the selected provider, protocol version, certificate chain, or key.
     pub fn server_config(&self) -> Result<ServerConfig, crate::HomeError> {
-        let provider = Arc::new(rustls::crypto::ring::default_provider());
-        ServerConfig::builder_with_provider(provider)
-            .with_protocol_versions(&[&rustls::version::TLS13])
-            .map_err(|_| crate::HomeError::TlsConfig)?
-            .with_client_cert_verifier(self.client_cert_verifier.clone())
-            .with_single_cert(self.certificate_chain.clone(), self.private_key.clone_key())
-            .map_err(|_| crate::HomeError::TlsConfig)
+        build_server_config(
+            self.certificate_chain.clone(),
+            self.private_key.clone_key(),
+            self.client_cert_verifier.clone(),
+        )
     }
+}
+
+pub(crate) fn build_server_config(
+    certificate_chain: Vec<CertificateDer<'static>>,
+    private_key: PrivateKeyDer<'static>,
+    client_cert_verifier: Arc<dyn ClientCertVerifier>,
+) -> Result<ServerConfig, crate::HomeError> {
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    ServerConfig::builder_with_provider(provider)
+        .with_protocol_versions(&[&rustls::version::TLS13])
+        .map_err(|_| crate::HomeError::TlsConfig)?
+        .with_client_cert_verifier(client_cert_verifier)
+        .with_single_cert(certificate_chain, private_key)
+        .map_err(|_| crate::HomeError::TlsConfig)
 }

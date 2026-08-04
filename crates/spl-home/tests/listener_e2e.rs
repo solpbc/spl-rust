@@ -640,6 +640,47 @@ async fn pairing_window_completes_verified_ceremony_and_publishes_rk() {
 }
 
 #[tokio::test]
+async fn pairing_window_failed_handshake_rolls_back_for_retry() {
+    let fixture = pair_fixture();
+    let now = Instant::now();
+    let mut window = PairWindow::open(
+        PairSecret::from([0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef]),
+        now + Duration::from_mins(1),
+        pair_window_config(&fixture),
+    )
+    .unwrap();
+    let relay_key = window.relay_key_hex();
+    let (dialer, failed_home_io) = tokio::io::duplex(64 * 1024);
+    drop(dialer);
+    let failed = window.admit(failed_home_io, relay_key.as_str(), now).await;
+    assert!(matches!(failed, Err(spl_home::HomeError::Tls)));
+
+    let instance_id = window.instance_id().to_owned();
+    let link = pair_link(&fixture);
+    let (dialer_io, home_io) = tokio::io::duplex(64 * 1024);
+    let client = tokio::spawn(async move {
+        pair_over_carrier(
+            dialer_io,
+            &link,
+            "pair-window-test",
+            &serde_json::Map::new(),
+        )
+        .await
+    });
+    let retry = window
+        .admit(home_io, relay_key.as_str(), Instant::now())
+        .await;
+    assert!(
+        retry.is_ok(),
+        "a failed TLS handshake must not consume the pairing window"
+    );
+    let mut home = retry.unwrap();
+    let mut stream = home.accept_stream().await.unwrap();
+    serve_pair_response(&mut stream, &fixture, &instance_id).await;
+    assert!(client.await.unwrap().is_ok());
+}
+
+#[tokio::test]
 async fn pairing_window_client_rejects_non_jid_instance_id() {
     let fixture = pair_fixture();
     let now = Instant::now();

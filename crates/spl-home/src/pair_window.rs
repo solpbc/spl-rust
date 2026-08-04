@@ -37,7 +37,7 @@ impl Drop for PairSecret {
 ///
 /// This intentionally implements no [`std::fmt::Display`], so logging a relay
 /// key is not one formatting placeholder away.
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone)]
 pub struct RelayKeyHex(String);
 
 impl RelayKeyHex {
@@ -158,7 +158,12 @@ impl PairWindow {
     /// Uppercase hexadecimal is rejected. Relay key, expiry, and consumption
     /// are checked before the TLS handshake writes any carrier bytes.
     ///
-    /// Protocol: `.proto-ref/pair-window.md`, lines 81-85 and 91.
+    /// Protocol: `.proto-ref/pair-window.md`, line 83 requires one use with
+    /// the first dial winning; line 91 requires consume-on-success-only with
+    /// rollback after a failed admission.
+    ///
+    /// Refusals happen before the handshake so carrier bytes cannot distinguish
+    /// local refusal causes, preserving the oracle-safety requirement in line 85.
     ///
     /// # Errors
     ///

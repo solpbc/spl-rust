@@ -75,8 +75,16 @@ pub async fn pair_over_relay(
 
     let spki = ca::extract_spki_der(pinned_ca.as_ref())
         .map_err(|_| TransportError::Pairing("relay ca spki".into()))?;
-    let expected = spl_core::relay_window::jid_from_spki(&spki)
-        .map_err(|_| TransportError::Pairing("relay ca not p-256".into()))?;
+    let expected = spl_core::relay_window::jid_from_spki(&spki).map_err(|error| {
+        let message = match error {
+            spl_core::relay_window::JidError::NotP256 => "relay ca SPKI is not P-256",
+            spl_core::relay_window::JidError::InvalidPoint => {
+                "relay ca SPKI contains an invalid P-256 public point"
+            }
+            spl_core::relay_window::JidError::MalformedSpki => "relay ca SPKI is malformed",
+        };
+        TransportError::Pairing(message.into())
+    })?;
     if pair.instance_id != expected {
         return Err(TransportError::Pairing("relay instance mismatch".into()));
     }

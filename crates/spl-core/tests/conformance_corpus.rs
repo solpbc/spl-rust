@@ -15,10 +15,10 @@ use std::ffi::OsStr;
 use std::fs;
 use std::path::{Component, Path, PathBuf};
 
-const AUTHORITY_COMMIT: &str = "0f49108dbe64f6d3ae906fa6f415182c10c83bc4";
+const AUTHORITY_COMMIT: &str = "ddfe13b2abce2fd40acbe2e18d0551727e7ef757";
 const AUTHORITY_MANIFEST_SHA256: &str =
-    "80c1df0d56010fc656e288833e40a2504c0785e659e52fc05793c1e79431f1ef";
-const BUNDLE_SEMVER: &str = "1.1.2";
+    "0d78abe38a2cf23af3b98c9a496bb3c6f1c94bc7c0467eafa43726af3a3603ea";
+const BUNDLE_SEMVER: &str = "2.0.0";
 const BUNDLE_SCHEMA_IDENTITY: &str = "spl.pair-link-definition-bundle.schema.v1";
 const ADOPTION_SCHEMA_VERSION: u32 = 1;
 const CONSUMER_IDENTIFIER: &str = "solpbc/spl-rust";
@@ -289,6 +289,13 @@ fn vendored_vectors_pin_library_behavior() -> Result<(), Box<dyn Error>> {
                 let actual = corpus_observers::observe_relay_key(secret_hex)?;
                 assert_eq!(&actual, expected_hex, "vector {}", vector.id);
             }
+            VectorCase::DeriveJid {
+                spki_der_hex,
+                expected,
+            } => {
+                let actual = corpus_observers::observe_jid(spki_der_hex)?;
+                assert_eq!(&actual, expected, "vector {}", vector.id);
+            }
         }
     }
     Ok(())
@@ -304,6 +311,11 @@ fn declared_vector_subset_is_explicit() -> Result<(), Box<dyn Error>> {
         .map(|vector| vector.id.as_str())
         .collect::<BTreeSet<_>>();
     let expected = BTreeSet::from([
+        "identity.jid.canonical",
+        "identity.jid.compressed-point",
+        "identity.jid.off-curve-point",
+        "identity.jid.wrong-algorithm",
+        "identity.jid.wrong-curve",
         "pair.v04.canonical.admission",
         "pair.v04.canonical.decode",
         "pair.v06.custom.published",

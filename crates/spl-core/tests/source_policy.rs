@@ -47,16 +47,20 @@ fn protocol_mirror_has_exact_pinned_contents() -> Result<(), Box<dyn Error>> {
             "a00c87a8b465e8c438576818ced4428fce039fda242b6540cb72f121c377dcc4",
         ),
         (
+            "identity.md",
+            "b5c777414499ce7d90d8985a82d6faf91a24dab90e575b8024782bbad84855af",
+        ),
+        (
             "pair-window.md",
-            "3239768ac357437c893ccfc3aea72c998bacd27a0450ac3695768b921f7e317f",
+            "4cf6038aff424f22e0851fa455138fff3095418995995bb04210fcc00cffb380",
         ),
         (
             "pairing.md",
-            "214f0779a1f08c733bc4094cbbc3b29d5167ec8ab5df1491a2ed60d482ee61d4",
+            "526b1b479ba875501b965d531ab0a1214d06820d1db4d7e354196af8c910de91",
         ),
         (
             "session.md",
-            "8b573947f72e63dd2b81359eb97adaaacd1c9137113a5a2a96e21f04c6830908",
+            "7acfb5030ae9f4ead7546118cb02abc6136cf44b05b47a94606eac79ee16d396",
         ),
         (
             "tokens.md",

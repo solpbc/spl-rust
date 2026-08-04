@@ -42,6 +42,7 @@ spl-core = { path = "crates/spl-core", version = "0.1.0" }
 base64 = { version = "0.22", default-features = false, features = ["std"] }
 futures-util = { version = "0.3", default-features = false, features = ["sink"] }
 hkdf = "0.12"
+p256 = { version = "0.13.2", default-features = false, features = ["arithmetic", "pkcs8", "alloc"] }
 rcgen = { version = "0.13", default-features = false, features = ["ring", "pem"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
 rustls-webpki = { version = "0.103", default-features = false, features = ["ring", "std"] }

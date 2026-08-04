@@ -149,7 +149,11 @@ pub fn extract_spki_der(cert_der: &[u8]) -> Result<Vec<u8>, CaError> {
     Ok(spki.full(cert_der).to_vec())
 }
 
-/// True if `spki_der` is a canonical EC P-256 `SubjectPublicKeyInfo`.
+/// True if `spki_der` names EC P-256 in its `AlgorithmIdentifier`.
+///
+/// This checks only the algorithm and curve OIDs. It does not read the public-key
+/// BIT STRING or validate its point, so it is not sufficient for journal identity
+/// derivation.
 #[expect(
     clippy::similar_names,
     reason = "alg_id, alg_oid, and curve_oid mirror the nested DER fields"

@@ -7,17 +7,25 @@
 //! be promoted later if direct pairing needs the same journal identity.
 
 use hkdf::Hkdf;
+use p256::pkcs8::der::Decode;
+use p256::pkcs8::{EncodePublicKey, SubjectPublicKeyInfoRef};
 use sha2::Sha256;
 use thiserror::Error;
 
-use crate::{ca, pairlink};
+use crate::pairlink;
 
 /// Errors produced while deriving a journal identity.
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum JidError {
-    /// The supplied SPKI is not a canonical EC P-256 key.
-    #[error("journal CA SPKI is not EC P-256")]
+    /// The supplied SPKI does not name an EC P-256 key.
+    #[error("journal CA SPKI is not P-256")]
     NotP256,
+    /// The supplied P-256 SPKI contains an invalid public point.
+    #[error("journal CA SPKI contains an invalid P-256 public point")]
+    InvalidPoint,
+    /// The supplied SPKI is not well-formed DER.
+    #[error("journal CA SPKI is malformed")]
+    MalformedSpki,
 }
 
 /// Derive the 16-byte relay rendezvous key from a pair-window secret.
@@ -25,27 +33,47 @@ pub fn derive_rk(s: &[u8; 8]) -> [u8; 16] {
     hkdf16(s, None, b"spl-pair-window-v1")
 }
 
-/// Derive the stable UUID-form journal identity from canonical P-256 SPKI DER.
+/// Derive the stable UUID-form journal identity from a P-256 SPKI DER key.
 ///
 /// # Errors
 ///
-/// Returns [`JidError::NotP256`] when `spki_der` is not a canonical EC P-256
-/// `SubjectPublicKeyInfo` structure.
+/// Parses `spki_der`, confirms it names an on-curve P-256 public key, and
+/// derives from its canonical uncompressed SPKI DER serialization.
+///
+/// Returns [`JidError::NotP256`] when the algorithm or named curve is not
+/// P-256, [`JidError::InvalidPoint`] when a P-256 point is invalid, and
+/// [`JidError::MalformedSpki`] when the input is not a well-formed SPKI.
 pub fn jid_from_spki(spki_der: &[u8]) -> Result<String, JidError> {
-    if !ca::is_ec_p256_spki(spki_der) {
-        return Err(JidError::NotP256);
+    let spki = SubjectPublicKeyInfoRef::from_der(spki_der).map_err(|_| JidError::MalformedSpki)?;
+    if spki.subject_public_key.as_bytes().is_none() {
+        return Err(JidError::MalformedSpki);
     }
 
-    // Journal CAs emit canonical P-256 SPKI DER. The live VPE test is the
-    // end-to-end proof that this exact DER form is stable across the pairing path.
+    let public_key = match p256::PublicKey::try_from(&spki) {
+        Ok(public_key) => public_key,
+        Err(p256::pkcs8::spki::Error::OidUnknown { .. }) => return Err(JidError::NotP256),
+        Err(_) => return Err(JidError::InvalidPoint),
+    };
+
+    Ok(jid_from_public_key(&public_key))
+}
+
+#[expect(
+    clippy::expect_used,
+    reason = "a validated P-256 public key always has a fixed valid SPKI DER encoding"
+)]
+fn jid_from_public_key(public_key: &p256::PublicKey) -> String {
+    let canonical_der = public_key
+        .to_public_key_der()
+        .expect("validated P-256 public key encodes as DER");
     let mut raw = hkdf16(
-        spki_der,
+        canonical_der.as_bytes(),
         Some(b"solstone/journal/v1"),
         b"solstone/jid/uuidv8/v1",
     );
     raw[6] = (raw[6] & 0x0f) | 0x80;
     raw[8] = (raw[8] & 0x3f) | 0x80;
-    Ok(pairlink::uuid_string(&raw))
+    pairlink::uuid_string(&raw)
 }
 
 #[expect(
@@ -101,7 +129,28 @@ mod tests {
     }
 
     #[test]
-    fn jid_from_spki_fails_closed_on_non_p256() {
-        assert_eq!(jid_from_spki(b"not der"), Err(JidError::NotP256));
+    fn jid_from_spki_fails_closed_on_malformed_spki() {
+        assert_eq!(jid_from_spki(b"not der"), Err(JidError::MalformedSpki));
+    }
+
+    #[test]
+    fn jid_from_spki_refuses_malformed_spki_encodings() {
+        // Protocol: `.proto-ref/identity.md`, “malformed_spki | the input is not a
+        // well-formed SubjectPublicKeyInfo”.
+        let spki_der = hex_decode(
+            "3059301306072a8648ce3d020106082a8648ce3d03010703420004798953e7e8134fdf3c139f63d3fbccc252a28b6ca5059e618374a81231240f3fc83267aec725e18b66176c3685d1257201a67033819585a22a296350159ae70b",
+        );
+        let mut trailing = spki_der.clone();
+        trailing.push(0);
+        let mut non_minimal_length = vec![0x30, 0x81, 0x59];
+        non_minimal_length.extend_from_slice(&spki_der[2..]);
+
+        for malformed in [
+            b"not der".as_slice(),
+            trailing.as_slice(),
+            non_minimal_length.as_slice(),
+        ] {
+            assert_eq!(jid_from_spki(malformed), Err(JidError::MalformedSpki));
+        }
     }
 }

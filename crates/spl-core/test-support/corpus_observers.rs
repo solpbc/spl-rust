@@ -3,11 +3,11 @@
 
 use serde::Deserialize;
 use spl_core::pairlink::{self, PairLinkError, ParsedPairLink};
-use spl_core::relay_window::{self, JidError};
+use spl_core::relay_window;
 use std::error::Error;
 use std::path::{Path, PathBuf};
 
-pub(crate) const PROTOCOL_REVISION: &str = "ddfe13b2abce2fd40acbe2e18d0551727e7ef757";
+pub(crate) const PROTOCOL_REVISION: &str = "e639605b692577700648af470ee27da898c6df75";
 const VECTORS_PATH_FROM_MANIFEST: &str = "../../conformance/bundle/vectors.json";
 
 #[derive(Deserialize)]
@@ -109,15 +109,7 @@ pub(crate) enum PairErrorExpectation {
 #[serde(tag = "result", rename_all = "snake_case")]
 pub(crate) enum JidExpectation {
     Jid { jid: String },
-    Error { error: JidErrorExpectation },
-}
-
-#[derive(Debug, PartialEq, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-pub(crate) enum JidErrorExpectation {
-    NotP256,
-    InvalidPoint,
-    MalformedSpki,
+    Error,
 }
 
 pub(crate) fn vectors_path() -> PathBuf {
@@ -173,9 +165,7 @@ pub(crate) fn observe_jid(spki_der_hex: &str) -> Result<JidExpectation, Box<dyn 
     let spki_der = hex_decode(spki_der_hex)?;
     Ok(match relay_window::jid_from_spki(&spki_der) {
         Ok(jid) => JidExpectation::Jid { jid },
-        Err(error) => JidExpectation::Error {
-            error: jid_error(&error),
-        },
+        Err(_) => JidExpectation::Error,
     })
 }
 
@@ -214,14 +204,6 @@ fn pair_error(error: &PairLinkError) -> PairErrorExpectation {
         PairLinkError::InvalidCandidateCount { count } => {
             PairErrorExpectation::InvalidCandidateCount { count: *count }
         }
-    }
-}
-
-fn jid_error(error: &JidError) -> JidErrorExpectation {
-    match error {
-        JidError::NotP256 => JidErrorExpectation::NotP256,
-        JidError::InvalidPoint => JidErrorExpectation::InvalidPoint,
-        JidError::MalformedSpki => JidErrorExpectation::MalformedSpki,
     }
 }
 

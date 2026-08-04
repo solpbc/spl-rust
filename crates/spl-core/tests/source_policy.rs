@@ -48,11 +48,11 @@ fn protocol_mirror_has_exact_pinned_contents() -> Result<(), Box<dyn Error>> {
         ),
         (
             "identity.md",
-            "b5c777414499ce7d90d8985a82d6faf91a24dab90e575b8024782bbad84855af",
+            "e333fa6a9db7aa7ac7a701144454622130c56ad63d9a993885644ae522a732b4",
         ),
         (
             "pair-window.md",
-            "4cf6038aff424f22e0851fa455138fff3095418995995bb04210fcc00cffb380",
+            "6845844f14871ee7c9991e5c363620f4002d87099640b5156532ff6fd0922b67",
         ),
         (
             "pairing.md",
@@ -64,7 +64,7 @@ fn protocol_mirror_has_exact_pinned_contents() -> Result<(), Box<dyn Error>> {
         ),
         (
             "tokens.md",
-            "e5ded62b6c064435b2e8b007e9f2b1491cfb6b9dea49859110a1b2e33c3bc39d",
+            "c6bfb80cdae62988bb65ffb6972dac2f1f0b195b3ff46be115eddb25bc65aec4",
         ),
     ];
     let actual = fs::read_dir(&mirror)?

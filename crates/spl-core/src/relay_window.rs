@@ -37,12 +37,11 @@ pub fn derive_rk(s: &[u8; 8]) -> [u8; 16] {
 ///
 /// # Errors
 ///
-/// Parses `spki_der`, confirms it names an on-curve P-256 public key, and
-/// derives from its canonical uncompressed SPKI DER serialization.
+/// Parses `spki_der`, validates a P-256 public key, and derives from its
+/// canonical SPKI DER serialization, normalizing a compressed point.
 ///
-/// Returns [`JidError::NotP256`] when the algorithm or named curve is not
-/// P-256, [`JidError::InvalidPoint`] when a P-256 point is invalid, and
-/// [`JidError::MalformedSpki`] when the input is not a well-formed SPKI.
+/// Returns [`JidError`] when the input must be refused; its variants are
+/// diagnostic only.
 pub fn jid_from_spki(spki_der: &[u8]) -> Result<String, JidError> {
     let spki = SubjectPublicKeyInfoRef::from_der(spki_der).map_err(|_| JidError::MalformedSpki)?;
     if spki.subject_public_key.as_bytes().is_none() {
@@ -135,8 +134,8 @@ mod tests {
 
     #[test]
     fn jid_from_spki_refuses_malformed_spki_encodings() {
-        // Protocol: `.proto-ref/identity.md`, “malformed_spki | the input is not a
-        // well-formed SubjectPublicKeyInfo”.
+        // Protocol: `.proto-ref/identity.md`, “An implementation MUST refuse any input
+        // that is not a canonical P-256 `SubjectPublicKeyInfo`”.
         let spki_der = hex_decode(
             "3059301306072a8648ce3d020106082a8648ce3d03010703420004798953e7e8134fdf3c139f63d3fbccc252a28b6ca5059e618374a81231240f3fc83267aec725e18b66176c3685d1257201a67033819585a22a296350159ae70b",
         );

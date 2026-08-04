@@ -15,10 +15,10 @@ use std::ffi::OsStr;
 use std::fs;
 use std::path::{Component, Path, PathBuf};
 
-const AUTHORITY_COMMIT: &str = "ddfe13b2abce2fd40acbe2e18d0551727e7ef757";
+const AUTHORITY_COMMIT: &str = "e639605b692577700648af470ee27da898c6df75";
 const AUTHORITY_MANIFEST_SHA256: &str =
-    "0d78abe38a2cf23af3b98c9a496bb3c6f1c94bc7c0467eafa43726af3a3603ea";
-const BUNDLE_SEMVER: &str = "2.0.0";
+    "bd3fcd1f6c7bc4eddeb35eb8981be47dc738a603e16064ad52adbda75867e7b1";
+const BUNDLE_SEMVER: &str = "5.0.0";
 const BUNDLE_SCHEMA_IDENTITY: &str = "spl.pair-link-definition-bundle.schema.v1";
 const ADOPTION_SCHEMA_VERSION: u32 = 1;
 const CONSUMER_IDENTIFIER: &str = "solpbc/spl-rust";
@@ -313,7 +313,11 @@ fn declared_vector_subset_is_explicit() -> Result<(), Box<dyn Error>> {
     let expected = BTreeSet::from([
         "identity.jid.canonical",
         "identity.jid.compressed-point",
+        "identity.jid.explicit-parameters",
+        "identity.jid.malformed",
         "identity.jid.off-curve-point",
+        "identity.jid.trailing-data",
+        "identity.jid.unused-bits",
         "identity.jid.wrong-algorithm",
         "identity.jid.wrong-curve",
         "pair.v04.canonical.admission",

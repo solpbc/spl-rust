@@ -10,7 +10,7 @@ use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use futures_util::StreamExt;
 use spl_core::relay::{ListenControl, listen_url, parse_listen_control, tunnel_url};
@@ -155,7 +155,7 @@ impl RelayHealth {
     pub const fn listen_generation(&self) -> u64 {
         self.listen_generation
     }
-    /// Return the most recent successful tunnel timestamp supplied by the caller.
+    /// Return the timestamp recorded for the most recent successful tunnel.
     #[must_use]
     pub const fn last_successful_tunnel_at_ms(&self) -> Option<u64> {
         self.last_successful_tunnel_at_ms
@@ -165,7 +165,7 @@ impl RelayHealth {
     pub const fn last_failure(&self) -> Option<RelayTunnelFailure> {
         self.last_failure
     }
-    /// Return the timestamp of the most recent tunnel failure.
+    /// Return the timestamp recorded for the most recent tunnel failure.
     #[must_use]
     pub const fn last_failure_at_ms(&self) -> Option<u64> {
         self.last_failure_at_ms
@@ -202,6 +202,8 @@ pub enum RelayEvent {
     Connected,
     /// The listen WebSocket disconnected.
     Disconnected,
+    /// Relay configuration prevented opening a listen connection.
+    ConfigurationFailure,
     /// Prefix admission was saturated.
     AdmissionSaturated {
         /// Cumulative number of admission refusals.
@@ -229,6 +231,7 @@ impl fmt::Debug for RelayEvent {
             Self::Connecting => formatter.write_str("Connecting"),
             Self::Connected => formatter.write_str("Connected"),
             Self::Disconnected => formatter.write_str("Disconnected"),
+            Self::ConfigurationFailure => formatter.write_str("ConfigurationFailure"),
             Self::AdmissionSaturated { count } => formatter
                 .debug_struct("AdmissionSaturated")
                 .field("count", count)
@@ -405,8 +408,8 @@ impl HomeRelayClient {
     ///
     /// # Errors
     ///
-    /// Returns a class-only relay error only when the injected jitter source
-    /// produces an invalid sample.
+    /// Returns a class-only relay error for terminal relay configuration or an
+    /// invalid injected jitter sample.
     pub async fn run(&self) -> Result<(), TransportError> {
         let mut base = Duration::ZERO;
         loop {
@@ -414,13 +417,20 @@ impl HomeRelayClient {
             let started = Instant::now();
             let result = self.run_once().await;
             self.emit(RelayEvent::Disconnected);
-            base = base_after_connection(base, started.elapsed());
-            let (next, delay) = schedule_reconnect(base, self.inner.jitter.sample())
-                .ok_or(TransportError::Relay(RelayError::Abnormal))?;
-            base = next;
-            sleep(delay).await;
-            if result.is_ok() {
-                return Ok(());
+            match result {
+                Ok(()) => return Ok(()),
+                Err(error @ TransportError::Relay(RelayError::HomeRelayConfiguration)) => {
+                    self.emit(RelayEvent::ConfigurationFailure);
+                    return Err(error);
+                }
+                Err(_) => {
+                    self.record_reconnecting();
+                    base = base_after_connection(base, started.elapsed());
+                    let (next, delay) = schedule_reconnect(base, self.inner.jitter.sample())
+                        .ok_or(TransportError::Relay(RelayError::Abnormal))?;
+                    base = next;
+                    sleep(delay).await;
+                }
             }
         }
     }
@@ -469,12 +479,10 @@ impl HomeRelayClient {
                     }
                 }
                 Message::Binary(_) | Message::Ping(_) | Message::Pong(_) | Message::Frame(_) => {}
-                Message::Close(_) => {
-                    return Err(TransportError::Relay(RelayError::HomeListenConnection));
-                }
+                Message::Close(_) => return Ok(()),
             }
         }
-        Err(TransportError::Relay(RelayError::HomeListenConnection))
+        Ok(())
     }
 
     async fn handle_tunnel(&self, tunnel_id: String) {
@@ -492,20 +500,23 @@ impl HomeRelayClient {
             .await
             .map_err(|error| classify_dial(&error))?;
         if !self.inner.admission.acquire() {
-            self.emit(RelayEvent::AdmissionSaturated {
-                count: self.inner.admission.saturated(),
-            });
+            self.record_saturation(self.inner.admission.saturated());
             return Ok(());
         }
-        let mut io = PrefixIo::new(WsByteDuplex::new(ws).0);
-        let mut prefix = [0_u8; 4];
-        let read = timeout(self.inner.deadline, io.read_exact(&mut prefix)).await;
-        if !matches!(read, Ok(Ok(_))) || prefix[0] != 0x16 {
-            self.inner.admission.release();
-            self.emit(RelayEvent::TunnelUnknownPrefix);
-            return Ok(());
-        }
-        io.replay(prefix);
+        let io = match guard_tls_prefix(PrefixIo::new(WsByteDuplex::new(ws).0), self.inner.deadline)
+            .await
+        {
+            Ok(PrefixGuard::Tls(io)) => io,
+            Ok(PrefixGuard::Unknown) => {
+                self.inner.admission.release();
+                self.emit(RelayEvent::TunnelUnknownPrefix);
+                return Ok(());
+            }
+            Err(failure) => {
+                self.inner.admission.release();
+                return Err(failure);
+            }
+        };
         self.inner.admission.release();
         let mut connection = timeout(
             RELAY_HANDSHAKE_TIMEOUT,
@@ -516,6 +527,9 @@ impl HomeRelayClient {
         .map_err(|_| RelayTunnelFailure::RelayTunnelUnreachable)?;
         self.record_success();
         while let Ok(stream) = connection.accept_stream().await {
+            if !self.inner.accepting_tunnels.load(Ordering::Acquire) {
+                break;
+            }
             let client = self.clone();
             let task = tokio::spawn(async move {
                 if let Err(failure) = pipe_stream(stream, client.inner.app_port).await {
@@ -537,39 +551,59 @@ impl HomeRelayClient {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         tasks.retain(|task| !task.is_finished());
-        tasks.push(task);
+        if self.inner.accepting_tunnels.load(Ordering::Acquire) {
+            tasks.push(task);
+        } else {
+            task.abort();
+        }
     }
     fn record_success(&self) {
-        let mut health = self
-            .inner
-            .health
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        health.last_successful_tunnel_at_ms = Some(0);
-        health.last_failure = None;
-        self.emit(RelayEvent::Health(health.clone()));
+        self.update_health(|health| {
+            health.last_successful_tunnel_at_ms = Some(timestamp_ms());
+            health.last_failure = None;
+        });
     }
     fn record_connected(&self) {
-        let mut health = self
-            .inner
-            .health
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        health.state = RelayHealthState::Connected;
-        health.listen_generation = health.listen_generation.saturating_add(1);
-        self.emit(RelayEvent::Health(health.clone()));
+        self.update_health(|health| {
+            health.state = RelayHealthState::Connected;
+            health.listen_generation = health.listen_generation.saturating_add(1);
+        });
+    }
+    fn record_reconnecting(&self) {
+        self.update_health(|health| health.state = RelayHealthState::Reconnecting);
+    }
+    fn record_saturation(&self, count: u64) {
+        self.emit(RelayEvent::AdmissionSaturated { count });
+        self.update_health(|health| health.admission_saturated_count = count);
     }
     fn record_failure(&self, failure: RelayTunnelFailure) {
-        let mut health = self
-            .inner
-            .health
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        health.last_failure = Some(failure);
-        health.last_failure_at_ms = Some(0);
-        health.admission_saturated_count = self.inner.admission.saturated();
-        self.emit(RelayEvent::Health(health.clone()));
+        let saturated = self.inner.admission.saturated();
+        self.update_health(|health| {
+            health.last_failure = Some(failure);
+            health.last_failure_at_ms = Some(timestamp_ms());
+            health.admission_saturated_count = saturated;
+        });
     }
+    fn update_health(&self, update: impl FnOnce(&mut RelayHealth)) {
+        let snapshot = {
+            let mut health = self
+                .inner
+                .health
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            update(&mut health);
+            health.clone()
+        };
+        self.emit(RelayEvent::Health(snapshot));
+    }
+}
+
+fn timestamp_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .and_then(|duration| u64::try_from(duration.as_millis()).ok())
+        .unwrap_or_default()
 }
 
 impl RelayStop for HomeRelayClient {
@@ -639,6 +673,29 @@ struct PrefixIo<I> {
     prefix_len: usize,
     position: usize,
 }
+
+enum PrefixGuard<I> {
+    Tls(PrefixIo<I>),
+    Unknown,
+}
+
+async fn guard_tls_prefix<I>(
+    mut io: PrefixIo<I>,
+    deadline: Duration,
+) -> Result<PrefixGuard<I>, RelayTunnelFailure>
+where
+    I: AsyncRead + Unpin,
+{
+    let mut prefix = [0_u8; 4];
+    match timeout(deadline, io.read_exact(&mut prefix)).await {
+        Ok(Ok(_)) if prefix[0] == 0x16 => {
+            io.replay(prefix);
+            Ok(PrefixGuard::Tls(io))
+        }
+        Ok(Ok(_)) => Ok(PrefixGuard::Unknown),
+        Ok(Err(_)) | Err(_) => Err(RelayTunnelFailure::RelayTunnelUnreachable),
+    }
+}
 impl<I> PrefixIo<I> {
     fn new(inner: I) -> Self {
         Self {
@@ -703,14 +760,14 @@ where
     loop {
         tokio::select! {
             read = stream.read(&mut tunnel_buf) => match read {
-                Ok(0) => { if socket.shutdown().await.is_err() { let _ = stream.reset(ResetReason::InternalError); return Err(RelayTunnelFailure::LocalPrivateListenerUnreachable); } return Ok(()); }
-                Ok(count) => if socket.write_all(&tunnel_buf[..count]).await.is_err() { let _ = stream.reset(ResetReason::InternalError); return Err(RelayTunnelFailure::LocalPrivateListenerUnreachable); },
+                Ok(0) => { if socket.shutdown().await.is_err() { let _ = stream.reset(ResetReason::InternalError); return Err(RelayTunnelFailure::RelayTunnelUnreachable); } return Ok(()); }
+                Ok(count) => if socket.write_all(&tunnel_buf[..count]).await.is_err() { let _ = stream.reset(ResetReason::InternalError); return Err(RelayTunnelFailure::RelayTunnelUnreachable); },
                 Err(_) => return Ok(()),
             },
             read = socket.read(&mut socket_buf) => match read {
                 Ok(0) => { let _ = stream.shutdown().await; return Ok(()); }
                 Ok(count) => if stream.write_all(&socket_buf[..count]).await.is_err() { return Ok(()); },
-                Err(_) => { let _ = stream.reset(ResetReason::InternalError); return Err(RelayTunnelFailure::LocalPrivateListenerUnreachable); },
+                Err(_) => { let _ = stream.reset(ResetReason::InternalError); return Err(RelayTunnelFailure::RelayTunnelUnreachable); },
             },
         }
     }
@@ -719,7 +776,12 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use futures_util::SinkExt;
+    use std::future::pending;
+    use std::pin::Pin;
     use std::sync::Arc;
+    use std::sync::Mutex;
+    use std::task::{Context, Poll};
 
     use rcgen::{
         BasicConstraints, CertificateParams, ExtendedKeyUsagePurpose, IsCa, KeyPair,
@@ -791,6 +853,82 @@ mod tests {
         }
     }
 
+    struct CapturedEvents(Mutex<Vec<RelayEvent>>);
+
+    impl RelayEventSink for CapturedEvents {
+        fn emit(&self, event: RelayEvent) {
+            self.0
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(event);
+        }
+    }
+
+    struct FixedJitter;
+
+    impl RelayJitter for FixedJitter {
+        fn sample(&self) -> f64 {
+            0.5
+        }
+    }
+
+    fn test_client(relay_origin: String, events: Arc<CapturedEvents>) -> HomeRelayClient {
+        let fixture = tls_fixture();
+        HomeRelayClient::new(HomeRelayClientConfig {
+            relay_origin,
+            service_token: ServiceToken::new("test-service-token".into()),
+            home_config: home_config(&fixture),
+            app_port: 1,
+            dispatch_read_deadline: Duration::from_millis(20),
+            admission_ceiling: NonZeroUsize::new(1).unwrap(),
+            jitter: Arc::new(FixedJitter),
+            events,
+        })
+    }
+
+    fn health_snapshots(events: &CapturedEvents) -> Vec<RelayHealth> {
+        events
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .filter_map(|event| match event {
+                RelayEvent::Health(health) => Some(health.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    struct WriteFailingSocket;
+
+    impl AsyncRead for WriteFailingSocket {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            _buf: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            Poll::Pending
+        }
+    }
+
+    impl AsyncWrite for WriteFailingSocket {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            _buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            Poll::Ready(Err(io::Error::other("loopback write failed")))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
     #[tokio::test]
     async fn prefix_guard_replays_every_byte_across_chunk_boundaries() {
         for chunks in [
@@ -831,6 +969,51 @@ mod tests {
             assert_eq!(&replayed, b"\x16\x03\x01\x00payload");
             writer.await.unwrap();
         }
+    }
+
+    #[tokio::test]
+    async fn stalled_prefix_is_a_transport_failure_not_an_unknown_prefix() {
+        let (_writer, reader) = tokio::io::duplex(64);
+        let result = guard_tls_prefix(PrefixIo::new(reader), Duration::from_millis(10)).await;
+        assert!(
+            matches!(result, Err(RelayTunnelFailure::RelayTunnelUnreachable)),
+            "a stalled prefix must classify as a transport failure"
+        );
+    }
+
+    #[tokio::test]
+    async fn stalled_prefix_does_not_emit_unknown_prefix() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let relay_origin = format!("http://{}", listener.local_addr().unwrap());
+        let relay = tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            let mut tunnel = tokio_tungstenite::accept_async(tcp).await.unwrap();
+            let _ = tunnel.next().await;
+        });
+        let events = Arc::new(CapturedEvents(Mutex::new(Vec::new())));
+        let client = test_client(relay_origin, events.clone());
+        client.handle_tunnel("stalled-prefix".into()).await;
+        relay.await.unwrap();
+        let events = events
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, RelayEvent::TunnelUnknownPrefix)),
+            "a stalled prefix must not emit TunnelUnknownPrefix"
+        );
+        assert!(
+            events.iter().any(|event| matches!(
+                event,
+                RelayEvent::Health(RelayHealth {
+                    last_failure: Some(RelayTunnelFailure::RelayTunnelUnreachable),
+                    ..
+                })
+            )),
+            "a stalled prefix must emit a transport failure through health"
+        );
     }
 
     #[tokio::test]
@@ -898,6 +1081,43 @@ mod tests {
         );
         assert!(pipe.await.unwrap().is_ok());
         app_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn post_connect_socket_error_is_not_listener_unreachable() {
+        let fixture = tls_fixture();
+        let (mobile_io, home_io) = tokio::io::duplex(2 * 1024 * 1024);
+        let home = tokio::spawn(HomeConnection::accept(home_io, home_config(&fixture)));
+        let client_config = crate::tls::mtls_config(
+            &sha256(fixture.ca.as_ref())[..16],
+            fixture.client_chain,
+            fixture.client_key,
+        )
+        .unwrap();
+        let mut mobile = TlsConnector::from(Arc::new(client_config))
+            .connect(ServerName::try_from("spl.local").unwrap(), mobile_io)
+            .await
+            .unwrap();
+        let mut home = home.await.unwrap().unwrap();
+        mobile
+            .write_all(
+                &Frame::new(1, FLAG_OPEN | FLAG_DATA, b"hello".to_vec())
+                    .encode()
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        mobile.flush().await.unwrap();
+        let stream = tokio::time::timeout(Duration::from_secs(1), home.accept_stream())
+            .await
+            .expect("mux driver must accept the opened stream")
+            .unwrap();
+        let mut socket = WriteFailingSocket;
+        assert_eq!(
+            pump_stream(stream, &mut socket).await,
+            Err(RelayTunnelFailure::RelayTunnelUnreachable),
+            "a post-connect socket error must not claim the listener was unreachable"
+        );
     }
 
     #[tokio::test]
@@ -1020,6 +1240,7 @@ mod tests {
             RelayEvent::Connecting,
             RelayEvent::Connected,
             RelayEvent::Disconnected,
+            RelayEvent::ConfigurationFailure,
             RelayEvent::AdmissionSaturated { count: 1 },
             RelayEvent::TunnelUnknownPrefix,
             RelayEvent::TunnelPaired {
@@ -1072,6 +1293,164 @@ mod tests {
             base_after_connection(Duration::from_secs(8), Duration::from_mins(1)),
             Duration::ZERO,
             "60 seconds of stable establishment resets backoff"
+        );
+    }
+
+    #[tokio::test]
+    async fn stop_aborts_a_pump_registered_after_its_snapshot() {
+        struct NotifyOnDrop(Option<tokio::sync::oneshot::Sender<()>>);
+
+        impl Drop for NotifyOnDrop {
+            fn drop(&mut self) {
+                if let Some(sender) = self.0.take() {
+                    let _ = sender.send(());
+                }
+            }
+        }
+
+        let events = Arc::new(CapturedEvents(Mutex::new(Vec::new())));
+        let client = test_client("http://127.0.0.1:1".into(), events);
+        client.stop().await;
+        let (started_sender, started_receiver) = tokio::sync::oneshot::channel();
+        let (stopped_sender, stopped_receiver) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(async move {
+            let _notify = NotifyOnDrop(Some(stopped_sender));
+            started_sender.send(()).unwrap();
+            pending::<()>().await;
+        });
+        started_receiver
+            .await
+            .expect("test task must reach delayed registration");
+        client.track_tunnel_task(task);
+        tokio::time::timeout(Duration::from_secs(1), stopped_receiver)
+            .await
+            .expect("a pump registered after stop must be aborted")
+            .expect("aborted pump must run its cancellation cleanup");
+    }
+
+    #[tokio::test]
+    async fn invalid_relay_origin_is_terminal_and_emitted() {
+        let events = Arc::new(CapturedEvents(Mutex::new(Vec::new())));
+        let client = test_client("ftp://invalid-relay".into(), events.clone());
+        let result = tokio::time::timeout(Duration::from_millis(100), client.run())
+            .await
+            .expect("invalid relay origin must not enter reconnect backoff");
+        assert!(matches!(
+            result,
+            Err(TransportError::Relay(RelayError::HomeRelayConfiguration))
+        ));
+        assert!(
+            events
+                .0
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .iter()
+                .any(|event| matches!(event, RelayEvent::ConfigurationFailure)),
+            "terminal configuration failure must be emitted through the event port"
+        );
+    }
+
+    #[tokio::test]
+    async fn normal_listen_eof_ends_run_without_backoff() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let relay_origin = format!("http://{}", listener.local_addr().unwrap());
+        let relay = tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            let mut listen = tokio_tungstenite::accept_async(tcp).await.unwrap();
+            listen.send(Message::Close(None)).await.unwrap();
+        });
+        let events = Arc::new(CapturedEvents(Mutex::new(Vec::new())));
+        let client = test_client(relay_origin, events);
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), client.run())
+                .await
+                .expect("normal listen EOF must not wait for reconnect backoff")
+                .is_ok()
+        );
+        relay.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn listen_failure_publishes_reconnecting_health() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let relay_origin = format!("http://{}", listener.local_addr().unwrap());
+        let relay = tokio::spawn(async move {
+            let (mut tcp, _) = listener.accept().await.unwrap();
+            let mut request = [0_u8; 1024];
+            let _ = tcp.read(&mut request).await.unwrap();
+            tcp.write_all(
+                b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            )
+            .await
+            .unwrap();
+        });
+        let events = Arc::new(CapturedEvents(Mutex::new(Vec::new())));
+        let client = test_client(relay_origin, events.clone());
+        let running = tokio::spawn({
+            let client = client.clone();
+            async move { client.run().await }
+        });
+        relay.await.unwrap();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if health_snapshots(&events)
+                    .iter()
+                    .any(|health| health.state() == RelayHealthState::Reconnecting)
+                {
+                    return;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("listen loss must publish reconnecting health before backoff");
+        running.abort();
+    }
+
+    #[tokio::test]
+    async fn health_records_real_ordered_timestamps() {
+        let events = Arc::new(CapturedEvents(Mutex::new(Vec::new())));
+        let client = test_client("http://127.0.0.1:1".into(), events.clone());
+        client.record_failure(RelayTunnelFailure::RelayTunnelUnreachable);
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        client.record_success();
+        let health = health_snapshots(&events)
+            .pop()
+            .expect("health changes must be emitted");
+        let failure_at = health
+            .last_failure_at_ms()
+            .expect("failure timestamp must be recorded");
+        let success_at = health
+            .last_successful_tunnel_at_ms()
+            .expect("success timestamp must be recorded");
+        assert_ne!(
+            failure_at, 0,
+            "failure timestamp must be a real clock value"
+        );
+        assert_ne!(
+            success_at, 0,
+            "success timestamp must be a real clock value"
+        );
+        assert!(
+            success_at >= failure_at,
+            "success timestamp must not precede the recorded failure"
+        );
+    }
+
+    #[test]
+    fn saturation_immediately_updates_owner_visible_health() {
+        let events = Arc::new(CapturedEvents(Mutex::new(Vec::new())));
+        let client = test_client("http://127.0.0.1:1".into(), events.clone());
+        assert!(client.inner.admission.acquire());
+        assert!(!client.inner.admission.acquire());
+        client.record_saturation(client.inner.admission.saturated());
+        assert_eq!(
+            health_snapshots(&events)
+                .last()
+                .expect("saturation must emit a health snapshot")
+                .admission_saturated_count(),
+            1,
+            "saturation must reach owner-visible health without another failure"
         );
     }
 }

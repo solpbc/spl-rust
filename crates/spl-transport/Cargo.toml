@@ -1,6 +1,6 @@
 [package]
 name = "spl-transport"
-description = "SPL client transport: CA-fingerprint-pinned mutual TLS over a direct LAN dial or a WebSocket relay, the mux carrier, and the local loopback proxy. Drives spl-core's pure wire over rustls; cross-platform and host-testable."
+description = "SPL client transport: direct and relay dialing, including home-side relay attachment, TLS, mux carriage, and loopback proxying over rustls."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

@@ -48,7 +48,7 @@ pub fn listen_url(relay_origin: &str) -> Result<String, DialUrlError> {
 
 /// Construct the home tunnel-attachment WebSocket URL.
 ///
-/// Protocol: `.proto-ref/session.md`, lines 153-173. Authentication is carried
+/// Protocol: `.proto-ref/session.md`, lines 88-102. Authentication is carried
 /// only in the WebSocket `Authorization` header, never in this URL.
 ///
 /// # Errors

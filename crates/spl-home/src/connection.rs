@@ -47,6 +47,7 @@ enum DriverCommand {
     Consumed { stream_id: u32, bytes: usize },
     Close { stream_id: u32 },
     Cancel { stream_id: u32 },
+    Reset { stream_id: u32, reason: ResetReason },
     Wake,
     CloseConnection,
 }
@@ -180,6 +181,29 @@ impl HomeStream {
     /// Return this logical stream's peer-owned identifier.
     pub fn id(&self) -> u32 {
         self.id
+    }
+
+    /// Reset this stream with a classified local failure reason.
+    ///
+    /// Protocol: `.proto-ref/session.md`, lines 215-224 require a local socket
+    /// error to reset its tunnel stream with `INTERNAL_ERROR`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HomeError::Closed`] when the stream is already closed or its
+    /// driver has stopped.
+    pub fn reset(&mut self, reason: ResetReason) -> Result<(), HomeError> {
+        if self.stream_error().is_some() {
+            return Err(HomeError::Closed);
+        }
+        self.commands
+            .send(DriverCommand::Reset {
+                stream_id: self.id,
+                reason,
+            })
+            .map_err(|_| HomeError::Closed)?;
+        self.write_shutdown = true;
+        Ok(())
     }
 
     fn new(
@@ -355,6 +379,10 @@ impl Drop for HomeStream {
     }
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "the driver keeps its state and command dispatch together to preserve ordering"
+)]
 async fn run_driver<S>(
     tls: tokio_rustls::server::TlsStream<S>,
     mut acceptor: MuxAcceptor,
@@ -417,6 +445,22 @@ async fn run_driver<S>(
                             &streams,
                         );
                         match acceptor.reset(stream_id, ResetReason::Cancel) {
+                            Ok(output) => {
+                                if !deliver_output(output, &mut streams, &accepts, &command_tx, &mut writer).await { break; }
+                            }
+                            Err(HomeError::Closed) => {}
+                            Err(_) => break,
+                        }
+                    }
+                    DriverCommand::Reset { stream_id, reason } => {
+                        discard_pending_stream(
+                            stream_id,
+                            &mut pending,
+                            &mut ready,
+                            &mut closing,
+                            &streams,
+                        );
+                        match acceptor.reset(stream_id, reason) {
                             Ok(output) => {
                                 if !deliver_output(output, &mut streams, &accepts, &command_tx, &mut writer).await { break; }
                             }
@@ -601,6 +645,7 @@ async fn deliver_output<W>(
 where
     W: AsyncWrite + Unpin,
 {
+    let mut wrote_frame = false;
     for frame in output.frames {
         let Ok(bytes) = frame.encode() else {
             return false;
@@ -608,6 +653,10 @@ where
         if writer.write_all(&bytes).await.is_err() {
             return false;
         }
+        wrote_frame = true;
+    }
+    if wrote_frame && writer.flush().await.is_err() {
+        return false;
     }
     for event in output.events {
         match event {
@@ -939,5 +988,31 @@ mod tests {
         let mut acceptor = acceptor_with_streams(&[7]);
         let output = acceptor.reset(7, ResetReason::Cancel).unwrap();
         assert_eq!(output.frames, vec![Frame::reset(7, RESET_CANCEL)]);
+    }
+
+    #[test]
+    #[expect(
+        clippy::panic,
+        reason = "the test needs a precise command-shape failure"
+    )]
+    fn explicit_internal_reset_encodes_internal_error_not_cancel() {
+        let (commands, mut receiver) = mpsc::unbounded_channel();
+        let (_, signals) = mpsc::unbounded_channel();
+        let state = Arc::new(StreamStatus::new());
+        let mut stream = HomeStream::new(1, signals, commands, state);
+        stream.reset(ResetReason::InternalError).unwrap();
+        let DriverCommand::Reset { stream_id, reason } = receiver.try_recv().unwrap() else {
+            panic!("explicit reset must send a reset command");
+        };
+        let mut acceptor = acceptor_with_streams(&[stream_id]);
+        let output = acceptor.reset(stream_id, reason).unwrap();
+        assert_eq!(
+            output.frames,
+            [Frame::reset(1, spl_core::frame::RESET_INTERNAL_ERROR)]
+        );
+        assert_ne!(
+            output.frames,
+            [Frame::reset(1, spl_core::frame::RESET_CANCEL)]
+        );
     }
 }

@@ -34,6 +34,7 @@ expect_used = "warn"
 
 [workspace.dependencies]
 spl-core = { path = "crates/spl-core", version = "0.1.0" }
+spl-home = { path = "crates/spl-home", version = "0.1.0" }
 # Crypto/transport pins mirror the configuration the shipping Windows client
 # already runs: the `ring` provider with default features off. This is a
 # correctness-and-review-surface choice first (one audited provider across every

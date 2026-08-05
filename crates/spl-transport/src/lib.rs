@@ -66,6 +66,7 @@
 pub mod client;
 pub mod connection;
 pub mod credential;
+pub mod home_relay;
 pub mod journal_bridge;
 mod journal_bridge_carrier;
 pub mod pairing;
@@ -103,6 +104,12 @@ pub enum RelayError {
     UpgradeRejected,
     /// Inner-handshake or first-byte timeout; retryable.
     Stalled,
+    /// A home listen WebSocket could not be established or remained open.
+    HomeListenConnection,
+    /// The configured home relay origin cannot form a WebSocket URL.
+    HomeRelayConfiguration,
+    /// A home tunnel WebSocket was rejected with this HTTP status.
+    HomeTunnelRejected(u16),
 }
 
 impl fmt::Display for RelayError {
@@ -119,6 +126,9 @@ impl fmt::Display for RelayError {
             Self::Abnormal => "abnormal close",
             Self::UpgradeRejected => "upgrade rejected",
             Self::Stalled => "stalled",
+            Self::HomeListenConnection => "home listen connection failed",
+            Self::HomeRelayConfiguration => "invalid home relay configuration",
+            Self::HomeTunnelRejected(_) => "home tunnel rejected",
         };
         formatter.write_str(message)
     }
@@ -229,6 +239,11 @@ pub fn transport_error_code(error: &TransportError) -> String {
             RelayError::Abnormal => "relay_abnormal",
             RelayError::UpgradeRejected => "relay_upgrade_rejected",
             RelayError::Stalled => "relay_stalled",
+            RelayError::HomeListenConnection => "relay_home_listen_connection",
+            RelayError::HomeRelayConfiguration => "relay_home_configuration",
+            RelayError::HomeTunnelRejected(status) => {
+                return format!("relay_home_tunnel_http_{status}");
+            }
         }
         .to_string(),
         TransportError::RelayControlRejected { endpoint, status } => {
@@ -299,6 +314,18 @@ mod tests {
                 "relay_upgrade_rejected",
             ),
             (TransportError::Relay(RelayError::Stalled), "relay_stalled"),
+            (
+                TransportError::Relay(RelayError::HomeListenConnection),
+                "relay_home_listen_connection",
+            ),
+            (
+                TransportError::Relay(RelayError::HomeRelayConfiguration),
+                "relay_home_configuration",
+            ),
+            (
+                TransportError::Relay(RelayError::HomeTunnelRejected(503)),
+                "relay_home_tunnel_http_503",
+            ),
             (
                 TransportError::RelayControlRejected {
                     endpoint: RelayControlEndpoint::EnrollDevice,

@@ -24,26 +24,35 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use futures_util::{SinkExt, StreamExt};
-use rcgen::{CertificateParams, KeyPair, PKCS_ECDSA_P256_SHA256};
-use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
+use rcgen::{
+    BasicConstraints, CertificateParams, ExtendedKeyUsagePurpose, IsCa, KeyPair, KeyUsagePurpose,
+    PKCS_ECDSA_P256_SHA256,
+};
+use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName};
+use rustls::server::danger::ClientCertVerifier;
 use rustls::{ClientConfig, ServerConfig};
 use serde_json::json;
 use spl_core::bridge::BridgeNames;
 use spl_core::frame::{
-    FLAG_CLOSE, FLAG_DATA, FLAG_RESET, FLAG_WINDOW, Frame, FrameDecoder, RESET_FLOW_CONTROL_ERROR,
+    FLAG_CLOSE, FLAG_DATA, FLAG_OPEN, FLAG_RESET, FLAG_WINDOW, Frame, FrameDecoder,
+    RESET_FLOW_CONTROL_ERROR,
 };
 use spl_core::http::HttpResponse;
 use spl_core::mux::INITIAL_WINDOW;
+use spl_home::{HomeConfig, MuxLimits};
 use spl_transport::client::{DialedCarrier, TokenPersistHook, TransportClient};
 use spl_transport::credential::{Credential, EndpointAddr};
+use spl_transport::home_relay::{
+    HomeRelayClient, HomeRelayClientConfig, RelayEvent, RelayEventSink, RelayJitter, ServiceToken,
+};
 use spl_transport::journal_bridge::{self, BridgePolicy, CarrierOpener, JournalBridgeConfig};
 use spl_transport::relay::{dial_relay_ws, request_once_over_ws, request_once_relay};
-use spl_transport::tls::pairing_config;
+use spl_transport::tls::{mtls_config, pairing_config};
 use spl_transport::{RelayError, TransportError, transport_error_code};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, DuplexStream};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::task::JoinHandle;
-use tokio_rustls::TlsAcceptor;
+use tokio_rustls::{TlsAcceptor, TlsConnector};
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::handshake::server::{ErrorResponse, Request, Response};
 use tokio_tungstenite::tungstenite::protocol::CloseFrame;
@@ -74,6 +83,86 @@ fn server_config(cert: CertificateDer<'static>, key: PrivateKeyDer<'static>) -> 
         .with_no_client_auth()
         .with_single_cert(vec![cert], key)
         .unwrap()
+}
+
+struct HomeTlsFixture {
+    ca: CertificateDer<'static>,
+    server_chain: Vec<CertificateDer<'static>>,
+    server_key: PrivateKeyDer<'static>,
+    client_chain: Vec<CertificateDer<'static>>,
+    client_key: PrivateKeyDer<'static>,
+}
+
+fn home_tls_fixture() -> HomeTlsFixture {
+    let ca_key = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).unwrap();
+    let mut ca_params = CertificateParams::new(Vec::<String>::new()).unwrap();
+    ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+    ca_params.key_usages = vec![
+        KeyUsagePurpose::KeyCertSign,
+        KeyUsagePurpose::DigitalSignature,
+    ];
+    let ca = ca_params.self_signed(&ca_key).unwrap();
+    let ca_der = CertificateDer::from(ca.der().to_vec());
+
+    let server_key = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).unwrap();
+    let mut server_params = CertificateParams::new(vec!["spl.local".to_owned()]).unwrap();
+    server_params
+        .extended_key_usages
+        .push(ExtendedKeyUsagePurpose::ServerAuth);
+    let server = server_params.signed_by(&server_key, &ca, &ca_key).unwrap();
+
+    let client_key = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).unwrap();
+    let mut client_params = CertificateParams::new(vec!["relay-test".to_owned()]).unwrap();
+    client_params
+        .extended_key_usages
+        .push(ExtendedKeyUsagePurpose::ClientAuth);
+    let client = client_params.signed_by(&client_key, &ca, &ca_key).unwrap();
+    HomeTlsFixture {
+        ca: ca_der.clone(),
+        server_chain: vec![CertificateDer::from(server.der().to_vec()), ca_der.clone()],
+        server_key: PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(server_key.serialize_der())),
+        client_chain: vec![CertificateDer::from(client.der().to_vec()), ca_der],
+        client_key: PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(client_key.serialize_der())),
+    }
+}
+
+fn home_config(fixture: &HomeTlsFixture) -> HomeConfig {
+    let mut roots = rustls::RootCertStore::empty();
+    roots.add(fixture.ca.clone()).unwrap();
+    let verifier: Arc<dyn ClientCertVerifier> =
+        rustls::server::WebPkiClientVerifier::builder(Arc::new(roots))
+            .build()
+            .unwrap();
+    HomeConfig {
+        certificate_chain: fixture.server_chain.clone(),
+        private_key: fixture.server_key.clone_key(),
+        client_cert_verifier: verifier,
+        mux_limits: MuxLimits::default(),
+    }
+}
+
+struct FixedRelayJitter;
+
+impl RelayJitter for FixedRelayJitter {
+    fn sample(&self) -> f64 {
+        0.5
+    }
+}
+
+struct TestRelayEvents;
+
+impl RelayEventSink for TestRelayEvents {
+    fn emit(&self, _event: RelayEvent) {}
+}
+
+struct DisconnectEvents(AtomicUsize);
+
+impl RelayEventSink for DisconnectEvents {
+    fn emit(&self, event: RelayEvent) {
+        if matches!(event, RelayEvent::Disconnected) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
 }
 
 fn client_config(pin: &[u8]) -> Arc<ClientConfig> {
@@ -1094,6 +1183,201 @@ fn deterministic_bytes(len: usize) -> Vec<u8> {
     (0..len)
         .map(|i| ((i.wrapping_mul(31) + (i / 7)) % 251) as u8)
         .collect()
+}
+
+#[tokio::test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "the cycle assertion keeps the relay, mobile, and loopback milestones in one ordered test"
+)]
+#[expect(
+    clippy::result_large_err,
+    reason = "the WebSocket upgrade callbacks use tungstenite's required full rejection response type"
+)]
+async fn home_relay_attachment_forwards_bytes_and_observes_stream_close() {
+    let relay_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let relay_origin = format!("http://{}", relay_listener.local_addr().unwrap());
+    let app_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let app_port = app_listener.local_addr().unwrap().port();
+    let (app_received_sender, app_received_receiver) = tokio::sync::oneshot::channel();
+    let (close_sender, close_receiver) = tokio::sync::oneshot::channel();
+    let app = tokio::spawn(async move {
+        let (mut socket, _) = tokio::time::timeout(Duration::from_secs(1), app_listener.accept())
+            .await
+            .expect("relay pipe must dial the app")
+            .unwrap();
+        let mut request = [0_u8; 5];
+        socket.read_exact(&mut request).await.unwrap();
+        assert_eq!(request, *b"hello");
+        app_received_sender.send(()).unwrap();
+        socket.write_all(b"world").await.unwrap();
+        close_receiver
+            .await
+            .expect("test must request app teardown after observing reply");
+        socket.shutdown().await.unwrap();
+    });
+    let (mobile_sender, mobile_receiver) = tokio::sync::oneshot::channel();
+    let relay = tokio::spawn(async move {
+        let (listen_tcp, _) = relay_listener.accept().await.unwrap();
+        let mut listen = accept_hdr_async(listen_tcp, |request: &Request, response: Response| {
+            assert_eq!(request.uri().path(), "/session/listen");
+            assert_eq!(
+                request.headers().get("authorization").unwrap(),
+                "Bearer test-service-token"
+            );
+            Ok(response)
+        })
+        .await
+        .unwrap();
+        listen
+            .send(Message::Text(
+                r#"{"type":"incoming","tunnel_id":"test-tunnel"}"#.into(),
+            ))
+            .await
+            .unwrap();
+        let (tunnel_tcp, _) = relay_listener.accept().await.unwrap();
+        let tunnel = accept_hdr_async(tunnel_tcp, |request: &Request, response: Response| {
+            assert_eq!(request.uri().path(), "/tunnel/test-tunnel");
+            assert_eq!(
+                request.headers().get("authorization").unwrap(),
+                "Bearer test-service-token"
+            );
+            Ok(response)
+        })
+        .await
+        .unwrap();
+        let (relay_side, mobile_side) = tokio::io::duplex(2 * 1024 * 1024);
+        mobile_sender.send(mobile_side).unwrap();
+        let _ = pump_ws(tunnel, relay_side, None).await;
+        let _ = listen.next().await;
+    });
+    let fixture = home_tls_fixture();
+    let client = HomeRelayClient::new(HomeRelayClientConfig {
+        relay_origin,
+        service_token: ServiceToken::new("test-service-token".into()),
+        home_config: home_config(&fixture),
+        app_port,
+        dispatch_read_deadline: Duration::from_secs(1),
+        admission_ceiling: std::num::NonZeroUsize::new(1).unwrap(),
+        jitter: Arc::new(FixedRelayJitter),
+        events: Arc::new(TestRelayEvents),
+    });
+    let running = tokio::spawn({
+        let client = client.clone();
+        async move { client.run().await }
+    });
+    let mobile_io = tokio::time::timeout(Duration::from_secs(1), mobile_receiver)
+        .await
+        .expect("home must open the signaled tunnel")
+        .unwrap();
+    let config = mtls_config(
+        &spl_core::ca::sha256(fixture.ca.as_ref())[..16],
+        fixture.client_chain,
+        fixture.client_key,
+    )
+    .unwrap();
+    let mut mobile = TlsConnector::from(Arc::new(config))
+        .connect(ServerName::try_from("spl.local").unwrap(), mobile_io)
+        .await
+        .unwrap();
+    mobile
+        .write_all(
+            &Frame::new(1, FLAG_OPEN | FLAG_DATA, b"hello".to_vec())
+                .encode()
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    mobile.flush().await.unwrap();
+    tokio::time::timeout(Duration::from_secs(1), app_received_receiver)
+        .await
+        .expect("tunnel bytes must reach the loopback app")
+        .unwrap();
+    let mut decoder = FrameDecoder::new();
+    let mut buffer = [0_u8; 4096];
+    let mut saw_reply = false;
+    while !saw_reply {
+        let count = tokio::time::timeout(Duration::from_secs(1), mobile.read(&mut buffer))
+            .await
+            .expect("full relay cycle must not stall")
+            .unwrap();
+        decoder.feed(&buffer[..count]);
+        for frame in decoder.drain().unwrap() {
+            saw_reply |= frame.payload == b"world";
+        }
+    }
+    assert!(
+        saw_reply,
+        "mobile must receive loopback reply through relay"
+    );
+    close_sender.send(()).unwrap();
+    let saw_close = tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            let count = mobile.read(&mut buffer).await.unwrap();
+            decoder.feed(&buffer[..count]);
+            if decoder
+                .drain()
+                .unwrap()
+                .into_iter()
+                .any(|frame| frame.flags == FLAG_CLOSE)
+            {
+                return;
+            }
+        }
+    })
+    .await
+    .is_ok();
+    assert!(
+        saw_close,
+        "mobile must observe stream close after app teardown"
+    );
+    app.await.unwrap();
+    client.stop().await;
+    running.abort();
+    relay.abort();
+}
+
+#[tokio::test]
+async fn stopped_home_relay_ignores_incoming_without_opening_a_tunnel() {
+    let relay_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let relay_origin = format!("http://{}", relay_listener.local_addr().unwrap());
+    let relay = tokio::spawn(async move {
+        let (listen_tcp, _) = relay_listener.accept().await.unwrap();
+        let mut listen = accept_async(listen_tcp).await.unwrap();
+        listen
+            .send(Message::Text(
+                r#"{"type":"incoming","tunnel_id":"after-stop"}"#.into(),
+            ))
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_millis(150), relay_listener.accept())
+            .await
+            .is_err()
+    });
+    let fixture = home_tls_fixture();
+    let events = Arc::new(DisconnectEvents(AtomicUsize::new(0)));
+    let client = HomeRelayClient::new(HomeRelayClientConfig {
+        relay_origin,
+        service_token: ServiceToken::new("test-service-token".into()),
+        home_config: home_config(&fixture),
+        app_port: 1,
+        dispatch_read_deadline: Duration::from_secs(1),
+        admission_ceiling: std::num::NonZeroUsize::new(1).unwrap(),
+        jitter: Arc::new(FixedRelayJitter),
+        events: events.clone(),
+    });
+    client.stop().await;
+    assert_eq!(
+        events.0.load(Ordering::SeqCst),
+        1,
+        "stop must announce the typed disconnect transition"
+    );
+    let running = tokio::spawn({
+        let client = client.clone();
+        async move { client.run().await }
+    });
+    assert!(relay.await.unwrap(), "stop must prevent the tunnel dial");
+    running.abort();
 }
 
 #[expect(

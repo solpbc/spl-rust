@@ -33,6 +33,94 @@ pub fn pair_dial_url(relay_origin: &str) -> Result<String, DialUrlError> {
     Ok(format!("{}/session/pair-dial", ws_origin(relay_origin)?))
 }
 
+/// Construct the home relay-listen WebSocket URL.
+///
+/// Protocol: `.proto-ref/session.md`, lines 23-45. Authentication is carried
+/// only in the WebSocket `Authorization` header, never in this URL.
+///
+/// # Errors
+///
+/// Returns [`DialUrlError::UnsupportedScheme`] when `relay_origin` is not an
+/// HTTP or HTTPS origin.
+pub fn listen_url(relay_origin: &str) -> Result<String, DialUrlError> {
+    Ok(format!("{}/session/listen", ws_origin(relay_origin)?))
+}
+
+/// Construct the home tunnel-attachment WebSocket URL.
+///
+/// Protocol: `.proto-ref/session.md`, lines 153-173. Authentication is carried
+/// only in the WebSocket `Authorization` header, never in this URL.
+///
+/// # Errors
+///
+/// Returns [`DialUrlError::UnsupportedScheme`] when `relay_origin` is not an
+/// HTTP or HTTPS origin.
+pub fn tunnel_url(relay_origin: &str, tunnel_id: &str) -> Result<String, DialUrlError> {
+    Ok(format!(
+        "{}/tunnel/{}",
+        ws_origin(relay_origin)?,
+        percent_encode(tunnel_id)
+    ))
+}
+
+/// A parsed listen control message.
+#[derive(Clone, PartialEq, Eq)]
+pub enum ListenControl {
+    /// A relay-offered tunnel identifier.
+    Incoming {
+        /// Relay-assigned opaque tunnel identifier.
+        tunnel_id: String,
+    },
+    /// A well-formed future control type that v1 ignores.
+    Ignore,
+    /// Malformed or incomplete control text.
+    Invalid,
+}
+
+impl std::fmt::Debug for ListenControl {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Incoming { tunnel_id: _ } => formatter
+                .debug_struct("Incoming")
+                .field("tunnel_id", &"[REDACTED]")
+                .finish(),
+            Self::Ignore => formatter.write_str("Ignore"),
+            Self::Invalid => formatter.write_str("Invalid"),
+        }
+    }
+}
+
+/// Parse a text-frame listen control message.
+///
+/// Protocol: `.proto-ref/session.md`, lines 153-161. Callers must pass only
+/// WebSocket text frames; malformed controls are nonfatal and unknown types are
+/// ignored.
+pub fn parse_listen_control(text: &str) -> ListenControl {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(text) else {
+        return ListenControl::Invalid;
+    };
+    let Some(object) = value.as_object() else {
+        return ListenControl::Invalid;
+    };
+    match object.get("type").and_then(serde_json::Value::as_str) {
+        Some("incoming") => {}
+        Some(_) => return ListenControl::Ignore,
+        None => return ListenControl::Invalid,
+    }
+    let tunnel_id = match object.get("tunnel_id") {
+        Some(serde_json::Value::String(value)) if !value.is_empty() => Some(value.clone()),
+        Some(serde_json::Value::Number(value)) => value
+            .as_i64()
+            .map(|value| value.to_string())
+            .or_else(|| value.as_u64().map(|value| value.to_string())),
+        _ => None,
+    };
+    match tunnel_id {
+        Some(tunnel_id) => ListenControl::Incoming { tunnel_id },
+        None => ListenControl::Invalid,
+    }
+}
+
 fn relay_url(relay_origin: &str, path: &str, instance_id: &str) -> Result<String, DialUrlError> {
     let origin = ws_origin(relay_origin)?;
     Ok(format!(

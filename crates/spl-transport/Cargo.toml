@@ -12,6 +12,7 @@ workspace = true
 
 [dependencies]
 spl-core = { workspace = true }
+spl-home = { workspace = true }
 base64 = { workspace = true }
 futures-util = { workspace = true }
 rcgen = { workspace = true }

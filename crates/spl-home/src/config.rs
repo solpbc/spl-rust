@@ -81,6 +81,17 @@ pub struct HomeConfig {
     pub mux_limits: MuxLimits,
 }
 
+impl Clone for HomeConfig {
+    fn clone(&self) -> Self {
+        Self {
+            certificate_chain: self.certificate_chain.clone(),
+            private_key: self.private_key.clone_key(),
+            client_cert_verifier: self.client_cert_verifier.clone(),
+            mux_limits: self.mux_limits,
+        }
+    }
+}
+
 impl HomeConfig {
     /// Build a TLS-1.3-only server configuration using the caller's verifier.
     ///

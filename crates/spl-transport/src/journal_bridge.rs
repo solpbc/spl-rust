@@ -83,13 +83,15 @@ pub struct JournalBridgeStatus {
     pub contacted: bool,
     /// Whether the current persistent carrier is live.
     pub carrier_live: bool,
-    /// Terminal reason latched from the persistent carrier, if any.
+    /// Terminal reason observed while dialing or using the persistent carrier,
+    /// if any; latched once and never cleared.
     pub terminal_reason: Option<JournalBridgeTerminalReason>,
     /// Accepted connection tasks that have not completed.
     pub active_requests: usize,
 }
 
-/// Terminal condition observed by a journal bridge carrier.
+/// Terminal condition observed while dialing or using a journal bridge carrier;
+/// latched once and never cleared.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum JournalBridgeTerminalReason {
     /// The peer rejected the TLS session with access denied.

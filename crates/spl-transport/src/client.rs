@@ -148,7 +148,9 @@ impl TransportClient {
     /// A newly paired fingerprint can take a moment to reach every journal
     /// worker because the listener fans out across `SO_REUSEPORT` processes.
     /// Direct connection and handshake failures therefore retain the bounded
-    /// linear retry before relay fallback.
+    /// linear retry before relay fallback, except a received TLS access-denied
+    /// alert, which returns immediately without another endpoint, retry, or
+    /// relay fallback.
     ///
     /// # Errors
     ///

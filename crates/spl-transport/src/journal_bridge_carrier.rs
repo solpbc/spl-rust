@@ -323,6 +323,8 @@ pub(crate) struct MuxCarrier {
     slot: Mutex<Option<Arc<CarrierHandle>>>,
     keepalive: KeepaliveConfig,
     status: SharedStatus,
+    #[cfg(test)]
+    redial_hook: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 
 impl MuxCarrier {
@@ -340,6 +342,8 @@ impl MuxCarrier {
             slot: Mutex::new(None),
             keepalive,
             status,
+            #[cfg(test)]
+            redial_hook: None,
         }
     }
 
@@ -423,6 +427,15 @@ impl MuxCarrier {
             mark_carrier_dead(&self.status, &handle.status_identity);
         }
 
+        #[cfg(test)]
+        if let Some(redial_hook) = &self.redial_hook {
+            redial_hook();
+        }
+
+        if lock_status(&self.status).snapshot.terminal_reason.is_some() {
+            return Err(TransportError::TlsAccessDenied);
+        }
+
         let dialed = match self.opener.dial_carrier().await {
             Ok(dialed) => dialed,
             Err(error) => {
@@ -442,6 +455,10 @@ impl MuxCarrier {
         let alive = Arc::new(AtomicBool::new(true));
         let status_identity = Arc::new(());
         let mut status = lock_status(&self.status);
+        if status.snapshot.terminal_reason.is_some() {
+            drop(status);
+            return Err(TransportError::TlsAccessDenied);
+        }
         let writer = tokio::spawn(writer_task(
             write,
             writer_rx,
@@ -1667,6 +1684,90 @@ mod tests {
         }
     }
 
+    struct DropFlagDuplexStream {
+        inner: DuplexStream,
+        dropped: Arc<AtomicBool>,
+    }
+
+    impl AsyncRead for DropFlagDuplexStream {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            Pin::new(&mut self.inner).poll_read(cx, buf)
+        }
+    }
+
+    impl AsyncWrite for DropFlagDuplexStream {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            Pin::new(&mut self.inner).poll_write(cx, buf)
+        }
+
+        fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Pin::new(&mut self.inner).poll_flush(cx)
+        }
+
+        fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Pin::new(&mut self.inner).poll_shutdown(cx)
+        }
+    }
+
+    impl Drop for DropFlagDuplexStream {
+        fn drop(&mut self) {
+            self.dropped.store(true, Ordering::SeqCst);
+        }
+    }
+
+    struct LatchingDuplexOpener {
+        status: SharedStatus,
+        dials: Arc<AtomicUsize>,
+        dropped: Arc<AtomicBool>,
+        peer: Arc<std::sync::Mutex<Option<DuplexStream>>>,
+    }
+
+    impl CarrierOpener for LatchingDuplexOpener {
+        fn proxy_headers(
+            &self,
+            upstream_headers: &[(String, String)],
+        ) -> Result<Vec<(String, String)>, TransportError> {
+            Ok(upstream_headers.to_vec())
+        }
+
+        fn dial_carrier(
+            &self,
+        ) -> Pin<
+            Box<
+                dyn Future<Output = Result<crate::client::DialedCarrier, TransportError>>
+                    + Send
+                    + '_,
+            >,
+        > {
+            let status = self.status.clone();
+            let dials = self.dials.clone();
+            let dropped = self.dropped.clone();
+            let peer = self.peer.clone();
+            Box::pin(async move {
+                dials.fetch_add(1, Ordering::SeqCst);
+                let (client, server) = tokio::io::duplex(1024);
+                *peer.lock().unwrap() = Some(server);
+                let stream = DropFlagDuplexStream {
+                    inner: client,
+                    dropped,
+                };
+                latch_tls_access_denied(&status);
+                Ok(crate::client::DialedCarrier::from_test_parts(
+                    Box::new(stream),
+                    CarrierKind::Lan,
+                ))
+            })
+        }
+    }
+
     #[derive(Clone)]
     struct TestCarrier {
         commands: mpsc::Sender<CarrierCommand>,
@@ -1854,6 +1955,7 @@ mod tests {
             slot: Mutex::new(Some(handle)),
             keepalive: KeepaliveConfig::default(),
             status: status.clone(),
+            redial_hook: None,
         };
         latch_tls_access_denied(&status);
 
@@ -1862,6 +1964,99 @@ mod tests {
             Err(TransportError::TlsAccessDenied)
         ));
         assert_eq!(dials.load(Ordering::SeqCst), 0);
+    }
+
+    // Falsified by removing the post-dead-carrier terminal check: the hook latches access denied
+    // before dialing, so this call reaches the opener instead of returning the terminal error.
+    #[tokio::test]
+    async fn terminal_latch_after_dead_carrier_stops_redial() {
+        let status = crate::journal_bridge::new_status();
+        let status_identity = Arc::new(());
+        publish_test_carrier(&status, &status_identity);
+        let (commands, _commands_rx) = mpsc::channel(COMMAND_QUEUE);
+        let (body_ready, _body_ready_rx) = mpsc::unbounded_channel();
+        let handle = Arc::new(CarrierHandle {
+            commands,
+            body_ready,
+            alive: Arc::new(AtomicBool::new(false)),
+            status_identity,
+            tasks: Mutex::new(None),
+        });
+        let dials = Arc::new(AtomicUsize::new(0));
+        let hook_calls = Arc::new(AtomicUsize::new(0));
+        let hook_status = status.clone();
+        let hook_calls_for_hook = hook_calls.clone();
+        let carrier = MuxCarrier {
+            opener: Arc::new(CountingFailOpener {
+                dials: dials.clone(),
+            }),
+            slot: Mutex::new(Some(handle)),
+            keepalive: KeepaliveConfig::default(),
+            status: status.clone(),
+            redial_hook: Some(Arc::new(move || {
+                hook_calls_for_hook.fetch_add(1, Ordering::SeqCst);
+                latch_tls_access_denied(&hook_status);
+            })),
+        };
+
+        assert!(matches!(
+            carrier.get_or_dial().await,
+            Err(TransportError::TlsAccessDenied)
+        ));
+        assert_eq!(hook_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(dials.load(Ordering::SeqCst), 0);
+        let record = lock_status(&status);
+        assert_eq!(
+            record.snapshot.terminal_reason,
+            Some(JournalBridgeTerminalReason::TlsAccessDenied)
+        );
+        assert!(!record.snapshot.carrier_live);
+    }
+
+    // Falsified by omitting the terminal recheck under the publish guard: a dial that latches
+    // access denied still publishes its successor instead of dropping it before this call returns.
+    #[tokio::test]
+    async fn terminal_latch_during_dial_drops_successor_before_publish() {
+        let status = crate::journal_bridge::new_status();
+        let dials = Arc::new(AtomicUsize::new(0));
+        let dropped = Arc::new(AtomicBool::new(false));
+        let peer = Arc::new(std::sync::Mutex::new(None));
+        let carrier = MuxCarrier {
+            opener: Arc::new(LatchingDuplexOpener {
+                status: status.clone(),
+                dials: dials.clone(),
+                dropped: dropped.clone(),
+                peer: peer.clone(),
+            }),
+            slot: Mutex::new(None),
+            keepalive: KeepaliveConfig::default(),
+            status: status.clone(),
+            redial_hook: None,
+        };
+
+        assert!(matches!(
+            carrier.get_or_dial().await,
+            Err(TransportError::TlsAccessDenied)
+        ));
+        assert_eq!(dials.load(Ordering::SeqCst), 1);
+        assert!(dropped.load(Ordering::SeqCst));
+        assert!(peer.lock().unwrap().is_some());
+        assert!(carrier.slot.lock().await.is_none());
+        {
+            let record = lock_status(&status);
+            assert_eq!(
+                record.snapshot.terminal_reason,
+                Some(JournalBridgeTerminalReason::TlsAccessDenied)
+            );
+            assert!(record.current_carrier.is_none());
+            assert!(!record.snapshot.carrier_live);
+        }
+
+        assert!(matches!(
+            carrier.get_or_dial().await,
+            Err(TransportError::TlsAccessDenied)
+        ));
+        assert_eq!(dials.load(Ordering::SeqCst), 1);
     }
 
     async fn open_test_stream(carrier: &TestCarrier, target: &str, body: Vec<u8>) -> StreamRx {

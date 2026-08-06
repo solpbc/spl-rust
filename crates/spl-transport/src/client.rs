@@ -42,6 +42,11 @@ impl DialedCarrier {
     pub(crate) fn into_parts(self) -> (Box<dyn CarrierIo>, CarrierKind) {
         (self.stream, self.kind)
     }
+
+    #[cfg(test)]
+    pub(crate) fn from_test_parts(stream: Box<dyn CarrierIo>, kind: CarrierKind) -> Self {
+        Self { stream, kind }
+    }
 }
 
 #[derive(Clone)]

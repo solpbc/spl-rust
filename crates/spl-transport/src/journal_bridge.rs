@@ -83,8 +83,17 @@ pub struct JournalBridgeStatus {
     pub contacted: bool,
     /// Whether the current persistent carrier is live.
     pub carrier_live: bool,
+    /// Terminal reason latched from the persistent carrier, if any.
+    pub terminal_reason: Option<JournalBridgeTerminalReason>,
     /// Accepted connection tasks that have not completed.
     pub active_requests: usize,
+}
+
+/// Terminal condition observed by a journal bridge carrier.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JournalBridgeTerminalReason {
+    /// The peer rejected the TLS session with access denied.
+    TlsAccessDenied,
 }
 
 pub(crate) type SharedStatus = Arc<Mutex<StatusRecord>>;
@@ -107,6 +116,7 @@ pub(crate) fn new_status() -> SharedStatus {
             listener_active: false,
             contacted: false,
             carrier_live: false,
+            terminal_reason: None,
             active_requests: 0,
         },
         current_carrier: None,
@@ -1495,6 +1505,7 @@ mod tests {
             listener_active: true,
             contacted: true,
             carrier_live: false,
+            terminal_reason: None,
             active_requests: 1,
         };
         assert!(local_response(&request("GET", "/other"), &status).is_none());

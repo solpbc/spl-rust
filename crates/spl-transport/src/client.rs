@@ -44,6 +44,7 @@ impl DialedCarrier {
     }
 }
 
+#[derive(Clone)]
 pub(crate) enum CarrierKind {
     Lan,
     Relay { termination: RelayTerminationHandle },
@@ -164,6 +165,9 @@ impl TransportClient {
                             stream: Box::new(stream),
                             kind: CarrierKind::Lan,
                         });
+                    }
+                    Err(TransportError::TlsAccessDenied) => {
+                        return Err(TransportError::TlsAccessDenied);
                     }
                     Err(error) => last_err = Some(error),
                 }
@@ -359,6 +363,95 @@ fn relay_fault_is_transient_err(error: &TransportError) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
+
+    use rcgen::{CertificateParams, KeyPair, PKCS_ECDSA_P256_SHA256};
+    use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+    use tokio::sync::oneshot;
+    use tokio_rustls::TlsAcceptor;
+
+    use crate::credential::EndpointAddr;
+
+    fn test_client(endpoints: Vec<EndpointAddr>) -> TransportClient {
+        TransportClient {
+            credential: Credential {
+                client_key_pem: String::new(),
+                client_cert_pem: String::new(),
+                ca_chain_pem: Vec::new(),
+                ca_fp_prefix: Vec::new(),
+                instance_id: "test-instance".into(),
+                home_label: "Test".into(),
+                endpoints,
+                home_attestation: None,
+                local_endpoints: None,
+                relay_origin: None,
+                device_token: None,
+                device_token_expires_at: None,
+            },
+            config: Arc::new(tls::trust_all_pairing_config().unwrap()),
+            device_token: None,
+            token_persist: None,
+        }
+    }
+
+    async fn scripted_alert_listener(
+        description: u8,
+    ) -> (EndpointAddr, tokio::task::JoinHandle<()>) {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let endpoint = EndpointAddr {
+            host: "127.0.0.1".into(),
+            port: listener.local_addr().unwrap().port(),
+        };
+        let task = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut header = [0u8; 5];
+            stream.read_exact(&mut header).await.unwrap();
+            let mut hello = vec![0u8; u16::from_be_bytes([header[3], header[4]]) as usize];
+            stream.read_exact(&mut hello).await.unwrap();
+            stream
+                .write_all(&[0x15, 0x03, 0x03, 0x00, 0x02, 0x02, description])
+                .await
+                .unwrap();
+            stream.flush().await.unwrap();
+        });
+        (endpoint, task)
+    }
+
+    async fn healthy_tls_listener() -> (EndpointAddr, oneshot::Receiver<()>) {
+        let key = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).unwrap();
+        let certificate = CertificateParams::new(vec!["spl.local".into()])
+            .unwrap()
+            .self_signed(&key)
+            .unwrap();
+        let config = rustls::ServerConfig::builder_with_provider(Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_no_client_auth()
+        .with_single_cert(
+            vec![CertificateDer::from(certificate.der().to_vec())],
+            PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key.serialize_der())),
+        )
+        .unwrap();
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let endpoint = EndpointAddr {
+            host: "127.0.0.1".into(),
+            port: listener.local_addr().unwrap().port(),
+        };
+        let (accepted_tx, accepted_rx) = oneshot::channel();
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            TlsAcceptor::from(Arc::new(config))
+                .accept(stream)
+                .await
+                .unwrap();
+            let _ = accepted_tx.send(());
+        });
+        (endpoint, accepted_rx)
+    }
 
     #[test]
     fn relay_fault_is_transient_truth_table() {
@@ -377,6 +470,54 @@ mod tests {
             RelayError::UpgradeRejected,
         ] {
             assert!(!relay_fault_is_transient(&err), "{err:?} should stop");
+        }
+    }
+
+    // Falsified by restoring the previous generic error assignment in the inner endpoint loop:
+    // the second listener accepts a connection, proving the terminal alert did not stop dialing.
+    #[tokio::test]
+    async fn access_denied_stops_before_later_direct_endpoint() {
+        let (first, first_task) = scripted_alert_listener(49).await;
+        let later = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let later_endpoint = EndpointAddr {
+            host: "127.0.0.1".into(),
+            port: later.local_addr().unwrap().port(),
+        };
+        let (later_accept_tx, mut later_accept_rx) = oneshot::channel();
+        let later_task = tokio::spawn(async move {
+            let (stream, _) = later.accept().await.unwrap();
+            drop(stream);
+            let _ = later_accept_tx.send(());
+        });
+        let client = test_client(vec![first, later_endpoint]);
+
+        assert!(matches!(
+            client.dial_carrier().await,
+            Err(TransportError::TlsAccessDenied)
+        ));
+        first_task.await.unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), &mut later_accept_rx)
+                .await
+                .is_err()
+        );
+        later_task.abort();
+    }
+
+    // Falsified by changing the classifier to treat every received alert as terminal: the healthy
+    // second endpoint is never reached. The pre-feature source has no classifier, so this test
+    // can only fail there at compile time; its behavioral falsification targets overbroad changes.
+    #[tokio::test]
+    async fn non_access_denied_alerts_continue_to_later_endpoint() {
+        for description in [46, 80, 200] {
+            let (first, first_task) = scripted_alert_listener(description).await;
+            let (second, accepted) = healthy_tls_listener().await;
+            let client = test_client(vec![first, second]);
+
+            let carrier = client.dial_carrier().await.unwrap();
+            drop(carrier);
+            first_task.await.unwrap();
+            accepted.await.unwrap();
         }
     }
 }

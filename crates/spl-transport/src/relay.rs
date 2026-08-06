@@ -35,7 +35,7 @@ use tokio_tungstenite::{
 
 use crate::connection::run_request_over_stream;
 use crate::tls::pinned_server_name;
-use crate::{RelayError, TransportError};
+use crate::{RelayError, TransportError, received_access_denied};
 
 /// Inner mTLS progress bound. This is not a presence-hold wait; a live relay
 /// path should produce the journal's TLS response well before this.
@@ -162,6 +162,11 @@ impl RelayTerminationHandle {
 
     fn record(&self, value: WsTermination) {
         record_termination(&self.0, value);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn record_close_for_test(&self, close_code: u16) {
+        self.record(WsTermination::Close(close_code));
     }
 }
 
@@ -442,18 +447,24 @@ pub(crate) async fn dial_relay_carrier(
     {
         Err(_) => return Err(TransportError::Relay(RelayError::Stalled)),
         Ok(Ok(tls)) => tls,
-        Ok(Err(e)) => {
-            if let Some(error) = termination.current_error() {
-                return Err(TransportError::Relay(error));
-            }
-            return Err(TransportError::Tls(format!("inner relay handshake: {e}")));
-        }
+        Ok(Err(error)) => return Err(inner_handshake_error(&termination, &error)),
     };
 
     Ok(RelayCarrier {
         stream: tls,
         termination,
     })
+}
+
+fn inner_handshake_error(
+    termination: &RelayTerminationHandle,
+    error: &io::Error,
+) -> TransportError {
+    if let Some(error) = termination.current_error() {
+        return TransportError::Relay(error);
+    }
+    received_access_denied(error)
+        .unwrap_or_else(|| TransportError::Tls(format!("inner relay handshake: {error}")))
 }
 
 async fn request_once_over_ws_inner(
@@ -581,5 +592,22 @@ mod tests {
             relay_error_from_pair_upgrade_status(401),
             RelayError::PairWindowClosed
         );
+    }
+
+    // Falsified by checking the TLS error before the recorded relay close: this assertion then
+    // receives TlsAccessDenied instead of the relay outcome that must retain precedence.
+    #[test]
+    fn recorded_relay_termination_precedes_inner_access_denied() {
+        let termination = RelayTerminationHandle::new();
+        termination.record_close_for_test(4401);
+        let error = io::Error::new(
+            io::ErrorKind::InvalidData,
+            rustls::Error::AlertReceived(rustls::AlertDescription::AccessDenied),
+        );
+
+        assert!(matches!(
+            inner_handshake_error(&termination, &error),
+            TransportError::Relay(RelayError::Unauthorized)
+        ));
     }
 }

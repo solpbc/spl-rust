@@ -26,8 +26,12 @@ use rcgen::{
     BasicConstraints, CertificateParams, CertificateSigningRequestParams, IsCa, KeyPair,
     KeyUsagePurpose, PKCS_ECDSA_P256_SHA256,
 };
-use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
-use rustls::{ClientConfig, ServerConfig};
+use rustls::client::danger::HandshakeSignatureValid;
+use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, UnixTime};
+use rustls::server::danger::{ClientCertVerified, ClientCertVerifier};
+use rustls::{
+    CertificateError, ClientConfig, DigitallySignedStruct, Error, ServerConfig, SignatureScheme,
+};
 use spl_core::bridge::{BridgeNames, RequestHeaderPolicy};
 use spl_core::frame::{
     FLAG_CLOSE, FLAG_DATA, FLAG_RESET, FLAG_WINDOW, Frame, FrameDecoder, RESET_CANCEL,
@@ -79,6 +83,64 @@ fn server_config(cert: CertificateDer<'static>, key: PrivateKeyDer<'static>) -> 
         .with_safe_default_protocol_versions()
         .unwrap()
         .with_no_client_auth()
+        .with_single_cert(vec![cert], key)
+        .unwrap()
+}
+
+#[derive(Debug)]
+struct RejectVerifier;
+
+impl ClientCertVerifier for RejectVerifier {
+    fn root_hint_subjects(&self) -> &[rustls::DistinguishedName] {
+        &[]
+    }
+
+    fn verify_client_cert(
+        &self,
+        _end_entity: &CertificateDer<'_>,
+        _intermediates: &[CertificateDer<'_>],
+        _now: UnixTime,
+    ) -> Result<ClientCertVerified, Error> {
+        Err(Error::InvalidCertificate(
+            CertificateError::ApplicationVerificationFailure,
+        ))
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        _message: &[u8],
+        _cert: &CertificateDer<'_>,
+        _dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, Error> {
+        Err(Error::InvalidCertificate(
+            CertificateError::ApplicationVerificationFailure,
+        ))
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        _message: &[u8],
+        _cert: &CertificateDer<'_>,
+        _dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, Error> {
+        Err(Error::InvalidCertificate(
+            CertificateError::ApplicationVerificationFailure,
+        ))
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        vec![SignatureScheme::ECDSA_NISTP256_SHA256]
+    }
+}
+
+fn rejecting_server_config(
+    cert: CertificateDer<'static>,
+    key: PrivateKeyDer<'static>,
+) -> ServerConfig {
+    ServerConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_client_cert_verifier(Arc::new(RejectVerifier))
         .with_single_cert(vec![cert], key)
         .unwrap()
 }
@@ -831,6 +893,57 @@ async fn raw_bridge_bytes(port: u16, request: &[u8]) -> Vec<u8> {
     let mut response = Vec::new();
     stream.read_to_end(&mut response).await.unwrap();
     response
+}
+
+// The coordinator latches before fanout closes the response stream, so reading this first 502
+// establishes that the terminal reason is already observable. Restoring generic read-error
+// conversion leaves no terminal reason and lets the second request reach this listener. This peer
+// uses real rustls TLS 1.3 client-auth rejection.
+#[tokio::test]
+async fn journal_bridge_latches_real_received_access_denied() {
+    let (cert, key) = self_signed();
+    let pin = spl_core::ca::sha256(cert.as_ref())[..16].to_vec();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let (second_accept_tx, mut second_accept_rx) = tokio::sync::oneshot::channel();
+    let server = tokio::spawn(async move {
+        let acceptor = TlsAcceptor::from(Arc::new(rejecting_server_config(cert, key)));
+        let (first, _) = listener.accept().await.unwrap();
+        assert!(acceptor.accept(first).await.is_err());
+        let (second, _) = listener.accept().await.unwrap();
+        drop(second);
+        let _ = second_accept_tx.send(());
+    });
+    let handle = start_bridge(transport_credential(pin, port)).await;
+    let capability = capability_from(&handle);
+    let cookie = Some(format!("{TEST_CAP_COOKIE_NAME}={capability}"));
+    let host = Some(loopback_host(handle.port()));
+
+    let first = raw_bridge_request(
+        handle.port(),
+        "GET",
+        "/healthz",
+        host.clone(),
+        cookie.clone(),
+        &[],
+        b"",
+    )
+    .await;
+    assert_eq!(response_status(&first), 502);
+    assert_eq!(
+        handle.status().terminal_reason,
+        Some(journal_bridge::JournalBridgeTerminalReason::TlsAccessDenied)
+    );
+
+    let second = raw_bridge_request(handle.port(), "GET", "/healthz", host, cookie, &[], b"").await;
+    assert_eq!(response_status(&second), 502);
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(100), &mut second_accept_rx)
+            .await
+            .is_err()
+    );
+    handle.shutdown_and_wait().await;
+    server.abort();
 }
 
 async fn partial_body_bridge_request(

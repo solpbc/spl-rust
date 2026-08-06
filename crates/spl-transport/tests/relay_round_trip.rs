@@ -905,6 +905,7 @@ enum CombinedWsMode {
     AlwaysUnauthorized,
     Close(u16),
     UpgradeReject(u16),
+    InnerAlert(u8),
 }
 
 struct CombinedRelayState {
@@ -1046,7 +1047,7 @@ async fn handle_combined_ws(tcp: TcpStream, state: Arc<CombinedRelayState>) -> i
         Err(_) => return Ok(()),
     };
     match mode {
-        CombinedWsMode::AcceptAny => {}
+        CombinedWsMode::AcceptAny | CombinedWsMode::InnerAlert(_) => {}
         CombinedWsMode::FreshOnly => {
             let expected = format!("Bearer {}", state.fresh_token);
             if *seen_auth.lock().unwrap() != expected {
@@ -1084,6 +1085,18 @@ async fn handle_combined_ws(tcp: TcpStream, state: Arc<CombinedRelayState>) -> i
     tokio::spawn(async move {
         let _ = pump_ws(ws, relay_side, None).await;
     });
+    if let CombinedWsMode::InnerAlert(description) = mode {
+        let mut server_side = server_side;
+        let mut header = [0u8; 5];
+        server_side.read_exact(&mut header).await?;
+        let mut hello = vec![0u8; u16::from_be_bytes([header[3], header[4]]) as usize];
+        server_side.read_exact(&mut hello).await?;
+        server_side
+            .write_all(&[0x15, 0x03, 0x03, 0x00, 0x02, 0x02, description])
+            .await?;
+        server_side.flush().await?;
+        return Ok(());
+    }
     let request = serve_stream_response(
         server_side,
         state.acceptor.clone(),
@@ -1756,6 +1769,42 @@ async fn relay_fallbacks_after_lan_unreachable() {
         assert!(request_text.starts_with("POST /app/observer/ingest/event HTTP/1.1\r\n"));
     }
     handle.shutdown_and_wait().await;
+    relay.abort();
+}
+
+// Falsified by restoring generic inner-handshake formatting: this result becomes Tls(_) rather
+// than the terminal variant even though the relay delivers a real TLS access-denied alert.
+#[tokio::test]
+async fn relay_inner_access_denied_is_terminal() {
+    let (pin, acceptor) = tls_pair_with_pin();
+    let now = epoch_secs();
+    let token = mint_jwt(now, now + 10_000);
+    let relay = spawn_combined_relay(acceptor, CombinedWsMode::InnerAlert(49), token.clone()).await;
+    let client = transport_client(relay_credential(pin, 9, relay.origin.clone(), token), None);
+
+    assert!(matches!(
+        Box::pin(client.dial_carrier()).await,
+        Err(TransportError::TlsAccessDenied)
+    ));
+    assert_eq!(relay.state.ws_dials.load(Ordering::SeqCst), 1);
+    relay.abort();
+}
+
+// Falsified by broadening the inner classifier to every alert description: this result becomes
+// TlsAccessDenied instead of preserving the existing generic TLS error for description 46.
+#[tokio::test]
+async fn relay_inner_non_access_denied_alert_stays_tls() {
+    let (pin, acceptor) = tls_pair_with_pin();
+    let now = epoch_secs();
+    let token = mint_jwt(now, now + 10_000);
+    let relay = spawn_combined_relay(acceptor, CombinedWsMode::InnerAlert(46), token.clone()).await;
+    let client = transport_client(relay_credential(pin, 9, relay.origin.clone(), token), None);
+
+    assert!(matches!(
+        Box::pin(client.dial_carrier()).await,
+        Err(TransportError::Tls(_))
+    ));
+    assert_eq!(relay.state.ws_dials.load(Ordering::SeqCst), 1);
     relay.abort();
 }
 

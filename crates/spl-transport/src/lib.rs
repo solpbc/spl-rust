@@ -78,7 +78,9 @@ pub(crate) mod spki_pin;
 pub mod tls;
 
 use std::fmt;
+use std::io;
 
+use rustls::{AlertDescription, Error as RustlsError};
 use spl_core::http::HttpError;
 use spl_core::mux::MuxError;
 use thiserror::Error;
@@ -167,6 +169,9 @@ pub enum TransportError {
     /// TLS configuration or handshake failed.
     #[error("tls error: {0}")]
     Tls(String),
+    /// The peer rejected the TLS session with access denied.
+    #[error("tls access denied")]
+    TlsAccessDenied,
     /// Cryptographic material or verification failed.
     #[error("crypto error: {0}")]
     Crypto(String),
@@ -217,11 +222,23 @@ pub enum TransportError {
     LocalOffset,
 }
 
+/// Classify a received TLS access-denied alert without retaining peer-controlled detail.
+pub(crate) fn received_access_denied(error: &io::Error) -> Option<TransportError> {
+    matches!(
+        error
+            .get_ref()
+            .and_then(|source| source.downcast_ref::<RustlsError>()),
+        Some(RustlsError::AlertReceived(AlertDescription::AccessDenied))
+    )
+    .then_some(TransportError::TlsAccessDenied)
+}
+
 /// Return a stable, secret-free diagnostic code for a transport error.
 pub fn transport_error_code(error: &TransportError) -> String {
     match error {
         TransportError::Io(_) => "io".to_string(),
         TransportError::Tls(_) => "tls".to_string(),
+        TransportError::TlsAccessDenied => "tls_access_denied".to_string(),
         TransportError::Crypto(_) => "crypto".to_string(),
         TransportError::Mux(_) => "mux".to_string(),
         TransportError::Http(_) => "http".to_string(),
@@ -268,6 +285,7 @@ mod tests {
                 "io",
             ),
             (TransportError::Tls("10.0.0.5:7657".into()), "tls"),
+            (TransportError::TlsAccessDenied, "tls_access_denied"),
             (TransportError::Crypto("fingerprint abc".into()), "crypto"),
             (TransportError::Mux(MuxError::Incomplete), "mux"),
             (

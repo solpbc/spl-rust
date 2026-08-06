@@ -60,6 +60,26 @@ impl CarrierOpener for CountingOpener {
     }
 }
 
+struct AccessDeniedOpener {
+    dials: Arc<AtomicUsize>,
+}
+
+impl CarrierOpener for AccessDeniedOpener {
+    fn proxy_headers(
+        &self,
+        upstream_headers: &[(String, String)],
+    ) -> Result<Vec<(String, String)>, TransportError> {
+        Ok(upstream_headers.to_vec())
+    }
+
+    fn dial_carrier(
+        &self,
+    ) -> Pin<Box<dyn Future<Output = Result<DialedCarrier, TransportError>> + Send + '_>> {
+        self.dials.fetch_add(1, Ordering::SeqCst);
+        Box::pin(async { Err(TransportError::TlsAccessDenied) })
+    }
+}
+
 fn neutral_bridge_names() -> BridgeNames {
     BridgeNames {
         capability_cookie_name: "test-journal-cap".into(),
@@ -214,6 +234,42 @@ async fn journal_bridge_local_response_is_authorized_and_uses_coherent_status() 
     assert!(!after.carrier_live);
     assert_eq!(after.active_requests, 0);
 
+    handle.shutdown_and_wait().await;
+}
+
+// Falsified by removing the get_or_dial latch-on-error branch: the second request increments
+// the opener count to two instead of returning the existing local 502 without another dial.
+#[tokio::test]
+async fn access_denied_setup_latches_and_short_circuits_later_requests() {
+    let dials = Arc::new(AtomicUsize::new(0));
+    let handle = journal_bridge::start(JournalBridgeConfig {
+        opener: Arc::new(AccessDeniedOpener {
+            dials: dials.clone(),
+        }),
+        bridge_names: neutral_bridge_names(),
+        endpoint_hosts: Vec::new(),
+        policy: BridgePolicy::default(),
+    })
+    .await
+    .expect("bridge start");
+    let port = handle.port();
+    let capability = handle
+        .bootstrap_url()
+        .and_then(|url| url.split_once("cap=").map(|(_, value)| value.to_string()))
+        .expect("default capability");
+    let cookie = format!("test-journal-cap={capability}");
+
+    let first = raw_request(port, "/healthz", Some(&cookie)).await;
+    assert_eq!(response_status(&first), 502);
+    assert_eq!(dials.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        handle.status().terminal_reason,
+        Some(journal_bridge::JournalBridgeTerminalReason::TlsAccessDenied)
+    );
+
+    let second = raw_request(port, "/healthz", Some(&cookie)).await;
+    assert_eq!(response_status(&second), 502);
+    assert_eq!(dials.load(Ordering::SeqCst), 1);
     handle.shutdown_and_wait().await;
 }
 

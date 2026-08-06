@@ -25,8 +25,10 @@ use tokio::time::{Instant, MissedTickBehavior};
 use std::sync::atomic::AtomicUsize;
 
 use crate::client::{CarrierIo, CarrierKind};
-use crate::journal_bridge::{CarrierOpener, SharedStatus, lock_status};
-use crate::{TransportError, transport_error_code};
+use crate::journal_bridge::{
+    CarrierOpener, JournalBridgeTerminalReason, SharedStatus, lock_status,
+};
+use crate::{TransportError, received_access_denied, transport_error_code};
 
 const READ_BUF_BYTES: usize = 64 * 1024;
 const COMMAND_QUEUE: usize = 64;
@@ -409,6 +411,9 @@ impl MuxCarrier {
 
     async fn get_or_dial(&self) -> Result<Arc<CarrierHandle>, TransportError> {
         let mut slot = self.slot.lock().await;
+        if lock_status(&self.status).snapshot.terminal_reason.is_some() {
+            return Err(TransportError::TlsAccessDenied);
+        }
         if let Some(handle) = slot.as_ref()
             && handle.alive.load(Ordering::SeqCst)
         {
@@ -418,7 +423,15 @@ impl MuxCarrier {
             mark_carrier_dead(&self.status, &handle.status_identity);
         }
 
-        let dialed = self.opener.dial_carrier().await?;
+        let dialed = match self.opener.dial_carrier().await {
+            Ok(dialed) => dialed,
+            Err(error) => {
+                if matches!(error, TransportError::TlsAccessDenied) {
+                    latch_tls_access_denied(&self.status);
+                }
+                return Err(error);
+            }
+        };
         let (stream, kind) = dialed.into_parts();
         let (read, write) = split(stream);
         let (commands_tx, commands_rx) = mpsc::channel(COMMAND_QUEUE);
@@ -433,6 +446,7 @@ impl MuxCarrier {
             write,
             writer_rx,
             writer_events_tx,
+            kind.clone(),
             CarrierLiveGuard::new(alive.clone(), self.status.clone(), status_identity.clone()),
         ));
         let coordinator = tokio::spawn(coordinator_task(
@@ -783,11 +797,17 @@ async fn writer_task(
     mut write: CarrierWrite,
     mut rx: mpsc::Receiver<WriterPacket>,
     events: mpsc::UnboundedSender<WriterEvent>,
+    kind: CarrierKind,
     carrier_guard: CarrierLiveGuard,
 ) {
     while let Some(packet) = rx.recv().await {
         let WriterPacket { bytes, body_leases } = packet;
-        if write.write_all(&bytes).await.is_err() || write.flush().await.is_err() {
+        if let Err(error) = write.write_all(&bytes).await {
+            let _ = carrier_tls_access_denied(&error, &kind, &carrier_guard.status);
+            break;
+        }
+        if let Err(error) = write.flush().await {
+            let _ = carrier_tls_access_denied(&error, &kind, &carrier_guard.status);
             break;
         }
         #[cfg(test)]
@@ -859,7 +879,11 @@ async fn coordinator_task(
                             Err(error) => CoordinatorStep::Error(error),
                         }
                     }
-                    Err(_) => CoordinatorStep::Error(writer_error("carrier read failed")),
+                    Err(error) => carrier_tls_access_denied(&error, &kind, &carrier_guard.status)
+                        .map_or_else(
+                            || CoordinatorStep::Error(writer_error("carrier read failed")),
+                            CoordinatorStep::Error,
+                        ),
                 }
             }
             command = commands.recv() => {
@@ -1010,6 +1034,34 @@ fn mark_carrier_dead(status: &SharedStatus, status_identity: &Arc<()>) {
     {
         record.current_carrier = None;
         record.snapshot.carrier_live = false;
+    }
+}
+
+fn latch_tls_access_denied(status: &SharedStatus) {
+    let mut record = lock_status(status);
+    if record.snapshot.terminal_reason.is_none() {
+        record.snapshot.terminal_reason = Some(JournalBridgeTerminalReason::TlsAccessDenied);
+    }
+}
+
+fn relay_termination_error(kind: &CarrierKind) -> Option<crate::RelayError> {
+    match kind {
+        CarrierKind::Lan => None,
+        CarrierKind::Relay { termination } => termination.current_error(),
+    }
+}
+
+fn carrier_tls_access_denied(
+    error: &io::Error,
+    kind: &CarrierKind,
+    status: &SharedStatus,
+) -> Option<TransportError> {
+    let error = received_access_denied(error)?;
+    if relay_termination_error(kind).is_none() {
+        latch_tls_access_denied(status);
+        Some(error)
+    } else {
+        None
     }
 }
 
@@ -1461,20 +1513,10 @@ fn writer_error(reason: &'static str) -> TransportError {
 }
 
 fn log_carrier_teardown(kind: &CarrierKind, fallback_code: &str) {
-    let code = match kind {
-        CarrierKind::Lan => fallback_code.to_string(),
-        CarrierKind::Relay { termination } =>
-        {
-            #[expect(
-                clippy::map_unwrap_or,
-                reason = "the copied teardown mapping keeps the relay error and fallback code paths explicit"
-            )]
-            termination
-                .current_error()
-                .map(|error| transport_error_code(&TransportError::Relay(error)))
-                .unwrap_or_else(|| fallback_code.to_string())
-        }
-    };
+    let code = relay_termination_error(kind).map_or_else(
+        || fallback_code.to_string(),
+        |error| transport_error_code(&TransportError::Relay(error)),
+    );
     tracing::warn!(
         target: "journal_bridge",
         category = FailureCategory::UpstreamUnreachable.token(),
@@ -1500,6 +1542,9 @@ mod tests {
         FrameDecoder, RECOMMENDED_CHUNK, RESET_CANCEL, RESET_FLOW_CONTROL_ERROR,
     };
     use spl_core::mux::INITIAL_WINDOW;
+    use std::future::Future;
+    use std::pin::Pin;
+    use std::task::{Context, Poll};
     use tokio::io::{AsyncRead, AsyncWrite, DuplexStream};
 
     const TEST_INTERVAL: Duration = Duration::from_millis(100);
@@ -1533,9 +1578,93 @@ mod tests {
             write,
             writer_rx,
             events_tx,
+            CarrierKind::Lan,
             CarrierLiveGuard::new(alive, status, status_identity),
         ));
         (writer_tx, task)
+    }
+
+    struct AccessDeniedWriteStream;
+
+    impl AsyncRead for AccessDeniedWriteStream {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            _buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            Poll::Pending
+        }
+    }
+
+    impl AsyncWrite for AccessDeniedWriteStream {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            _buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                rustls::Error::AlertReceived(rustls::AlertDescription::AccessDenied),
+            )))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    fn spawn_access_denied_writer(
+        status: SharedStatus,
+        status_identity: Arc<()>,
+        kind: CarrierKind,
+    ) -> (
+        mpsc::Sender<WriterPacket>,
+        mpsc::UnboundedReceiver<WriterEvent>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let stream: Box<dyn CarrierIo> = Box::new(AccessDeniedWriteStream);
+        let (_read, write) = split(stream);
+        let (writer_tx, writer_rx) = mpsc::channel(WRITER_QUEUE);
+        let (events_tx, events_rx) = mpsc::unbounded_channel();
+        let alive = Arc::new(AtomicBool::new(true));
+        let task = tokio::spawn(writer_task(
+            write,
+            writer_rx,
+            events_tx,
+            kind,
+            CarrierLiveGuard::new(alive, status, status_identity),
+        ));
+        (writer_tx, events_rx, task)
+    }
+
+    struct CountingFailOpener {
+        dials: Arc<AtomicUsize>,
+    }
+
+    impl CarrierOpener for CountingFailOpener {
+        fn proxy_headers(
+            &self,
+            upstream_headers: &[(String, String)],
+        ) -> Result<Vec<(String, String)>, TransportError> {
+            Ok(upstream_headers.to_vec())
+        }
+
+        fn dial_carrier(
+            &self,
+        ) -> Pin<
+            Box<
+                dyn Future<Output = Result<crate::client::DialedCarrier, TransportError>>
+                    + Send
+                    + '_,
+            >,
+        > {
+            self.dials.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async { Err(TransportError::NoEndpoint) })
+        }
     }
 
     #[derive(Clone)]
@@ -1564,6 +1693,7 @@ mod tests {
             write,
             writer_rx,
             writer_events_tx,
+            CarrierKind::Lan,
             CarrierLiveGuard::new(alive.clone(), status.clone(), status_identity.clone()),
         ));
         tokio::spawn(coordinator_task(
@@ -1624,6 +1754,114 @@ mod tests {
                 .as_ref()
                 .is_some_and(|current| Arc::ptr_eq(current, &successor_identity))
         );
+    }
+
+    // Falsified by removing the writer-side classification call: the scripted writer still
+    // stops, but this assertion observes no terminal reason. Real rustls writes do not expose
+    // received alerts, so this seam deliberately injects the typed I/O error.
+    #[tokio::test]
+    async fn writer_latches_scripted_access_denied_before_stopping() {
+        let status = crate::journal_bridge::new_status();
+        let status_identity = Arc::new(());
+        publish_test_carrier(&status, &status_identity);
+        let (writer, mut events, task) =
+            spawn_access_denied_writer(status.clone(), status_identity, CarrierKind::Lan);
+
+        writer
+            .send(WriterPacket {
+                bytes: vec![1],
+                body_leases: Vec::new(),
+            })
+            .await
+            .unwrap();
+        assert!(matches!(events.recv().await, Some(WriterEvent::Stopped)));
+        assert_eq!(
+            lock_status(&status).snapshot.terminal_reason,
+            Some(JournalBridgeTerminalReason::TlsAccessDenied)
+        );
+        task.await.unwrap();
+    }
+
+    // Falsified by removing the write-once latch assignment: an old carrier cleanup leaves the
+    // successor live but the terminal reason absent, which this assertion rejects.
+    #[test]
+    fn terminal_reason_survives_old_carrier_cleanup() {
+        let status = crate::journal_bridge::new_status();
+        let old_identity = Arc::new(());
+        let successor_identity = Arc::new(());
+        publish_test_carrier(&status, &old_identity);
+        latch_tls_access_denied(&status);
+        publish_test_carrier(&status, &successor_identity);
+
+        mark_carrier_dead(&status, &old_identity);
+
+        let record = lock_status(&status);
+        assert!(record.snapshot.carrier_live);
+        assert_eq!(
+            record.snapshot.terminal_reason,
+            Some(JournalBridgeTerminalReason::TlsAccessDenied)
+        );
+    }
+
+    // Falsified by bypassing relay termination precedence in the writer classifier: the scripted
+    // error would set a terminal reason despite the recorded relay close taking priority.
+    #[tokio::test]
+    async fn writer_preserves_recorded_relay_termination_precedence() {
+        let status = crate::journal_bridge::new_status();
+        let status_identity = Arc::new(());
+        publish_test_carrier(&status, &status_identity);
+        let termination = crate::relay::RelayTerminationHandle::new();
+        termination.record_close_for_test(4401);
+        let (writer, mut events, task) = spawn_access_denied_writer(
+            status.clone(),
+            status_identity,
+            CarrierKind::Relay { termination },
+        );
+
+        writer
+            .send(WriterPacket {
+                bytes: vec![1],
+                body_leases: Vec::new(),
+            })
+            .await
+            .unwrap();
+        assert!(matches!(events.recv().await, Some(WriterEvent::Stopped)));
+        assert_eq!(lock_status(&status).snapshot.terminal_reason, None);
+        task.await.unwrap();
+    }
+
+    // Falsified by moving the terminal check below cached-handle reuse: this call returns the
+    // cached handle path instead of the terminal error, even though no opener dial is needed.
+    #[tokio::test]
+    async fn terminal_latch_precedes_cached_carrier_reuse() {
+        let status = crate::journal_bridge::new_status();
+        let status_identity = Arc::new(());
+        publish_test_carrier(&status, &status_identity);
+        let (commands, _commands_rx) = mpsc::channel(COMMAND_QUEUE);
+        let (body_ready, _body_ready_rx) = mpsc::unbounded_channel();
+        let handle = Arc::new(CarrierHandle {
+            commands,
+            body_ready,
+            alive: Arc::new(AtomicBool::new(true)),
+            status_identity,
+            tasks: Mutex::new(None),
+        });
+        let dials = Arc::new(AtomicUsize::new(0));
+        let carrier = MuxCarrier {
+            opener: Arc::new(CountingFailOpener {
+                dials: dials.clone(),
+            }),
+            slot: Mutex::new(Some(handle)),
+            keepalive: KeepaliveConfig::default(),
+            status: status.clone(),
+        };
+        latch_tls_access_denied(&status);
+
+        assert!(matches!(
+            carrier.get_or_dial().await,
+            Err(TransportError::TlsAccessDenied)
+        ));
+        assert_eq!(dials.load(Ordering::SeqCst), 0);
     }
 
     async fn open_test_stream(carrier: &TestCarrier, target: &str, body: Vec<u8>) -> StreamRx {

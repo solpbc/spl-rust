@@ -27,8 +27,8 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio_rustls::{TlsConnector, client::TlsStream};
 
-use crate::TransportError;
 use crate::tls::pinned_server_name;
+use crate::{TransportError, received_access_denied};
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// Upper bound on the TLS handshake that follows a successful connect. A LAN or
@@ -119,9 +119,11 @@ where
             std::io::ErrorKind::TimedOut,
             format!("tls handshake to {host}:{port} timed out"),
         ))),
-        Ok(result) => {
-            result.map_err(|e| TransportError::Tls(format!("handshake to {host}:{port}: {e}")))
-        }
+        Ok(result) => result.map_err(|error| {
+            received_access_denied(&error).unwrap_or_else(|| {
+                TransportError::Tls(format!("handshake to {host}:{port}: {error}"))
+            })
+        }),
     }
 }
 

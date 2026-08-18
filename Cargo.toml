@@ -3,6 +3,8 @@ members = ["crates/spl-core", "crates/spl-transport", "crates/spl-home"]
 resolver = "3"
 
 [workspace.package]
+# Release identity is the git tag (currently v0.6.0), not this workspace
+# version. Consumers pin by tag or rev. 0.1.0 is the crate graph label.
 version = "0.1.0"
 edition = "2024"
 # The MSRV floor is the LOWEST consuming product's toolchain, not the newest

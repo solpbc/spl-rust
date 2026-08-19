@@ -3,18 +3,18 @@
   "adoption_schema_version": 1,
   "consumer_identifier": "solpbc/spl-rust",
   "authority_repository": "https://github.com/solpbc/spl",
-  "authority_commit": "2393102495dca0e692562e33a5fcb2bc1e18de7d",
-  "bundle_semver": "5.0.1",
+  "authority_commit": "8c802a5975d3c07afa9ef9fe5c74cc2d3cf55314",
+  "bundle_semver": "6.0.0",
   "authority_manifest_path": "proto/definition/bundle/manifest.json",
-  "authority_manifest_sha256": "94429142e3447fa517addcb8de783de7b0f5d1bc377966688714348dc090d1a3",
+  "authority_manifest_sha256": "d9dfb5a2ace5b804000874012454024874e290d9d16974bcac84d7367668e091",
   "bundle_files": [
     {
       "path": "definition.json",
-      "sha256": "3e11d71c12dc200d84c0f39ad130f557bd0a5a35ad29bfdadd4144d42aa2ea93"
+      "sha256": "6edede4da4be355d4a2569693630a63cc93cf5a577feee65fadaaa39a5f6615b"
     },
     {
       "path": "definition.schema.json",
-      "sha256": "8f20c198d40c3bc299c24bb601dc7ea245fe08f17063ae765248d7f1aaf88c21"
+      "sha256": "e52b0fa33e732de6a48336571e541c6fb4d6551de047c3b4e037323e0fe5f69a"
     },
     {
       "path": "vectors.json",

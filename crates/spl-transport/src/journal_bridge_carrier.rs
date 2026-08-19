@@ -2111,7 +2111,7 @@ mod tests {
         task.await.unwrap();
     }
 
-    // Protocol: `.proto-ref/session.md`, lines 189-198. Falsified by restoring the
+    // Protocol: `.proto-ref/session.md`, lines 191-200. Falsified by restoring the
     // writer_error("carrier read failed") fallback in coordinator_task's read arm:
     // carrier_failure stays None and the named 46 never reaches the in-flight stream.
     #[tokio::test]
@@ -2160,7 +2160,7 @@ mod tests {
         assert!(dials.load(Ordering::SeqCst) > dials_before);
     }
 
-    // Protocol: `.proto-ref/session.md`, lines 193, 202-203. Falsified by broadening
+    // Protocol: `.proto-ref/session.md`, lines 195, 205. Falsified by broadening
     // received_tls_alert to every rustls::Error: DecryptError becomes named 46 or latches.
     #[tokio::test]
     async fn non_alert_rustls_error_is_not_certificate_unknown() {
@@ -2193,7 +2193,7 @@ mod tests {
         assert_eq!(lock_status(&status).snapshot.terminal_reason, None);
     }
 
-    // Protocol: `.proto-ref/session.md`, lines 189-193. Falsified by discarding the
+    // Protocol: `.proto-ref/session.md`, lines 191-195. Falsified by discarding the
     // classified writer error (always Stopped(None)): carrier_failure stays None.
     #[tokio::test]
     async fn writer_certificate_unknown_reaches_inflight_stream_without_latch() {

@@ -185,7 +185,7 @@ impl HomeStream {
 
     /// Reset this stream with a classified local failure reason.
     ///
-    /// Protocol: `.proto-ref/session.md`, lines 215-224 require a local socket
+    /// Protocol: `.proto-ref/session.md`, lines 217-226 require a local socket
     /// error to reset its tunnel stream with `INTERNAL_ERROR`.
     ///
     /// # Errors

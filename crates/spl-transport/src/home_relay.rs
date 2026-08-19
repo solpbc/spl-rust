@@ -328,7 +328,7 @@ pub trait RelayStop {
 
 /// Schedules a reconnect delay from the current base and injected jitter sample.
 ///
-/// Protocol: `.proto-ref/session.md`, lines 319-325.
+/// Protocol: `.proto-ref/session.md`, lines 320-326.
 ///
 /// Returns `None` when `jitter` is not finite or falls outside 0.0 through 1.0.
 pub fn schedule_reconnect(current_base: Duration, jitter: f64) -> Option<(Duration, Duration)> {

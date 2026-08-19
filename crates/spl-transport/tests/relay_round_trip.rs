@@ -1790,7 +1790,7 @@ async fn relay_inner_access_denied_is_terminal() {
     relay.abort();
 }
 
-// AC2(a). Protocol: `.proto-ref/session.md`, lines 179-183, 189-193. Falsified by
+// AC2(a). Protocol: `.proto-ref/session.md`, lines 181-185, 191-195. Falsified by
 // restoring generic inner-handshake formatting: this result becomes Tls(_) rather
 // than TlsCertificateUnknown even though the relay delivers a real TLS 46 alert.
 #[tokio::test]

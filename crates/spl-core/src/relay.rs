@@ -35,7 +35,7 @@ pub fn pair_dial_url(relay_origin: &str) -> Result<String, DialUrlError> {
 
 /// Construct the home relay-listen WebSocket URL.
 ///
-/// Protocol: `.proto-ref/session.md`, lines 23-45. Authentication is carried
+/// Protocol: `.proto-ref/session.md`, lines 25-47. Authentication is carried
 /// only in the WebSocket `Authorization` header, never in this URL.
 ///
 /// # Errors
@@ -48,7 +48,7 @@ pub fn listen_url(relay_origin: &str) -> Result<String, DialUrlError> {
 
 /// Construct the home tunnel-attachment WebSocket URL.
 ///
-/// Protocol: `.proto-ref/session.md`, lines 88-102. Authentication is carried
+/// Protocol: `.proto-ref/session.md`, lines 91-104. Authentication is carried
 /// only in the WebSocket `Authorization` header, never in this URL.
 ///
 /// # Errors
@@ -92,7 +92,7 @@ impl std::fmt::Debug for ListenControl {
 
 /// Parse a text-frame listen control message.
 ///
-/// Protocol: `.proto-ref/session.md`, lines 153-161. Callers must pass only
+/// Protocol: `.proto-ref/session.md`, lines 155-163. Callers must pass only
 /// WebSocket text frames; malformed controls are nonfatal and unknown types are
 /// ignored.
 pub fn parse_listen_control(text: &str) -> ListenControl {

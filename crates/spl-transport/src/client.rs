@@ -530,7 +530,7 @@ mod tests {
         later_task.abort();
     }
 
-    // Protocol: `.proto-ref/session.md`, lines 189-193. Falsified by restoring the
+    // Protocol: `.proto-ref/session.md`, lines 191-195. Falsified by restoring the
     // last_err-overwrite branch in dial_carrier (dropping the 46 short-circuit): the
     // later LAN listener accepts and the counted relay listener accepts.
     #[tokio::test]

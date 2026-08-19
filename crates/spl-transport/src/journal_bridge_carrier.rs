@@ -28,7 +28,7 @@ use crate::client::{CarrierIo, CarrierKind};
 use crate::journal_bridge::{
     CarrierOpener, JournalBridgeTerminalReason, SharedStatus, lock_status,
 };
-use crate::{TransportError, received_access_denied, transport_error_code};
+use crate::{TransportError, received_tls_alert, transport_error_code};
 
 const READ_BUF_BYTES: usize = 64 * 1024;
 const COMMAND_QUEUE: usize = 64;
@@ -601,6 +601,7 @@ pub(crate) struct StreamRx {
     cancel: mpsc::UnboundedSender<u32>,
     terminal: bool,
     early_final_status: Option<u16>,
+    certificate_unknown: bool,
 }
 
 impl StreamRx {
@@ -615,6 +616,11 @@ impl StreamRx {
                 self.terminal = true;
                 self.early_final_status = Some(head.status);
                 return Some(StreamItem::Head(head));
+            }
+            DeliveryEvent::CertificateUnknown => {
+                self.terminal = true;
+                self.certificate_unknown = true;
+                return None;
             }
         };
         debug_assert!(event.wire_cost == 0 || matches!(event.item, StreamItem::Body(_)));
@@ -636,6 +642,19 @@ impl StreamRx {
 
     pub(crate) fn early_final_status(&self) -> Option<u16> {
         self.early_final_status
+    }
+
+    /// Named carrier failure observed while this stream was still open, if any.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "loopback 502 stays untyped; carrier tests observe named 46 through this accessor"
+        )
+    )]
+    pub(crate) fn carrier_failure(&self) -> Option<TransportError> {
+        self.certificate_unknown
+            .then_some(TransportError::TlsCertificateUnknown)
     }
 
     pub(crate) fn cancel(&mut self) {
@@ -726,6 +745,7 @@ enum CarrierCommand {
 enum DeliveryEvent {
     Stream(StreamEvent),
     EarlyFinal(HttpHead),
+    CertificateUnknown,
 }
 
 struct StreamState {
@@ -759,7 +779,7 @@ struct WriterPacket {
 
 enum WriterEvent {
     Drained,
-    Stopped,
+    Stopped(Option<TransportError>),
 }
 
 struct CoordinatorWriter {
@@ -817,14 +837,15 @@ async fn writer_task(
     kind: CarrierKind,
     carrier_guard: CarrierLiveGuard,
 ) {
+    let mut stop_reason = None;
     while let Some(packet) = rx.recv().await {
         let WriterPacket { bytes, body_leases } = packet;
         if let Err(error) = write.write_all(&bytes).await {
-            let _ = carrier_tls_access_denied(&error, &kind, &carrier_guard.status);
+            stop_reason = classify_carrier_tls_alert(&error, &kind, &carrier_guard.status);
             break;
         }
         if let Err(error) = write.flush().await {
-            let _ = carrier_tls_access_denied(&error, &kind, &carrier_guard.status);
+            stop_reason = classify_carrier_tls_alert(&error, &kind, &carrier_guard.status);
             break;
         }
         #[cfg(test)]
@@ -836,7 +857,7 @@ async fn writer_task(
             break;
         }
     }
-    let _ = events.send(WriterEvent::Stopped);
+    let _ = events.send(WriterEvent::Stopped(stop_reason));
     drop(carrier_guard);
 }
 
@@ -896,7 +917,7 @@ async fn coordinator_task(
                             Err(error) => CoordinatorStep::Error(error),
                         }
                     }
-                    Err(error) => carrier_tls_access_denied(&error, &kind, &carrier_guard.status)
+                    Err(error) => classify_carrier_tls_alert(&error, &kind, &carrier_guard.status)
                         .map_or_else(
                             || CoordinatorStep::Error(writer_error("carrier read failed")),
                             CoordinatorStep::Error,
@@ -994,7 +1015,8 @@ async fn coordinator_task(
                         writer.drained();
                         CoordinatorStep::Continue
                     }
-                    Some(WriterEvent::Stopped) | None => {
+                    Some(WriterEvent::Stopped(Some(error))) => CoordinatorStep::Error(error),
+                    Some(WriterEvent::Stopped(None)) | None => {
                         CoordinatorStep::Error(writer_error("carrier writer stopped"))
                     }
                 }
@@ -1026,7 +1048,11 @@ async fn coordinator_task(
                 break;
             }
             CoordinatorStep::Error(error) => {
-                fanout_eof(&mut streams);
+                if matches!(error, TransportError::TlsCertificateUnknown) {
+                    fanout_certificate_unknown(&mut streams);
+                } else {
+                    fanout_eof(&mut streams);
+                }
                 log_carrier_teardown(&kind, &transport_error_code(&error));
                 break;
             }
@@ -1068,18 +1094,19 @@ fn relay_termination_error(kind: &CarrierKind) -> Option<crate::RelayError> {
     }
 }
 
-fn carrier_tls_access_denied(
+fn classify_carrier_tls_alert(
     error: &io::Error,
     kind: &CarrierKind,
     status: &SharedStatus,
 ) -> Option<TransportError> {
-    let error = received_access_denied(error)?;
-    if relay_termination_error(kind).is_none() {
-        latch_tls_access_denied(status);
-        Some(error)
-    } else {
-        None
+    let error = received_tls_alert(error)?;
+    if relay_termination_error(kind).is_some() {
+        return None;
     }
+    if matches!(error, TransportError::TlsAccessDenied) {
+        latch_tls_access_denied(status);
+    }
+    Some(error)
 }
 
 fn handle_read(
@@ -1205,6 +1232,7 @@ fn open_stream_on_carrier(
         cancel,
         terminal: false,
         early_final_status: None,
+        certificate_unknown: false,
     }
 }
 
@@ -1485,6 +1513,12 @@ fn fanout_eof(streams: &mut HashMap<u32, StreamState>) {
     }
 }
 
+fn fanout_certificate_unknown(streams: &mut HashMap<u32, StreamState>) {
+    for (_, state) in streams.drain() {
+        let _ = state.delivery.try_send(DeliveryEvent::CertificateUnknown);
+    }
+}
+
 fn handle_keepalive(
     writer: &mut CoordinatorWriter,
     outstanding: &mut Option<OutstandingProbe>,
@@ -1561,7 +1595,7 @@ mod tests {
     use spl_core::mux::INITIAL_WINDOW;
     use std::future::Future;
     use std::pin::Pin;
-    use std::task::{Context, Poll};
+    use std::task::{Context, Poll, Waker};
     use tokio::io::{AsyncRead, AsyncWrite, DuplexStream};
 
     const TEST_INTERVAL: Duration = Duration::from_millis(100);
@@ -1601,9 +1635,11 @@ mod tests {
         (writer_tx, task)
     }
 
-    struct AccessDeniedWriteStream;
+    struct AlertWriteStream {
+        description: rustls::AlertDescription,
+    }
 
-    impl AsyncRead for AccessDeniedWriteStream {
+    impl AsyncRead for AlertWriteStream {
         fn poll_read(
             self: Pin<&mut Self>,
             _cx: &mut Context<'_>,
@@ -1613,7 +1649,7 @@ mod tests {
         }
     }
 
-    impl AsyncWrite for AccessDeniedWriteStream {
+    impl AsyncWrite for AlertWriteStream {
         fn poll_write(
             self: Pin<&mut Self>,
             _cx: &mut Context<'_>,
@@ -1621,7 +1657,7 @@ mod tests {
         ) -> Poll<io::Result<usize>> {
             Poll::Ready(Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                rustls::Error::AlertReceived(rustls::AlertDescription::AccessDenied),
+                rustls::Error::AlertReceived(self.description),
             )))
         }
 
@@ -1643,7 +1679,25 @@ mod tests {
         mpsc::UnboundedReceiver<WriterEvent>,
         tokio::task::JoinHandle<()>,
     ) {
-        let stream: Box<dyn CarrierIo> = Box::new(AccessDeniedWriteStream);
+        spawn_alert_writer(
+            status,
+            status_identity,
+            kind,
+            rustls::AlertDescription::AccessDenied,
+        )
+    }
+
+    fn spawn_alert_writer(
+        status: SharedStatus,
+        status_identity: Arc<()>,
+        kind: CarrierKind,
+        description: rustls::AlertDescription,
+    ) -> (
+        mpsc::Sender<WriterPacket>,
+        mpsc::UnboundedReceiver<WriterEvent>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let stream: Box<dyn CarrierIo> = Box::new(AlertWriteStream { description });
         let (_read, write) = split(stream);
         let (writer_tx, writer_rx) = mpsc::channel(WRITER_QUEUE);
         let (events_tx, events_rx) = mpsc::unbounded_channel();
@@ -1681,6 +1735,132 @@ mod tests {
         > {
             self.dials.fetch_add(1, Ordering::SeqCst);
             Box::pin(async { Err(TransportError::NoEndpoint) })
+        }
+    }
+
+    struct InjectedTlsErrorStream {
+        error: rustls::Error,
+        fired: Arc<AtomicBool>,
+        waker: Arc<std::sync::Mutex<Option<Waker>>>,
+    }
+
+    impl AsyncRead for InjectedTlsErrorStream {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            _buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            if self.fired.load(Ordering::SeqCst) {
+                return Poll::Ready(Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    self.error.clone(),
+                )));
+            }
+            *self.waker.lock().unwrap() = Some(cx.waker().clone());
+            Poll::Pending
+        }
+    }
+
+    impl AsyncWrite for InjectedTlsErrorStream {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            Poll::Ready(Ok(buf.len()))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    struct InjectedTlsErrorOpener {
+        dials: Arc<AtomicUsize>,
+        error: rustls::Error,
+        fired: Arc<AtomicBool>,
+        waker: Arc<std::sync::Mutex<Option<Waker>>>,
+        kind: CarrierKind,
+    }
+
+    impl CarrierOpener for InjectedTlsErrorOpener {
+        fn proxy_headers(
+            &self,
+            upstream_headers: &[(String, String)],
+        ) -> Result<Vec<(String, String)>, TransportError> {
+            Ok(upstream_headers.to_vec())
+        }
+
+        fn dial_carrier(
+            &self,
+        ) -> Pin<
+            Box<
+                dyn Future<Output = Result<crate::client::DialedCarrier, TransportError>>
+                    + Send
+                    + '_,
+            >,
+        > {
+            self.dials.fetch_add(1, Ordering::SeqCst);
+            let stream = InjectedTlsErrorStream {
+                error: self.error.clone(),
+                fired: self.fired.clone(),
+                waker: self.waker.clone(),
+            };
+            let kind = self.kind.clone();
+            Box::pin(async move {
+                Ok(crate::client::DialedCarrier::from_test_parts(
+                    Box::new(stream),
+                    kind,
+                ))
+            })
+        }
+    }
+
+    struct AlertWriteOpener {
+        dials: Arc<AtomicUsize>,
+        description: rustls::AlertDescription,
+        kind: CarrierKind,
+    }
+
+    impl CarrierOpener for AlertWriteOpener {
+        fn proxy_headers(
+            &self,
+            upstream_headers: &[(String, String)],
+        ) -> Result<Vec<(String, String)>, TransportError> {
+            Ok(upstream_headers.to_vec())
+        }
+
+        fn dial_carrier(
+            &self,
+        ) -> Pin<
+            Box<
+                dyn Future<Output = Result<crate::client::DialedCarrier, TransportError>>
+                    + Send
+                    + '_,
+            >,
+        > {
+            self.dials.fetch_add(1, Ordering::SeqCst);
+            let stream = AlertWriteStream {
+                description: self.description,
+            };
+            let kind = self.kind.clone();
+            Box::pin(async move {
+                Ok(crate::client::DialedCarrier::from_test_parts(
+                    Box::new(stream),
+                    kind,
+                ))
+            })
+        }
+    }
+
+    fn fire_injected_error(fired: &AtomicBool, waker: &std::sync::Mutex<Option<Waker>>) {
+        fired.store(true, Ordering::SeqCst);
+        if let Some(waker) = waker.lock().unwrap().take() {
+            waker.wake();
         }
     }
 
@@ -1875,7 +2055,7 @@ mod tests {
             })
             .await
             .unwrap();
-        assert!(matches!(events.recv().await, Some(WriterEvent::Stopped)));
+        assert!(matches!(events.recv().await, Some(WriterEvent::Stopped(_))));
         assert_eq!(
             lock_status(&status).snapshot.terminal_reason,
             Some(JournalBridgeTerminalReason::TlsAccessDenied)
@@ -1926,9 +2106,154 @@ mod tests {
             })
             .await
             .unwrap();
-        assert!(matches!(events.recv().await, Some(WriterEvent::Stopped)));
+        assert!(matches!(events.recv().await, Some(WriterEvent::Stopped(_))));
         assert_eq!(lock_status(&status).snapshot.terminal_reason, None);
         task.await.unwrap();
+    }
+
+    // Protocol: `.proto-ref/session.md`, lines 189-198. Falsified by restoring the
+    // writer_error("carrier read failed") fallback in coordinator_task's read arm:
+    // carrier_failure stays None and the named 46 never reaches the in-flight stream.
+    #[tokio::test]
+    async fn reader_certificate_unknown_reaches_inflight_stream_without_latch() {
+        let status = crate::journal_bridge::new_status();
+        let fired = Arc::new(AtomicBool::new(false));
+        let waker = Arc::new(std::sync::Mutex::new(None));
+        let dials = Arc::new(AtomicUsize::new(0));
+        let hook_calls = Arc::new(AtomicUsize::new(0));
+        let hook_calls_for_hook = hook_calls.clone();
+        let carrier = MuxCarrier {
+            opener: Arc::new(InjectedTlsErrorOpener {
+                dials: dials.clone(),
+                error: rustls::Error::AlertReceived(rustls::AlertDescription::CertificateUnknown),
+                fired: fired.clone(),
+                waker: waker.clone(),
+                kind: CarrierKind::Lan,
+            }),
+            slot: Mutex::new(None),
+            keepalive: KeepaliveConfig::default(),
+            status: status.clone(),
+            redial_hook: Some(Arc::new(move || {
+                hook_calls_for_hook.fetch_add(1, Ordering::SeqCst);
+            })),
+        };
+
+        let opened = carrier
+            .open_stream("GET", "/healthz", &[], 0)
+            .await
+            .unwrap();
+        let mut rx = opened.response;
+        fire_injected_error(&fired, &waker);
+        let _ = tokio::time::timeout(Duration::from_secs(1), rx.recv())
+            .await
+            .expect("in-flight stream should finish");
+        assert!(matches!(
+            rx.carrier_failure(),
+            Some(TransportError::TlsCertificateUnknown)
+        ));
+        assert_eq!(lock_status(&status).snapshot.terminal_reason, None);
+
+        let hook_before = hook_calls.load(Ordering::SeqCst);
+        let dials_before = dials.load(Ordering::SeqCst);
+        let _ = carrier.get_or_dial().await;
+        assert!(hook_calls.load(Ordering::SeqCst) > hook_before);
+        assert!(dials.load(Ordering::SeqCst) > dials_before);
+    }
+
+    // Protocol: `.proto-ref/session.md`, lines 193, 202-203. Falsified by broadening
+    // received_tls_alert to every rustls::Error: DecryptError becomes named 46 or latches.
+    #[tokio::test]
+    async fn non_alert_rustls_error_is_not_certificate_unknown() {
+        let status = crate::journal_bridge::new_status();
+        let fired = Arc::new(AtomicBool::new(false));
+        let waker = Arc::new(std::sync::Mutex::new(None));
+        let dials = Arc::new(AtomicUsize::new(0));
+        let carrier = MuxCarrier {
+            opener: Arc::new(InjectedTlsErrorOpener {
+                dials,
+                error: rustls::Error::DecryptError,
+                fired: fired.clone(),
+                waker: waker.clone(),
+                kind: CarrierKind::Lan,
+            }),
+            slot: Mutex::new(None),
+            keepalive: KeepaliveConfig::default(),
+            status: status.clone(),
+            redial_hook: None,
+        };
+
+        let opened = carrier
+            .open_stream("GET", "/healthz", &[], 0)
+            .await
+            .unwrap();
+        let mut rx = opened.response;
+        fire_injected_error(&fired, &waker);
+        assert_stream_eof(&mut rx).await;
+        assert!(rx.carrier_failure().is_none());
+        assert_eq!(lock_status(&status).snapshot.terminal_reason, None);
+    }
+
+    // Protocol: `.proto-ref/session.md`, lines 189-193. Falsified by discarding the
+    // classified writer error (always Stopped(None)): carrier_failure stays None.
+    #[tokio::test]
+    async fn writer_certificate_unknown_reaches_inflight_stream_without_latch() {
+        let status = crate::journal_bridge::new_status();
+        let dials = Arc::new(AtomicUsize::new(0));
+        let carrier = MuxCarrier {
+            opener: Arc::new(AlertWriteOpener {
+                dials,
+                description: rustls::AlertDescription::CertificateUnknown,
+                kind: CarrierKind::Lan,
+            }),
+            slot: Mutex::new(None),
+            keepalive: KeepaliveConfig::default(),
+            status: status.clone(),
+            redial_hook: None,
+        };
+
+        let opened = carrier
+            .open_stream("GET", "/healthz", &[], 0)
+            .await
+            .unwrap();
+        let mut rx = opened.response;
+        let _ = tokio::time::timeout(Duration::from_secs(1), rx.recv())
+            .await
+            .expect("in-flight stream should finish");
+        assert!(matches!(
+            rx.carrier_failure(),
+            Some(TransportError::TlsCertificateUnknown)
+        ));
+        assert_eq!(lock_status(&status).snapshot.terminal_reason, None);
+    }
+
+    // Falsified by checking the TLS error before the recorded relay close: the in-flight
+    // stream would then surface TlsCertificateUnknown and a terminal reason would latch.
+    #[tokio::test]
+    async fn writer_certificate_unknown_yields_to_recorded_relay_termination() {
+        let status = crate::journal_bridge::new_status();
+        let termination = crate::relay::RelayTerminationHandle::new();
+        termination.record_close_for_test(4401);
+        let dials = Arc::new(AtomicUsize::new(0));
+        let carrier = MuxCarrier {
+            opener: Arc::new(AlertWriteOpener {
+                dials,
+                description: rustls::AlertDescription::CertificateUnknown,
+                kind: CarrierKind::Relay { termination },
+            }),
+            slot: Mutex::new(None),
+            keepalive: KeepaliveConfig::default(),
+            status: status.clone(),
+            redial_hook: None,
+        };
+
+        let opened = carrier
+            .open_stream("GET", "/healthz", &[], 0)
+            .await
+            .unwrap();
+        let mut rx = opened.response;
+        assert_stream_eof(&mut rx).await;
+        assert!(rx.carrier_failure().is_none());
+        assert_eq!(lock_status(&status).snapshot.terminal_reason, None);
     }
 
     // Falsified by moving the terminal check below cached-handle reuse: this call returns the
@@ -2659,6 +2984,7 @@ mod tests {
             cancel,
             terminal: false,
             early_final_status: None,
+            certificate_unknown: false,
         };
 
         response.cancel();

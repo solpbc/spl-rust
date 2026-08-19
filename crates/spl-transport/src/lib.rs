@@ -172,6 +172,9 @@ pub enum TransportError {
     /// The peer rejected the TLS session with access denied.
     #[error("tls access denied")]
     TlsAccessDenied,
+    /// The peer rejected the TLS session with certificate unknown.
+    #[error("tls certificate unknown")]
+    TlsCertificateUnknown,
     /// Cryptographic material or verification failed.
     #[error("crypto error: {0}")]
     Crypto(String),
@@ -222,15 +225,20 @@ pub enum TransportError {
     LocalOffset,
 }
 
-/// Classify a received TLS access-denied alert without retaining peer-controlled detail.
-pub(crate) fn received_access_denied(error: &io::Error) -> Option<TransportError> {
-    matches!(
-        error
-            .get_ref()
-            .and_then(|source| source.downcast_ref::<RustlsError>()),
-        Some(RustlsError::AlertReceived(AlertDescription::AccessDenied))
-    )
-    .then_some(TransportError::TlsAccessDenied)
+/// Classify a received TLS alert the client must name, without retaining peer-controlled detail.
+pub(crate) fn received_tls_alert(error: &io::Error) -> Option<TransportError> {
+    match error
+        .get_ref()
+        .and_then(|source| source.downcast_ref::<RustlsError>())
+    {
+        Some(RustlsError::AlertReceived(AlertDescription::AccessDenied)) => {
+            Some(TransportError::TlsAccessDenied)
+        }
+        Some(RustlsError::AlertReceived(AlertDescription::CertificateUnknown)) => {
+            Some(TransportError::TlsCertificateUnknown)
+        }
+        _ => None,
+    }
 }
 
 /// Return a stable, secret-free diagnostic code for a transport error.
@@ -239,6 +247,7 @@ pub fn transport_error_code(error: &TransportError) -> String {
         TransportError::Io(_) => "io".to_string(),
         TransportError::Tls(_) => "tls".to_string(),
         TransportError::TlsAccessDenied => "tls_access_denied".to_string(),
+        TransportError::TlsCertificateUnknown => "tls_certificate_unknown".to_string(),
         TransportError::Crypto(_) => "crypto".to_string(),
         TransportError::Mux(_) => "mux".to_string(),
         TransportError::Http(_) => "http".to_string(),
@@ -286,6 +295,10 @@ mod tests {
             ),
             (TransportError::Tls("10.0.0.5:7657".into()), "tls"),
             (TransportError::TlsAccessDenied, "tls_access_denied"),
+            (
+                TransportError::TlsCertificateUnknown,
+                "tls_certificate_unknown",
+            ),
             (TransportError::Crypto("fingerprint abc".into()), "crypto"),
             (TransportError::Mux(MuxError::Incomplete), "mux"),
             (
@@ -373,5 +386,32 @@ mod tests {
             assert!(!code.contains("sha256:"));
             assert!(!code.contains("10.0.0.5"));
         }
+    }
+
+    fn tls_io_error(source: RustlsError) -> io::Error {
+        io::Error::new(io::ErrorKind::InvalidData, source)
+    }
+
+    #[test]
+    fn received_tls_alert_maps_known_alerts_only() {
+        assert!(matches!(
+            received_tls_alert(&tls_io_error(RustlsError::AlertReceived(
+                AlertDescription::AccessDenied
+            ))),
+            Some(TransportError::TlsAccessDenied)
+        ));
+        assert!(matches!(
+            received_tls_alert(&tls_io_error(RustlsError::AlertReceived(
+                AlertDescription::CertificateUnknown
+            ))),
+            Some(TransportError::TlsCertificateUnknown)
+        ));
+        assert!(
+            received_tls_alert(&tls_io_error(RustlsError::AlertReceived(
+                AlertDescription::InternalError
+            )))
+            .is_none()
+        );
+        assert!(received_tls_alert(&tls_io_error(RustlsError::DecryptError)).is_none());
     }
 }

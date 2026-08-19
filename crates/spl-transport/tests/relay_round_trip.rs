@@ -1790,10 +1790,11 @@ async fn relay_inner_access_denied_is_terminal() {
     relay.abort();
 }
 
-// Falsified by broadening the inner classifier to every alert description: this result becomes
-// TlsAccessDenied instead of preserving the existing generic TLS error for description 46.
+// AC2(a). Protocol: `.proto-ref/session.md`, lines 179-183, 189-193. Falsified by
+// restoring generic inner-handshake formatting: this result becomes Tls(_) rather
+// than TlsCertificateUnknown even though the relay delivers a real TLS 46 alert.
 #[tokio::test]
-async fn relay_inner_non_access_denied_alert_stays_tls() {
+async fn relay_inner_certificate_unknown_is_typed() {
     let (pin, acceptor) = tls_pair_with_pin();
     let now = epoch_secs();
     let token = mint_jwt(now, now + 10_000);
@@ -1802,10 +1803,38 @@ async fn relay_inner_non_access_denied_alert_stays_tls() {
 
     assert!(matches!(
         Box::pin(client.dial_carrier()).await,
-        Err(TransportError::Tls(_))
+        Err(TransportError::TlsCertificateUnknown)
     ));
     assert_eq!(relay.state.ws_dials.load(Ordering::SeqCst), 1);
     relay.abort();
+}
+
+// Falsified by broadening the inner classifier to every alert description: this result becomes
+// a named terminal variant instead of preserving the existing generic TLS error.
+#[tokio::test]
+async fn relay_inner_unclassified_alert_stays_tls() {
+    for description in [80, 200] {
+        let (pin, acceptor) = tls_pair_with_pin();
+        let now = epoch_secs();
+        let token = mint_jwt(now, now + 10_000);
+        let relay = spawn_combined_relay(
+            acceptor,
+            CombinedWsMode::InnerAlert(description),
+            token.clone(),
+        )
+        .await;
+        let client = transport_client(relay_credential(pin, 9, relay.origin.clone(), token), None);
+
+        assert!(
+            matches!(
+                Box::pin(client.dial_carrier()).await,
+                Err(TransportError::Tls(_))
+            ),
+            "description {description} must stay a generic TLS error"
+        );
+        assert_eq!(relay.state.ws_dials.load(Ordering::SeqCst), 1);
+        relay.abort();
+    }
 }
 
 #[tokio::test]

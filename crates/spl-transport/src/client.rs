@@ -154,8 +154,8 @@ impl TransportClient {
     /// worker because the listener fans out across `SO_REUSEPORT` processes.
     /// Direct connection and handshake failures therefore retain the bounded
     /// linear retry before relay fallback, except a received TLS access-denied
-    /// alert, which returns immediately without another endpoint, retry, or
-    /// relay fallback.
+    /// (49) or certificate-unknown (46) alert, which returns immediately
+    /// without another endpoint, retry, or relay fallback.
     ///
     /// # Errors
     ///
@@ -173,8 +173,11 @@ impl TransportClient {
                             kind: CarrierKind::Lan,
                         });
                     }
-                    Err(TransportError::TlsAccessDenied) => {
-                        return Err(TransportError::TlsAccessDenied);
+                    Err(
+                        error @ (TransportError::TlsAccessDenied
+                        | TransportError::TlsCertificateUnknown),
+                    ) => {
+                        return Err(error);
                     }
                     Err(error) => last_err = Some(error),
                 }
@@ -382,6 +385,22 @@ mod tests {
     use crate::credential::EndpointAddr;
 
     fn test_client(endpoints: Vec<EndpointAddr>) -> TransportClient {
+        test_client_inner(endpoints, None, None)
+    }
+
+    fn test_client_with_relay(
+        endpoints: Vec<EndpointAddr>,
+        relay_origin: String,
+        token: String,
+    ) -> TransportClient {
+        test_client_inner(endpoints, Some(relay_origin), Some(token))
+    }
+
+    fn test_client_inner(
+        endpoints: Vec<EndpointAddr>,
+        relay_origin: Option<String>,
+        token: Option<String>,
+    ) -> TransportClient {
         TransportClient {
             credential: Credential {
                 client_key_pem: String::new(),
@@ -393,12 +412,12 @@ mod tests {
                 endpoints,
                 home_attestation: None,
                 local_endpoints: None,
-                relay_origin: None,
-                device_token: None,
+                relay_origin,
+                device_token: token.clone(),
                 device_token_expires_at: None,
             },
             config: Arc::new(tls::trust_all_pairing_config().unwrap()),
-            device_token: None,
+            device_token: token.map(tokio::sync::Mutex::new),
             token_persist: None,
         }
     }
@@ -511,12 +530,62 @@ mod tests {
         later_task.abort();
     }
 
+    // Protocol: `.proto-ref/session.md`, lines 189-193. Falsified by restoring the
+    // last_err-overwrite branch in dial_carrier (dropping the 46 short-circuit): the
+    // later LAN listener accepts and the counted relay listener accepts.
+    #[tokio::test]
+    async fn certificate_unknown_stops_before_later_endpoint_and_relay() {
+        let (first, first_task) = scripted_alert_listener(46).await;
+        let later = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let later_endpoint = EndpointAddr {
+            host: "127.0.0.1".into(),
+            port: later.local_addr().unwrap().port(),
+        };
+        let (later_accept_tx, mut later_accept_rx) = oneshot::channel();
+        let later_task = tokio::spawn(async move {
+            let (stream, _) = later.accept().await.unwrap();
+            drop(stream);
+            let _ = later_accept_tx.send(());
+        });
+        let relay = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let relay_origin = format!("http://{}", relay.local_addr().unwrap());
+        let (relay_accept_tx, mut relay_accept_rx) = oneshot::channel();
+        let relay_task = tokio::spawn(async move {
+            let (stream, _) = relay.accept().await.unwrap();
+            drop(stream);
+            let _ = relay_accept_tx.send(());
+        });
+        let client = test_client_with_relay(
+            vec![first, later_endpoint],
+            relay_origin,
+            "test-token".into(),
+        );
+
+        assert!(matches!(
+            client.dial_carrier().await,
+            Err(TransportError::TlsCertificateUnknown)
+        ));
+        first_task.await.unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), &mut later_accept_rx)
+                .await
+                .is_err()
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), &mut relay_accept_rx)
+                .await
+                .is_err()
+        );
+        later_task.abort();
+        relay_task.abort();
+    }
+
     // Falsified by changing the classifier to treat every received alert as terminal: the healthy
     // second endpoint is never reached. The pre-feature source has no classifier, so this test
     // can only fail there at compile time; its behavioral falsification targets overbroad changes.
     #[tokio::test]
-    async fn non_access_denied_alerts_continue_to_later_endpoint() {
-        for description in [46, 80, 200] {
+    async fn unclassified_alerts_continue_to_later_endpoint() {
+        for description in [80, 200] {
             let (first, first_task) = scripted_alert_listener(description).await;
             let (second, accepted) = healthy_tls_listener().await;
             let client = test_client(vec![first, second]);

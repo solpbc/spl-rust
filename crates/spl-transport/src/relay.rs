@@ -35,7 +35,7 @@ use tokio_tungstenite::{
 
 use crate::connection::run_request_over_stream;
 use crate::tls::pinned_server_name;
-use crate::{RelayError, TransportError, received_access_denied};
+use crate::{RelayError, TransportError, received_tls_alert};
 
 /// Inner mTLS progress bound. This is not a presence-hold wait; a live relay
 /// path should produce the journal's TLS response well before this.
@@ -463,7 +463,7 @@ fn inner_handshake_error(
     if let Some(error) = termination.current_error() {
         return TransportError::Relay(error);
     }
-    received_access_denied(error)
+    received_tls_alert(error)
         .unwrap_or_else(|| TransportError::Tls(format!("inner relay handshake: {error}")))
 }
 
@@ -608,6 +608,24 @@ mod tests {
         assert!(matches!(
             inner_handshake_error(&termination, &error),
             TransportError::Relay(RelayError::Unauthorized)
+        ));
+    }
+
+    // AC2(b). Falsified by checking the TLS error before the recorded relay close: this
+    // assertion then receives TlsCertificateUnknown instead of the relay outcome that
+    // must retain precedence.
+    #[test]
+    fn recorded_relay_termination_precedes_inner_certificate_unknown() {
+        let termination = RelayTerminationHandle::new();
+        termination.record_close_for_test(4401);
+        let error = io::Error::new(
+            io::ErrorKind::InvalidData,
+            rustls::Error::AlertReceived(rustls::AlertDescription::CertificateUnknown),
+        );
+
+        assert!(matches!(
+            inner_handshake_error(&termination, &error),
+            TransportError::Relay(_)
         ));
     }
 }

@@ -1809,8 +1809,8 @@ async fn relay_inner_certificate_unknown_is_typed() {
     relay.abort();
 }
 
-// Falsified by broadening the inner classifier to every alert description: this result becomes
-// a named terminal variant instead of preserving the existing generic TLS error.
+// Falsified by broadening received_tls_alert beyond descriptions 49 and 46: this result becomes
+// a named variant instead of preserving the existing generic Tls(_).
 #[tokio::test]
 async fn relay_inner_unclassified_alert_stays_tls() {
     for description in [80, 200] {

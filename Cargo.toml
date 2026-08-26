@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/spl-core", "crates/spl-transport", "crates/spl-home"]
+members = ["crates/spl-core", "crates/spl-transport", "crates/spl-home", "crates/spl-bridge"]
 resolver = "3"
 
 [workspace.package]
@@ -43,11 +43,16 @@ spl-home = { path = "crates/spl-home", version = "0.1.0" }
 # consumer, no aws-lc-rs C toolchain in the graph); the smaller binary is a
 # consequence, not the reason.
 base64 = { version = "0.22", default-features = false, features = ["std"] }
+ed25519-dalek = { version = "2.1", default-features = false, features = ["pkcs8"] }
 futures-util = { version = "0.3", default-features = false, features = ["sink"] }
+getrandom = "0.2"
 hkdf = "0.12"
+jsonwebtoken = { version = "11", default-features = false, features = ["rust_crypto"] }
 p256 = { version = "0.13.2", default-features = false, features = ["arithmetic", "pkcs8", "alloc"] }
+ppp = "2.3"
 rcgen = { version = "0.13", default-features = false, features = ["ring", "pem"] }
-rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+rustls = { version = ">=0.23.18", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+rustls-pemfile = "2"
 rustls-webpki = { version = "0.103", default-features = false, features = ["ring", "std"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

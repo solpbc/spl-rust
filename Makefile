@@ -56,6 +56,8 @@ deny:
 # resolves for all four here.
 # spl-home is likewise host-only. It pulls rustls/ring, whose C build script
 # needs the same real cross toolchain as spl-transport.
+# spl-bridge is likewise host-only because its relay control plane pulls
+# rustls/ring and therefore needs the same real cross toolchain.
 CONSUMER_TARGETS = x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu aarch64-apple-darwin x86_64-pc-windows-msvc
 
 targets:
@@ -67,6 +69,8 @@ targets:
 	@$(CARGO) check -p spl-transport
 	@echo "== spl-home (host)"
 	@$(CARGO) check -p spl-home
+	@echo "== spl-bridge (host)"
+	@$(CARGO) check -p spl-bridge
 
 # Records the transport tier's contribution to a consumer's binary. Evidence for
 # the release record, NOT a pass/fail threshold: its job is to make a future

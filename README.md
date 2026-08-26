@@ -23,6 +23,7 @@ Alpha, pre-1.0. The API will change. Consumers pin an exact tag.
 | **`spl-core`** | Pair-link parsing and direct-address admission, mux framing and per-stream flow control, HTTP-over-SPL, CA-fingerprint pinning, pair-window and journal-identity derivations. No I/O, no platform dependency, host-testable. |
 | **`spl-transport`** | CA-fp-pinned mutual TLS over direct and relay dials, including the home-side relay attachment client, mux carrier, and local loopback proxy. Built on `rustls`, so it is cross-platform and host-testable. |
 | **`spl-home`** | Listener-side SPL mux acceptance and server-side mutual TLS. Inbound stream data is bounded by 1 MiB per live stream, plus the decoder ceiling and 1 MiB of outbound staging per live stream; it owns no HTTP parsing or authorization policy. |
+| **`spl-bridge`** | Public SNI-passthrough MCP relay for the journal-MCP endpoint, routing opaque client TLS bytes to a registered journal. |
 
 Application layers stay with the consuming product: observer registration and segment ingest, linked-system credential provisioning, credential storage, and service lifecycles are **not** in this package.
 

@@ -1,0 +1,139 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (c) 2026 sol pbc
+
+//! Standalone public SNI-passthrough MCP relay.
+
+use std::net::SocketAddr;
+use std::process::ExitCode;
+use std::sync::Arc;
+use std::time::Duration;
+
+use spl_bridge::pop_auth::{JwksTimeouts, JwksTokenVerifier, PopAuthenticator};
+use spl_bridge::{
+    pem_certificate_chain, pem_private_key, run_client_listener, run_control_listener,
+    server_tls_config,
+};
+use tokio::net::TcpListener;
+
+const DEFAULT_JWKS_TIMEOUT_MS: u64 = 3_000;
+
+struct Options {
+    control_listen: SocketAddr,
+    client_listen: SocketAddr,
+    control_tls_cert: String,
+    control_tls_key: String,
+    jwks_url: String,
+    jwks_connect_timeout: Duration,
+    jwks_read_timeout: Duration,
+}
+
+#[tokio::main(flavor = "current_thread")]
+async fn main() -> ExitCode {
+    match run().await {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => {
+            eprintln!("spl-bridge: {error}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+async fn run() -> Result<(), String> {
+    let options = parse_options(std::env::args().skip(1))?;
+    let certificate_pem = std::fs::read(&options.control_tls_cert)
+        .map_err(|_| String::from("could not read --control-tls-cert"))?;
+    let private_key_pem = std::fs::read(&options.control_tls_key)
+        .map_err(|_| String::from("could not read --control-tls-key"))?;
+    let tls_config = server_tls_config(
+        pem_certificate_chain(&certificate_pem)
+            .map_err(|_| String::from("could not parse --control-tls-cert"))?,
+        pem_private_key(&private_key_pem)
+            .map_err(|_| String::from("could not parse --control-tls-key"))?,
+    )
+    .map_err(|_| String::from("could not build control TLS configuration"))?;
+    let verifier = JwksTokenVerifier::with_timeouts(
+        &options.jwks_url,
+        JwksTimeouts {
+            connect: options.jwks_connect_timeout,
+            fetch: options.jwks_read_timeout,
+        },
+    )
+    .map_err(|_| String::from("invalid --jwks-url"))?;
+    let control_listener = TcpListener::bind(options.control_listen)
+        .await
+        .map_err(|_| String::from("could not bind --control-listen"))?;
+    let client_listener = TcpListener::bind(options.client_listen)
+        .await
+        .map_err(|_| String::from("could not bind --client-listen"))?;
+
+    let registry = spl_bridge::registry::Registry::default();
+    let authenticator = PopAuthenticator::new(Arc::new(verifier));
+    tokio::join!(
+        run_control_listener(
+            control_listener,
+            Arc::new(tls_config),
+            registry.clone(),
+            authenticator,
+        ),
+        run_client_listener(
+            client_listener,
+            registry,
+            spl_bridge::sni::DEFAULT_READ_DEADLINE,
+        ),
+    );
+    Ok(())
+}
+
+fn parse_options(arguments: impl Iterator<Item = String>) -> Result<Options, String> {
+    let mut control_listen = None;
+    let mut client_listen = None;
+    let mut control_tls_cert = None;
+    let mut control_tls_key = None;
+    let mut jwks_url = None;
+    let mut jwks_connect_timeout = DEFAULT_JWKS_TIMEOUT_MS;
+    let mut jwks_read_timeout = DEFAULT_JWKS_TIMEOUT_MS;
+    let mut arguments = arguments;
+
+    while let Some(flag) = arguments.next() {
+        let value = arguments
+            .next()
+            .ok_or_else(|| format!("missing value for {flag}"))?;
+        match flag.as_str() {
+            "--control-listen" => control_listen = Some(parse_address(&value, &flag)?),
+            "--client-listen" => client_listen = Some(parse_address(&value, &flag)?),
+            "--control-tls-cert" => control_tls_cert = Some(value),
+            "--control-tls-key" => control_tls_key = Some(value),
+            "--jwks-url" => jwks_url = Some(value),
+            "--jwks-connect-timeout-ms" => jwks_connect_timeout = parse_timeout(&value, &flag)?,
+            "--jwks-read-timeout-ms" => jwks_read_timeout = parse_timeout(&value, &flag)?,
+            _ => return Err(format!("unknown option {flag}")),
+        }
+    }
+
+    Ok(Options {
+        control_listen: control_listen.ok_or(String::from("--control-listen is required"))?,
+        client_listen: client_listen.ok_or(String::from("--client-listen is required"))?,
+        control_tls_cert: control_tls_cert.ok_or(String::from("--control-tls-cert is required"))?,
+        control_tls_key: control_tls_key.ok_or(String::from("--control-tls-key is required"))?,
+        jwks_url: jwks_url.ok_or(String::from("--jwks-url is required"))?,
+        jwks_connect_timeout: Duration::from_millis(jwks_connect_timeout),
+        jwks_read_timeout: Duration::from_millis(jwks_read_timeout),
+    })
+}
+
+fn parse_address(value: &str, flag: &str) -> Result<SocketAddr, String> {
+    value
+        .parse()
+        .map_err(|_| format!("invalid address for {flag}"))
+}
+
+fn parse_timeout(value: &str, flag: &str) -> Result<u64, String> {
+    let timeout = value
+        .parse::<u64>()
+        .map_err(|_| format!("invalid timeout for {flag}"))?;
+    if timeout == 0 {
+        Err(format!("timeout for {flag} must be greater than zero"))
+    } else {
+        Ok(timeout)
+    }
+}

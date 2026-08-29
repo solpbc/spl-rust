@@ -23,6 +23,7 @@ struct Options {
     control_tls_cert: String,
     control_tls_key: String,
     jwks_url: String,
+    bridge_id: String,
     jwks_connect_timeout: Duration,
     jwks_read_timeout: Duration,
 }
@@ -57,6 +58,7 @@ async fn run() -> Result<(), String> {
             connect: options.jwks_connect_timeout,
             fetch: options.jwks_read_timeout,
         },
+        options.bridge_id.clone(),
     )
     .map_err(|_| String::from("invalid --jwks-url"))?;
     let control_listener = TcpListener::bind(options.control_listen)
@@ -90,6 +92,7 @@ fn parse_options(arguments: impl Iterator<Item = String>) -> Result<Options, Str
     let mut control_tls_cert = None;
     let mut control_tls_key = None;
     let mut jwks_url = None;
+    let mut bridge_id = None;
     let mut jwks_connect_timeout = DEFAULT_JWKS_TIMEOUT_MS;
     let mut jwks_read_timeout = DEFAULT_JWKS_TIMEOUT_MS;
     let mut arguments = arguments;
@@ -104,6 +107,10 @@ fn parse_options(arguments: impl Iterator<Item = String>) -> Result<Options, Str
             "--control-tls-cert" => control_tls_cert = Some(value),
             "--control-tls-key" => control_tls_key = Some(value),
             "--jwks-url" => jwks_url = Some(value),
+            "--bridge-id" => {
+                validate_bridge_id(&value)?;
+                bridge_id = Some(value);
+            }
             "--jwks-connect-timeout-ms" => jwks_connect_timeout = parse_timeout(&value, &flag)?,
             "--jwks-read-timeout-ms" => jwks_read_timeout = parse_timeout(&value, &flag)?,
             _ => return Err(format!("unknown option {flag}")),
@@ -116,6 +123,7 @@ fn parse_options(arguments: impl Iterator<Item = String>) -> Result<Options, Str
         control_tls_cert: control_tls_cert.ok_or(String::from("--control-tls-cert is required"))?,
         control_tls_key: control_tls_key.ok_or(String::from("--control-tls-key is required"))?,
         jwks_url: jwks_url.ok_or(String::from("--jwks-url is required"))?,
+        bridge_id: bridge_id.ok_or(String::from("--bridge-id is required"))?,
         jwks_connect_timeout: Duration::from_millis(jwks_connect_timeout),
         jwks_read_timeout: Duration::from_millis(jwks_read_timeout),
     })
@@ -135,5 +143,59 @@ fn parse_timeout(value: &str, flag: &str) -> Result<u64, String> {
         Err(format!("timeout for {flag} must be greater than zero"))
     } else {
         Ok(timeout)
+    }
+}
+
+fn validate_bridge_id(value: &str) -> Result<(), String> {
+    if (1..=128).contains(&value.len())
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b':' | b'-'))
+    {
+        Ok(())
+    } else {
+        Err(String::from(
+            "invalid --bridge-id: must be 1-128 characters from [A-Za-z0-9._:-]",
+        ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #![expect(
+        clippy::unwrap_used,
+        reason = "test asserts on the rejection error directly"
+    )]
+
+    use super::validate_bridge_id;
+
+    #[test]
+    fn bridge_id_accepts_the_configured_grammar() {
+        for value in ["bridge", "mcp-bridge-fixture", "a.b_c:d-9"] {
+            assert_eq!(validate_bridge_id(value), Ok(()));
+        }
+    }
+
+    #[test]
+    fn bridge_id_rejections_do_not_echo_the_input() {
+        let too_long = "a".repeat(129);
+        let invalid = [
+            "",
+            " ",
+            " bridge",
+            "bridge ",
+            "bridge\n",
+            "brídge",
+            "bridge!",
+            "bridge/name",
+            &too_long,
+        ];
+        for value in invalid {
+            let error = validate_bridge_id(value).unwrap_err();
+            assert_eq!(
+                error,
+                "invalid --bridge-id: must be 1-128 characters from [A-Za-z0-9._:-]"
+            );
+        }
     }
 }

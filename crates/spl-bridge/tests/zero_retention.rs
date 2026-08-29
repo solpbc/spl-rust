@@ -8,6 +8,7 @@
     reason = "integration fixtures use controlled local certificates, sockets, and paths"
 )]
 
+use std::collections::HashMap;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -31,7 +32,9 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio_rustls::TlsConnector;
 
-const HOSTNAME: &str = "journal-retention.test";
+const HOSTNAME: &str = "aaaqeaye.solstone.me";
+const INSTANCE_ID: &str = "8488ae64-b592-80a3-97c6-490e995daa85";
+const BRIDGE_ID: &str = "mcp-bridge-zero-retention";
 const POP_DOMAIN_SEPARATOR: &[u8] = b"spl-bridge-pop-v1\0";
 
 #[derive(Clone)]
@@ -73,7 +76,10 @@ async fn listener_splice_keeps_payload_out_of_logs_and_scratch_files() {
 
     let fixture_key = SigningKey::from_bytes(&[7; 32]);
     let pop_key = SigningKey::from_bytes(&[19; 32]);
-    let verifier = FixtureTokenVerifier::new([(String::from("fixture"), fixture_key)]).unwrap();
+    let verifier = FixtureTokenVerifier::new(
+        HashMap::from([(String::from("fixture"), fixture_key)]),
+        String::from(BRIDGE_ID),
+    );
     let authenticator = PopAuthenticator::new(Arc::new(verifier.clone()));
     let registry = Registry::default();
     let (certificate, private_key) = certificate_fixture();
@@ -95,13 +101,15 @@ async fn listener_splice_keeps_payload_out_of_logs_and_scratch_files() {
         Duration::from_secs(1),
     ));
 
+    let issued_at = u64::try_from(unix_seconds()).unwrap();
     let token = verifier
         .mint(
             "fixture",
+            INSTANCE_ID,
             HOSTNAME,
-            unix_seconds(),
-            unix_seconds() + 60,
-            pop_key.verifying_key(),
+            issued_at,
+            issued_at + 600,
+            &pop_key.verifying_key(),
         )
         .unwrap();
     let journal = connect_and_authenticate(

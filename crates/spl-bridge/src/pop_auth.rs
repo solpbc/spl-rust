@@ -970,7 +970,7 @@ fn validate_token_claims(
     })
 }
 
-fn valid_hostname(hostname: &str) -> bool {
+pub(crate) fn valid_hostname(hostname: &str) -> bool {
     let Some(label) = hostname.strip_suffix(".solstone.me") else {
         return false;
     };

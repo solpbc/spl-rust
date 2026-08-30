@@ -35,6 +35,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio_rustls::TlsConnector;
 
 const HOSTNAME: &str = "aaaqeaye.solstone.me";
+const RESERVED_CONTROL_SNI: &str = "bridge.solstone.me";
 const INSTANCE_ID: &str = "8488ae64-b592-80a3-97c6-490e995daa85";
 const BRIDGE_ID: &str = "mcp-bridge-zero-retention";
 
@@ -60,6 +61,109 @@ impl Write for LogWriter {
     fn flush(&mut self) -> io::Result<()> {
         Ok(())
     }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn fragmented_reserved_client_hello_and_pipelined_tail_reach_control_unchanged() {
+    let control_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let control_address = control_listener.local_addr().unwrap();
+    let client_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let client_address = client_listener.local_addr().unwrap();
+    let client_task = tokio::spawn(run_client_listener(
+        client_listener,
+        Registry::default(),
+        control_address,
+        Duration::from_secs(1),
+    ));
+
+    let hello = fragment_client_hello(&client_hello(RESERVED_CONTROL_SNI), 0x51a7_2c3d);
+    let tail = b"pipelined-tail-must-arrive-without-a-proxy-prefix".to_vec();
+    let mut expected = hello.clone();
+    expected.extend_from_slice(&tail);
+    let captured = tokio::spawn(async move {
+        let (mut stream, _) = control_listener.accept().await.unwrap();
+        let mut bytes = Vec::new();
+        stream.read_to_end(&mut bytes).await.unwrap();
+        bytes
+    });
+
+    let mut client = TcpStream::connect(client_address).await.unwrap();
+    client.write_all(&expected).await.unwrap();
+    client.shutdown().await.unwrap();
+    assert_eq!(captured.await.unwrap(), expected);
+    client_task.abort();
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn reserved_name_bypasses_a_maliciously_seeded_registry_entry() {
+    let registry = Registry::default();
+    let (carrier, mut malicious_journal) = tokio::io::duplex(1024);
+    registry
+        .register(
+            String::from(RESERVED_CONTROL_SNI),
+            carrier,
+            u64::MAX,
+            tokio::time::Instant::now() + Duration::from_secs(1),
+        )
+        .await
+        .unwrap();
+
+    let control_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let control_address = control_listener.local_addr().unwrap();
+    let client_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let client_address = client_listener.local_addr().unwrap();
+    let client_task = tokio::spawn(run_client_listener(
+        client_listener,
+        registry,
+        control_address,
+        Duration::from_secs(1),
+    ));
+
+    let expected = client_hello(RESERVED_CONTROL_SNI);
+    let captured = tokio::spawn(async move {
+        let (mut stream, _) = control_listener.accept().await.unwrap();
+        let mut bytes = Vec::new();
+        stream.read_to_end(&mut bytes).await.unwrap();
+        bytes
+    });
+    let mut client = TcpStream::connect(client_address).await.unwrap();
+    client.write_all(&expected).await.unwrap();
+    client.shutdown().await.unwrap();
+    assert_eq!(captured.await.unwrap(), expected);
+    let mut byte = [0u8; 1];
+    assert!(
+        tokio::time::timeout(
+            Duration::from_millis(100),
+            malicious_journal.read(&mut byte)
+        )
+        .await
+        .is_err(),
+        "reserved-name traffic must not open a stream on the seeded journal"
+    );
+    client_task.abort();
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn reserved_sni_completes_real_pop_registration_through_the_public_listener() {
+    let fixture_key = SigningKey::from_bytes(&[7; 32]);
+    let pop_key = SigningKey::from_bytes(&[19; 32]);
+    let verifier = FixtureTokenVerifier::new(
+        HashMap::from([(String::from("fixture"), fixture_key)]),
+        String::from(BRIDGE_ID),
+    );
+    let registry = Registry::default();
+    let (public_address, certificate, control_task, client_task) = start_bridge(
+        registry.clone(),
+        verifier.clone(),
+        DEFAULT_ADMISSION_DEADLINE,
+    )
+    .await;
+    let token = mint_token(&verifier, &pop_key, HOSTNAME);
+    let journal = connect_and_authenticate(public_address, certificate, token, pop_key).await;
+    wait_for_registration(&registry).await;
+    drop(journal);
+    control_task.abort();
+    client_task.abort();
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -100,6 +204,7 @@ async fn listener_splice_keeps_payload_out_of_logs_and_scratch_files() {
     let client_task = tokio::spawn(run_client_listener(
         client_listener,
         registry.clone(),
+        control_address,
         Duration::from_secs(1),
     ));
 
@@ -138,10 +243,10 @@ async fn listener_splice_keeps_payload_out_of_logs_and_scratch_files() {
 
     let captured = logs.0.lock().unwrap().clone();
     assert!(
-        captured
+        !captured
             .windows(HOSTNAME.len())
             .any(|window| window == HOSTNAME.as_bytes()),
-        "the operational log capture must contain routing metadata"
+        "hostname input must not be emitted into operational logs"
     );
     for protected in [&payload, &response] {
         assert!(
@@ -175,7 +280,7 @@ async fn acceptance_criteria_3_and_5_admission_deadline_closes_stalled_peers_and
         String::from(BRIDGE_ID),
     );
     let registry = Registry::default();
-    let (control_address, certificate, control_task) = start_control_listener(
+    let (control_address, certificate, control_task, client_task) = start_bridge(
         registry.clone(),
         verifier.clone(),
         Duration::from_millis(200),
@@ -228,6 +333,7 @@ async fn acceptance_criteria_3_and_5_admission_deadline_closes_stalled_peers_and
     assert_connection_closed(&mut slow_proof).await;
     drop(journal);
     control_task.abort();
+    client_task.abort();
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -247,7 +353,7 @@ async fn acceptance_criteria_11_and_12_use_verified_identity_and_fixed_admission
         String::from(BRIDGE_ID),
     );
     let registry = Registry::default();
-    let (control_address, certificate, control_task) = start_control_listener(
+    let (control_address, certificate, control_task, client_task) = start_bridge(
         registry.clone(),
         verifier.clone(),
         Duration::from_millis(200),
@@ -293,7 +399,7 @@ async fn acceptance_criteria_11_and_12_use_verified_identity_and_fixed_admission
     framing_rejection.flush().await.unwrap();
     assert_connection_closed(&mut framing_rejection).await;
 
-    let mut timeout_rejection = TcpStream::connect(control_address).await.unwrap();
+    let mut timeout_rejection = connect_control(control_address, certificate.clone()).await;
     assert_connection_closed(&mut timeout_rejection).await;
 
     let journal = connect_and_authenticate(
@@ -309,11 +415,9 @@ async fn acceptance_criteria_11_and_12_use_verified_identity_and_fixed_admission
     let captured = wait_for_log_fragments(
         &logs,
         [
-            "token_rejection",
-            "framing_or_proof_rejection",
-            "admission_timeout",
-            "peer",
-            "generation",
+            "journal registration rejected: token rejection",
+            "journal registration rejected: framing or proof rejection",
+            "journal registration timed out",
         ],
     )
     .await;
@@ -334,9 +438,10 @@ async fn acceptance_criteria_11_and_12_use_verified_identity_and_fixed_admission
     }
 
     control_task.abort();
+    client_task.abort();
 }
 
-async fn start_control_listener(
+async fn start_bridge(
     registry: Registry,
     verifier: FixtureTokenVerifier,
     admission_deadline: Duration,
@@ -344,25 +449,34 @@ async fn start_control_listener(
     std::net::SocketAddr,
     CertificateDer<'static>,
     tokio::task::JoinHandle<()>,
+    tokio::task::JoinHandle<()>,
 ) {
     let (certificate, private_key) = certificate_fixture();
     let tls_config = Arc::new(server_tls_config(vec![certificate.clone()], private_key).unwrap());
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let address = listener.local_addr().unwrap();
+    let control_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let control_address = control_listener.local_addr().unwrap();
+    let client_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let client_address = client_listener.local_addr().unwrap();
     let authenticator = PopAuthenticator::new(Arc::new(verifier), String::from(BRIDGE_ID));
     let task = tokio::spawn(run_control_listener(
-        listener,
+        control_listener,
         tls_config,
-        registry,
+        registry.clone(),
         authenticator,
         admission_deadline,
     ));
-    (address, certificate, task)
+    let client_task = tokio::spawn(run_client_listener(
+        client_listener,
+        registry,
+        control_address,
+        admission_deadline,
+    ));
+    (client_address, certificate, task, client_task)
 }
 
 fn certificate_fixture() -> (CertificateDer<'static>, PrivateKeyDer<'static>) {
     let key = KeyPair::generate().unwrap();
-    let params = CertificateParams::new(vec![String::from("bridge.test")]).unwrap();
+    let params = CertificateParams::new(vec![String::from("bridge.solstone.me")]).unwrap();
     let certificate = params.self_signed(&key).unwrap();
     (
         CertificateDer::from(certificate.der().to_vec()),
@@ -402,7 +516,9 @@ async fn connect_control(
         .unwrap()
         .with_root_certificates(roots)
         .with_no_client_auth();
-    let server_name = ServerName::try_from("bridge.test").unwrap().to_owned();
+    let server_name = ServerName::try_from("bridge.solstone.me")
+        .unwrap()
+        .to_owned();
     TlsConnector::from(Arc::new(config))
         .connect(server_name, TcpStream::connect(address).await.unwrap())
         .await
@@ -604,6 +720,26 @@ fn client_hello(hostname: &str) -> Vec<u8> {
     push_u16(&mut record, handshake.len().try_into().unwrap());
     record.extend_from_slice(&handshake);
     record
+}
+
+fn fragment_client_hello(hello: &[u8], seed: u32) -> Vec<u8> {
+    let handshake = &hello[5..];
+    let mut output = Vec::new();
+    let mut position = 0;
+    let mut state = seed;
+    while position < handshake.len() {
+        state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+        let mut payload_length = 1 + usize::try_from((state >> 24) % 7).unwrap();
+        if position < 4 {
+            payload_length = [1, 2, 1][position.min(2)];
+        }
+        let end = (position + payload_length).min(handshake.len());
+        output.extend([0x16, 0x03, 0x01]);
+        push_u16(&mut output, (end - position).try_into().unwrap());
+        output.extend_from_slice(&handshake[position..end]);
+        position = end;
+    }
+    output
 }
 
 fn push_u16(out: &mut Vec<u8>, value: u16) {

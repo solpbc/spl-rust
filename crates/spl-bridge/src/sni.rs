@@ -9,7 +9,6 @@ use thiserror::Error;
 use tokio::net::TcpStream;
 
 const INITIAL_PEEK_BYTES: usize = 4 * 1024;
-const MAX_CLIENT_HELLO_BYTES: usize = 32 * 1024;
 const INCOMPLETE_RETRY_DELAY: Duration = Duration::from_millis(10);
 const TLS_HANDSHAKE: u8 = 0x16;
 const CLIENT_HELLO: u8 = 0x01;
@@ -22,6 +21,26 @@ const HOST_NAME: u8 = 0;
 /// or slowloris connection before the listener has enough information to route
 /// it.
 pub const DEFAULT_READ_DEADLINE: Duration = Duration::from_secs(5);
+
+/// Bounds applied while reassembling a TLS `ClientHello` across TLS records.
+///
+/// The handshake bound includes its four-byte TLS handshake header. The wire
+/// bound permits a one-byte record payload for every allowed handshake byte:
+/// `32_768 * (5 + 1) == 196_608`.
+#[derive(Clone, Copy)]
+struct ClientHelloLimits {
+    handshake_message_bytes: usize,
+    record_payload_bytes: usize,
+    record_count: usize,
+    encoded_wire_bytes: usize,
+}
+
+const CLIENT_HELLO_LIMITS: ClientHelloLimits = ClientHelloLimits {
+    handshake_message_bytes: 32_768,
+    record_payload_bytes: 16_384,
+    record_count: 32_768,
+    encoded_wire_bytes: 196_608,
+};
 
 /// Errors returned while extracting a TLS SNI hostname.
 #[derive(Debug, Error, PartialEq, Eq)]
@@ -67,11 +86,11 @@ async fn extract_sni_inner(stream: &TcpStream) -> Result<String, SniError> {
 
         match parse_client_hello(&bytes[..received])? {
             ParseOutcome::Complete(hostname) => return Ok(hostname),
-            ParseOutcome::Incomplete if capacity == MAX_CLIENT_HELLO_BYTES => {
+            ParseOutcome::Incomplete if capacity == CLIENT_HELLO_LIMITS.encoded_wire_bytes => {
                 return Err(SniError::MalformedClientHello);
             }
             ParseOutcome::Incomplete if received == capacity => {
-                capacity = (capacity * 2).min(MAX_CLIENT_HELLO_BYTES);
+                capacity = (capacity * 2).min(CLIENT_HELLO_LIMITS.encoded_wire_bytes);
             }
             ParseOutcome::Incomplete => {
                 stream.readable().await.map_err(|_| SniError::Io)?;
@@ -90,36 +109,88 @@ enum ParseOutcome {
 }
 
 fn parse_client_hello(input: &[u8]) -> Result<ParseOutcome, SniError> {
-    if input.len() < 5 {
-        return Ok(ParseOutcome::Incomplete);
-    }
-    if input[0] != TLS_HANDSHAKE {
-        return Err(SniError::MalformedClientHello);
-    }
-    let record_length = usize::from(u16::from_be_bytes([input[3], input[4]]));
-    let record_end = 5usize
-        .checked_add(record_length)
-        .ok_or(SniError::MalformedClientHello)?;
-    if record_end > MAX_CLIENT_HELLO_BYTES {
-        return Err(SniError::MalformedClientHello);
-    }
-    if input.len() < record_end {
-        return Ok(ParseOutcome::Incomplete);
-    }
+    parse_client_hello_with_limits(input, CLIENT_HELLO_LIMITS)
+}
 
-    let record = &input[5..record_end];
-    if record.len() < 4 || record[0] != CLIENT_HELLO {
-        return Err(SniError::MalformedClientHello);
+/// Parse complete TLS records from a freshly peeked prefix.
+///
+/// `extract_sni_inner` re-peeks from byte zero whenever it grows its window, so
+/// this parser deliberately derives all reassembly state from `input` on every
+/// call. Nothing here is retained between peeks.
+fn parse_client_hello_with_limits(
+    input: &[u8],
+    limits: ClientHelloLimits,
+) -> Result<ParseOutcome, SniError> {
+    let mut record_cursor = 0;
+    let mut record_count = 0;
+    let mut encoded_wire_bytes: usize = 0;
+    let mut handshake = Vec::new();
+    let mut handshake_length = None;
+
+    loop {
+        if record_cursor == input.len() {
+            return Ok(ParseOutcome::Incomplete);
+        }
+        if record_count == limits.record_count {
+            return Err(SniError::MalformedClientHello);
+        }
+        let Some(record_header) = input.get(record_cursor..record_cursor + 5) else {
+            return Ok(ParseOutcome::Incomplete);
+        };
+        if record_header[0] != TLS_HANDSHAKE {
+            return Err(SniError::MalformedClientHello);
+        }
+        let payload_length = usize::from(u16::from_be_bytes([record_header[3], record_header[4]]));
+        if payload_length > limits.record_payload_bytes {
+            return Err(SniError::MalformedClientHello);
+        }
+        let encoded_record_length = 5usize
+            .checked_add(payload_length)
+            .ok_or(SniError::MalformedClientHello)?;
+        let next_encoded_wire_bytes = encoded_wire_bytes
+            .checked_add(encoded_record_length)
+            .ok_or(SniError::MalformedClientHello)?;
+        if next_encoded_wire_bytes > limits.encoded_wire_bytes {
+            return Err(SniError::MalformedClientHello);
+        }
+        let record_end = record_cursor
+            .checked_add(encoded_record_length)
+            .ok_or(SniError::MalformedClientHello)?;
+        let Some(payload) = input.get(record_cursor + 5..record_end) else {
+            return Ok(ParseOutcome::Incomplete);
+        };
+
+        record_count += 1;
+        encoded_wire_bytes = next_encoded_wire_bytes;
+        for (index, byte) in payload.iter().copied().enumerate() {
+            if handshake.len() == limits.handshake_message_bytes {
+                return Err(SniError::MalformedClientHello);
+            }
+            handshake.push(byte);
+            if handshake.len() == 1 && handshake[0] != CLIENT_HELLO {
+                return Err(SniError::MalformedClientHello);
+            }
+            if handshake.len() == 4 {
+                let body_length = (usize::from(handshake[1]) << 16)
+                    | (usize::from(handshake[2]) << 8)
+                    | usize::from(handshake[3]);
+                let total_length = 4usize
+                    .checked_add(body_length)
+                    .ok_or(SniError::MalformedClientHello)?;
+                if total_length > limits.handshake_message_bytes {
+                    return Err(SniError::MalformedClientHello);
+                }
+                handshake_length = Some(total_length);
+            }
+            if handshake_length == Some(handshake.len()) {
+                if index + 1 != payload.len() {
+                    return Err(SniError::MalformedClientHello);
+                }
+                return parse_client_hello_body(&handshake[4..]).map(ParseOutcome::Complete);
+            }
+        }
+        record_cursor = record_end;
     }
-    let handshake_length =
-        (usize::from(record[1]) << 16) | (usize::from(record[2]) << 8) | usize::from(record[3]);
-    let handshake_end = 4usize
-        .checked_add(handshake_length)
-        .ok_or(SniError::MalformedClientHello)?;
-    if handshake_end != record.len() {
-        return Err(SniError::MalformedClientHello);
-    }
-    parse_client_hello_body(&record[4..handshake_end]).map(ParseOutcome::Complete)
 }
 
 fn parse_client_hello_body(body: &[u8]) -> Result<String, SniError> {
@@ -294,6 +365,34 @@ mod tests {
         record
     }
 
+    fn fragment_handshake(handshake_record: &[u8], seed: u32) -> Vec<u8> {
+        let handshake = &handshake_record[5..];
+        let mut state = seed;
+        let mut position = 0;
+        let mut records = Vec::new();
+        while position < handshake.len() {
+            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            let mut length = 1 + usize::try_from((state >> 24) % 11).unwrap();
+            if position < 4 {
+                length = [1, 2, 1][position.min(2)];
+            }
+            let end = (position + length).min(handshake.len());
+            records.extend([TLS_HANDSHAKE, 0x03, 0x01]);
+            push_u16(&mut records, (end - position).try_into().unwrap());
+            records.extend_from_slice(&handshake[position..end]);
+            position = end;
+        }
+        records
+    }
+
+    fn one_byte_records(handshake_record: &[u8]) -> Vec<u8> {
+        let mut records = Vec::new();
+        for byte in &handshake_record[5..] {
+            records.extend([TLS_HANDSHAKE, 0x03, 0x01, 0, 1, *byte]);
+        }
+        records
+    }
+
     fn extension(out: &mut Vec<u8>, extension_type: u16, data: &[u8]) {
         push_u16(out, extension_type);
         push_u16(out, data.len().try_into().unwrap());
@@ -348,6 +447,59 @@ mod tests {
 
         client.write_all(&hello).await.unwrap();
         assert_eq!(extraction.await.unwrap().unwrap(), "grease.journal.test");
+    }
+
+    #[tokio::test]
+    async fn extracts_sni_across_lcg_fragmented_tls_records_and_header_splits() {
+        let (mut client, server) = tcp_pair().await;
+        let hello = fragment_handshake(&client_hello("record.journal.test", true), 0x5151_7eed);
+        let extraction =
+            tokio::spawn(async move { extract_sni(&server, DEFAULT_READ_DEADLINE).await });
+
+        client.write_all(&hello).await.unwrap();
+        assert_eq!(extraction.await.unwrap().unwrap(), "record.journal.test");
+    }
+
+    #[test]
+    fn one_byte_record_encoding_reaches_the_exact_cumulative_wire_limit() {
+        let hostname = "limit.journal.test";
+        let mut hello = client_hello(hostname, false);
+        let target_handshake_length = CLIENT_HELLO_LIMITS.handshake_message_bytes;
+        let current_handshake_length = hello.len() - 5;
+        let padding_length = target_handshake_length - current_handshake_length - 4;
+
+        let record_length = u16::from_be_bytes([hello[3], hello[4]]);
+        let extension_length_index = 5 + 4 + 2 + 32 + 1 + 2 + 2 + 1 + 1;
+        let old_extensions_length = usize::from(u16::from_be_bytes([
+            hello[extension_length_index],
+            hello[extension_length_index + 1],
+        ]));
+        let padding_length_u16: u16 = padding_length.try_into().unwrap();
+        let new_extensions_length: u16 = (old_extensions_length + 4 + padding_length)
+            .try_into()
+            .unwrap();
+        hello[extension_length_index..extension_length_index + 2]
+            .copy_from_slice(&new_extensions_length.to_be_bytes());
+        hello.extend_from_slice(&0xfafa_u16.to_be_bytes());
+        hello.extend_from_slice(&padding_length_u16.to_be_bytes());
+        hello.extend(std::iter::repeat_n(0, padding_length));
+        let new_record_length: u16 = (usize::from(record_length) + 4 + padding_length)
+            .try_into()
+            .unwrap();
+        hello[3..5].copy_from_slice(&new_record_length.to_be_bytes());
+        let body_length = target_handshake_length - 4;
+        hello[6..9].copy_from_slice(&[
+            (body_length >> 16).try_into().unwrap(),
+            (body_length >> 8).try_into().unwrap(),
+            (body_length & 0xff).try_into().unwrap(),
+        ]);
+
+        let records = one_byte_records(&hello);
+        assert_eq!(records.len(), CLIENT_HELLO_LIMITS.encoded_wire_bytes);
+        assert!(matches!(
+            parse_client_hello(&records),
+            Ok(ParseOutcome::Complete(actual)) if actual == hostname
+        ));
     }
 
     #[tokio::test]

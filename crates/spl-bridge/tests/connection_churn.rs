@@ -9,13 +9,33 @@
     reason = "the controlled in-memory mux fixture asserts at exact failure sites"
 )]
 
+use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::Duration;
 
+use ed25519_dalek::SigningKey;
+use spl_bridge::pop_auth::{FixtureTokenVerifier, PopAuthenticator, RenewalIdentity};
 use spl_bridge::registry::Registry;
 use spl_home::{MuxAcceptor, MuxEvent, MuxLimits};
 use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream};
 
 const STREAMS: usize = 256;
+
+fn authenticator() -> PopAuthenticator {
+    let verifier = FixtureTokenVerifier::new(
+        HashMap::from([(String::from("fixture"), SigningKey::from_bytes(&[7; 32]))]),
+        String::from("bridge-test"),
+    );
+    PopAuthenticator::new(Arc::new(verifier), String::from("bridge-test"))
+}
+
+fn identity() -> RenewalIdentity {
+    RenewalIdentity::new(
+        String::from("churn.test"),
+        String::from("instance-test"),
+        SigningKey::from_bytes(&[19; 32]).verifying_key(),
+    )
+}
 
 #[tokio::test]
 async fn stream_churn_returns_registry_state_to_its_empty_baseline() {
@@ -25,15 +45,20 @@ async fn stream_churn_returns_registry_state_to_its_empty_baseline() {
         .register(
             String::from("churn.test"),
             carrier,
+            authenticator(),
+            identity(),
             u64::MAX,
             tokio::time::Instant::now() + Duration::from_secs(10),
         )
         .await
         .unwrap();
     let mut acceptor = MuxAcceptor::new(MuxLimits::default()).unwrap();
+    let output = feed_next(&mut peer, &mut acceptor).await;
+    assert_eq!(output.events, vec![MuxEvent::Opened { stream_id: 1 }]);
 
-    for _ in 0..STREAMS {
+    for index in 0..STREAMS {
         let mut stream = journal.open_stream().await.unwrap();
+        assert_eq!(stream.id(), 3 + u32::try_from(index).unwrap() * 2);
         let output = feed_next(&mut peer, &mut acceptor).await;
         assert_eq!(
             output.events,

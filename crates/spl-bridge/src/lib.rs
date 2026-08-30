@@ -25,6 +25,7 @@ use tokio::sync::Semaphore;
 use tokio_rustls::TlsAcceptor;
 
 pub mod frame_dialer;
+mod lease;
 pub mod pop_auth;
 pub mod proxy_protocol;
 pub mod registry;
@@ -100,7 +101,7 @@ const CONTROL_SPLICE_CONNECT_DEADLINE: Duration = Duration::from_secs(3);
 const RESERVED_CONTROL_SNI: &str = "bridge.solstone.me";
 
 #[derive(Clone, Copy)]
-enum BridgeLogEvent {
+pub(crate) enum BridgeLogEvent {
     ControlListenerStarted,
     ControlListenerAcceptFailed,
     ControlTlsHandshakeRejected,
@@ -115,6 +116,12 @@ enum BridgeLogEvent {
     JournalRegistered,
     JournalEvicted,
     JournalRegistrationAdmissionTimedOut,
+    JournalLeaseRenewalRetryableAttemptFailed,
+    JournalLeaseRenewalTerminalPoisoned,
+    JournalLeaseRenewalNonceOutstandingCapacity,
+    JournalLeaseRenewalNonceSpentCapacity,
+    JournalLeaseRenewed,
+    JournalLeaseExpiredWallClock,
     ClientListenerStarted,
     ClientListenerAcceptFailed,
     ClientRejectedBeforeRouting,
@@ -131,7 +138,7 @@ enum BridgeLogEvent {
 }
 
 impl BridgeLogEvent {
-    fn emit(self) {
+    pub(crate) fn emit(self) {
         match self {
             Self::ControlListenerStarted => tracing::info!("control listener started"),
             Self::ControlListenerAcceptFailed => tracing::warn!("control listener accept failed"),
@@ -164,6 +171,22 @@ impl BridgeLogEvent {
             Self::JournalEvicted => tracing::info!("journal evicted"),
             Self::JournalRegistrationAdmissionTimedOut => {
                 tracing::warn!("journal registration timed out");
+            }
+            Self::JournalLeaseRenewalRetryableAttemptFailed => {
+                tracing::warn!("journal lease renewal attempt rejected");
+            }
+            Self::JournalLeaseRenewalTerminalPoisoned => {
+                tracing::warn!("journal lease renewal stream poisoned");
+            }
+            Self::JournalLeaseRenewalNonceOutstandingCapacity => {
+                tracing::warn!("journal lease renewal rejected: nonce outstanding capacity");
+            }
+            Self::JournalLeaseRenewalNonceSpentCapacity => {
+                tracing::warn!("journal lease renewal rejected: nonce spent capacity");
+            }
+            Self::JournalLeaseRenewed => tracing::info!("journal lease renewed"),
+            Self::JournalLeaseExpiredWallClock => {
+                tracing::warn!("journal lease expired");
             }
             Self::ClientListenerStarted => tracing::info!("client listener started"),
             Self::ClientListenerAcceptFailed => tracing::warn!("client listener accept failed"),
@@ -240,10 +263,13 @@ pub async fn run_control_listener(
                     }
                 };
                 let hostname = registration.hostname().to_owned();
+                let identity = registration.renewal_identity();
                 let journal = match registry
                     .register(
                         hostname,
                         tls_stream,
+                        authenticator,
+                        identity,
                         registration.claims().expires_at(),
                         deadline,
                     )
@@ -451,12 +477,44 @@ async fn handle_client<C>(
 
 #[cfg(test)]
 mod tests {
+    #![expect(
+        clippy::unwrap_used,
+        reason = "tests use an in-memory log capture fixture"
+    )]
+
+    use std::io::Write;
+    use std::sync::{Arc, Mutex};
+
     use super::*;
     use crate::frame_dialer::DialerError;
     use crate::pop_auth::PopError;
     use crate::registry::RegistryError;
     use tokio::io::AsyncReadExt;
     use tokio::sync::Notify;
+
+    #[derive(Clone)]
+    struct LogBuffer(Arc<Mutex<Vec<u8>>>);
+
+    struct LogWriter(LogBuffer);
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for LogBuffer {
+        type Writer = LogWriter;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            LogWriter(self.clone())
+        }
+    }
+
+    impl Write for LogWriter {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.0.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
 
     #[derive(Clone)]
     struct NeverReadyControlConnector(Arc<Notify>);
@@ -664,6 +722,52 @@ mod tests {
                 registry_admission_event(&error),
                 BridgeLogEvent::JournalRegistrationRegistryFailed
             ));
+        }
+
+        for event in [
+            BridgeLogEvent::JournalLeaseRenewalRetryableAttemptFailed,
+            BridgeLogEvent::JournalLeaseRenewalTerminalPoisoned,
+            BridgeLogEvent::JournalLeaseRenewalNonceOutstandingCapacity,
+            BridgeLogEvent::JournalLeaseRenewalNonceSpentCapacity,
+            BridgeLogEvent::JournalLeaseRenewed,
+            BridgeLogEvent::JournalLeaseExpiredWallClock,
+        ] {
+            event.emit();
+        }
+    }
+
+    #[test]
+    fn acceptance_criterion_renewal_12_lease_events_do_not_reflect_peer_data() {
+        let logs = LogBuffer(Arc::new(Mutex::new(Vec::new())));
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .without_time()
+            .with_writer(logs.clone())
+            .finish();
+
+        tracing::subscriber::with_default(subscriber, || {
+            for event in [
+                BridgeLogEvent::JournalLeaseRenewalRetryableAttemptFailed,
+                BridgeLogEvent::JournalLeaseRenewalTerminalPoisoned,
+                BridgeLogEvent::JournalLeaseRenewalNonceOutstandingCapacity,
+                BridgeLogEvent::JournalLeaseRenewalNonceSpentCapacity,
+                BridgeLogEvent::JournalLeaseRenewed,
+                BridgeLogEvent::JournalLeaseExpiredWallClock,
+            ] {
+                event.emit();
+            }
+        });
+
+        let output = String::from_utf8(logs.0.lock().unwrap().clone()).unwrap();
+        for peer_value in [
+            "eyJhbGciOiJFZERTQSJ9.payload.signature",
+            "journal.example.test",
+            "8488ae64-b592-80a3-97c6-490e995daa85",
+            "AAECAwQFBgcICQoLDA0ODw",
+            "127.0.0.1:443",
+            "nonce-or-proof-bytes",
+        ] {
+            assert!(!output.contains(peer_value));
         }
     }
 }

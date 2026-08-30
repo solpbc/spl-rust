@@ -24,11 +24,13 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 use spl_bridge::pop_auth::{
     Challenge, ChallengeResponse, FixtureTokenVerifier, PopAuthenticator, RegistrationRequest,
+    RenewalIdentity,
 };
 use spl_bridge::registry::Registry;
 use spl_bridge::{
     DEFAULT_ADMISSION_DEADLINE, run_client_listener, run_control_listener, server_tls_config,
 };
+use spl_core::frame::{FLAG_OPEN, FrameDecoder};
 use spl_home::{MuxAcceptor, MuxEvent, MuxLimits};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -38,6 +40,22 @@ const HOSTNAME: &str = "aaaqeaye.solstone.me";
 const RESERVED_CONTROL_SNI: &str = "bridge.solstone.me";
 const INSTANCE_ID: &str = "8488ae64-b592-80a3-97c6-490e995daa85";
 const BRIDGE_ID: &str = "mcp-bridge-zero-retention";
+
+fn registry_authenticator() -> PopAuthenticator {
+    let verifier = FixtureTokenVerifier::new(
+        HashMap::from([(String::from("fixture"), SigningKey::from_bytes(&[7; 32]))]),
+        String::from(BRIDGE_ID),
+    );
+    PopAuthenticator::new(Arc::new(verifier), String::from(BRIDGE_ID))
+}
+
+fn registry_identity(hostname: &str) -> RenewalIdentity {
+    RenewalIdentity::new(
+        String::from(hostname),
+        String::from(INSTANCE_ID),
+        SigningKey::from_bytes(&[19; 32]).verifying_key(),
+    )
+}
 
 #[derive(Clone)]
 struct LogBuffer(Arc<Mutex<Vec<u8>>>);
@@ -102,11 +120,23 @@ async fn reserved_name_bypasses_a_maliciously_seeded_registry_entry() {
         .register(
             String::from(RESERVED_CONTROL_SNI),
             carrier,
+            registry_authenticator(),
+            registry_identity(RESERVED_CONTROL_SNI),
             u64::MAX,
             tokio::time::Instant::now() + Duration::from_secs(1),
         )
         .await
         .unwrap();
+    let mut control_open = [0u8; 8];
+    malicious_journal
+        .read_exact(&mut control_open)
+        .await
+        .unwrap();
+    let mut decoder = FrameDecoder::new();
+    decoder.feed(&control_open);
+    let frame = decoder.next_frame().unwrap().unwrap();
+    assert_eq!(frame.stream_id, 1);
+    assert_eq!(frame.flags, FLAG_OPEN);
 
     let control_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let control_address = control_listener.local_addr().unwrap();

@@ -74,6 +74,40 @@ pub struct VerifiedClaims {
     pop_key: VerifyingKey,
 }
 
+/// Identity attributes that stay fixed for one registered journal generation.
+#[derive(Clone)]
+pub struct RenewalIdentity {
+    hostname: String,
+    instance_id: String,
+    pop_key: VerifyingKey,
+}
+
+impl RenewalIdentity {
+    /// Build the immutable identity bound to one journal registration generation.
+    pub fn new(hostname: String, instance_id: String, pop_key: VerifyingKey) -> Self {
+        Self {
+            hostname,
+            instance_id,
+            pop_key,
+        }
+    }
+
+    /// Return the hostname fixed at initial registration.
+    pub fn hostname(&self) -> &str {
+        &self.hostname
+    }
+
+    /// Return the instance id fixed at initial registration.
+    pub fn instance_id(&self) -> &str {
+        &self.instance_id
+    }
+
+    /// Return the proof key fixed at initial registration.
+    pub fn pop_key(&self) -> &VerifyingKey {
+        &self.pop_key
+    }
+}
+
 impl VerifiedClaims {
     /// Return the Solstone instance id authorized by the token subject.
     pub fn instance_id(&self) -> &str {
@@ -182,6 +216,24 @@ pub struct ChallengeResponse {
     pub signature: String,
 }
 
+/// The complete response to a bridge-initiated journal lease renewal challenge.
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct RenewalResponse {
+    token: String,
+    hostname: String,
+    signature: String,
+}
+
+/// The result category for one renewal attempt.
+#[derive(Debug)]
+pub(crate) enum RenewalError {
+    /// The complete response was received but could not be accepted.
+    Retryable(PopError),
+    /// Carrier byte synchronization was lost before a complete response arrived.
+    Terminal,
+}
+
 /// The journal identity established by a successful proof-of-possession exchange.
 #[derive(Clone)]
 pub struct AuthenticatedRegistration {
@@ -198,6 +250,14 @@ impl AuthenticatedRegistration {
     /// Return the verified JWT claim set bound to this registration.
     pub fn claims(&self) -> &VerifiedClaims {
         &self.claims
+    }
+
+    pub(crate) fn renewal_identity(&self) -> RenewalIdentity {
+        RenewalIdentity {
+            hostname: self.hostname.clone(),
+            instance_id: self.claims.instance_id.clone(),
+            pop_key: self.claims.pop_key,
+        }
     }
 }
 
@@ -410,6 +470,70 @@ impl PopAuthenticator {
             hostname: request.hostname,
             claims,
         })
+    }
+
+    pub(crate) async fn renew<S>(
+        &self,
+        carrier: &mut S,
+        identity: &RenewalIdentity,
+        check_expires_at: u64,
+    ) -> Result<u64, RenewalError>
+    where
+        S: AsyncRead + AsyncWrite + Unpin,
+    {
+        let now = unix_seconds().map_err(RenewalError::Retryable)?;
+        let issued_at = i64::try_from(now)
+            .map_err(|_| RenewalError::Retryable(PopError::ChallengeTimeInvalid))?;
+        let mut nonce = NonceLease::issue(Arc::clone(&self.nonces), now, check_expires_at)
+            .map_err(RenewalError::Retryable)?;
+        let challenge = Challenge {
+            nonce: URL_SAFE_NO_PAD.encode(nonce.bytes()),
+            bridge_id: self.bridge_id.clone(),
+            timestamp: issued_at,
+        };
+        write_message(carrier, &challenge)
+            .await
+            .map_err(|_| RenewalError::Terminal)?;
+
+        let body = read_renewal_body(carrier)
+            .await
+            .map_err(|_| RenewalError::Terminal)?;
+        let response: RenewalResponse = serde_json::from_slice(&body)
+            .map_err(|_| RenewalError::Retryable(PopError::InvalidMessage))?;
+        let claims = self
+            .verifier
+            .verify(&response.token)
+            .await
+            .map_err(RenewalError::Retryable)?;
+        let verified_now = unix_seconds().map_err(RenewalError::Retryable)?;
+        let verified_at = i64::try_from(verified_now)
+            .map_err(|_| RenewalError::Retryable(PopError::ChallengeTimeInvalid))?;
+        if !challenge_timestamp_is_fresh(issued_at, verified_at) {
+            return Err(RenewalError::Retryable(PopError::ChallengeTimeInvalid));
+        }
+        let signature = decode_signature(&response.signature).map_err(RenewalError::Retryable)?;
+        let signed = proof_message(nonce.bytes(), &self.bridge_id, issued_at);
+        identity
+            .pop_key()
+            .verify_strict(&signed, &signature)
+            .map_err(|_| RenewalError::Retryable(PopError::InvalidProof))?;
+
+        let successor_expiry = claims.expires_at();
+        nonce
+            .redeem_and_extend(check_expires_at, successor_expiry, verified_now)
+            .map_err(RenewalError::Retryable)?;
+
+        if response.hostname != claims.hostname()
+            || claims.hostname() != identity.hostname()
+            || claims.instance_id() != identity.instance_id()
+            || claims.pop_key() != identity.pop_key()
+        {
+            return Err(RenewalError::Retryable(PopError::TokenRejected));
+        }
+        if successor_expiry <= check_expires_at {
+            return Err(RenewalError::Retryable(PopError::TokenTimeInvalid));
+        }
+        Ok(successor_expiry)
     }
 }
 
@@ -819,6 +943,33 @@ impl NonceCache {
         Ok(())
     }
 
+    fn redeem_renewal(
+        &mut self,
+        nonce: [u8; NONCE_BYTES],
+        check_expires_at: u64,
+        retain_until: u64,
+        now: u64,
+    ) -> Result<(), PopError> {
+        self.prune(now);
+        let entry = self.outstanding.get(&nonce).ok_or(PopError::NonceReplay)?;
+        if entry.expires_at != check_expires_at {
+            return Err(PopError::NonceReplay);
+        }
+        if self.spent.len() >= SPENT_NONCE_LIMIT {
+            return Err(PopError::NonceSpentCapacity);
+        }
+        self.outstanding
+            .remove(&nonce)
+            .ok_or(PopError::NonceReplay)?;
+        self.spent.insert(
+            nonce,
+            NonceEntry {
+                expires_at: retain_until,
+            },
+        );
+        Ok(())
+    }
+
     fn prune(&mut self, now: u64) {
         self.outstanding.retain(|_, entry| entry.expires_at > now);
         self.spent.retain(|_, entry| entry.expires_at > now);
@@ -844,6 +995,25 @@ impl NonceLease {
             return Err(PopError::NonceReplay);
         }
         lock_nonce_cache(&self.cache).redeem(self.nonce, expires_at, now)?;
+        self.armed = false;
+        Ok(())
+    }
+
+    fn redeem_and_extend(
+        &mut self,
+        check_expires_at: u64,
+        retain_until: u64,
+        now: u64,
+    ) -> Result<(), PopError> {
+        if !self.armed {
+            return Err(PopError::NonceReplay);
+        }
+        lock_nonce_cache(&self.cache).redeem_renewal(
+            self.nonce,
+            check_expires_at,
+            retain_until,
+            now,
+        )?;
         self.armed = false;
         Ok(())
     }
@@ -1034,6 +1204,27 @@ where
         .await
         .map_err(|_| PopError::Io)?;
     serde_json::from_slice(&bytes).map_err(|_| PopError::InvalidMessage)
+}
+
+async fn read_renewal_body<S>(carrier: &mut S) -> Result<Vec<u8>, PopError>
+where
+    S: AsyncRead + Unpin,
+{
+    let length = carrier
+        .read_u32()
+        .await
+        .map_err(|_| PopError::Io)?
+        .try_into()
+        .map_err(|_| PopError::MessageTooLarge)?;
+    if length > MAX_MESSAGE_BYTES {
+        return Err(PopError::MessageTooLarge);
+    }
+    let mut bytes = vec![0u8; length];
+    carrier
+        .read_exact(&mut bytes)
+        .await
+        .map_err(|_| PopError::Io)?;
+    Ok(bytes)
 }
 
 async fn write_message<S, T>(carrier: &mut S, message: &T) -> Result<(), PopError>
@@ -1286,6 +1477,20 @@ mod tests {
         }
     }
 
+    fn renewal_response(
+        challenge: &Challenge,
+        signing: &SigningKey,
+        token: String,
+        hostname: &str,
+    ) -> RenewalResponse {
+        let signature = response(challenge, signing).signature;
+        RenewalResponse {
+            token,
+            hostname: String::from(hostname),
+            signature,
+        }
+    }
+
     async fn assert_framed_message_rejected<T>(body: &str)
     where
         T: for<'a> Deserialize<'a>,
@@ -1394,6 +1599,342 @@ mod tests {
             .unwrap();
         let registration = server_task.await.unwrap().unwrap();
         assert_eq!(registration.hostname(), HOSTNAME);
+    }
+
+    #[tokio::test]
+    async fn acceptance_criterion_renewal_2_binds_e1_and_extends_to_e2() {
+        let (verifier, pop) = fixture();
+        let now = unix_seconds().unwrap();
+        let e1 = now + 600;
+        let e2 = now + 900;
+        let token = mint_token(&verifier, &pop, now, e2);
+        let authenticator = PopAuthenticator::new(Arc::new(verifier), String::from(BRIDGE_ID));
+        let identity = RenewalIdentity::new(
+            String::from(HOSTNAME),
+            String::from(INSTANCE_ID),
+            pop.verifying_key(),
+        );
+        let (mut client, mut server) = tokio::io::duplex(4096);
+        let server_task =
+            tokio::spawn(async move { authenticator.renew(&mut server, &identity, e1).await });
+
+        let challenge: Challenge = read_message(&mut client).await.unwrap();
+        write_message(
+            &mut client,
+            &renewal_response(&challenge, &pop, token, HOSTNAME),
+        )
+        .await
+        .unwrap();
+        assert_eq!(server_task.await.unwrap().unwrap(), e2);
+    }
+
+    #[tokio::test]
+    async fn acceptance_criterion_renewal_2_accepts_a_short_successor_lease() {
+        let (verifier, pop) = fixture();
+        let now = unix_seconds().unwrap();
+        let e1 = now + 4;
+        let e2 = now + 16;
+        let token = mint_token(&verifier, &pop, e2 - 700, e2);
+        let authenticator = PopAuthenticator::new(Arc::new(verifier), String::from(BRIDGE_ID));
+        let identity = RenewalIdentity::new(
+            String::from(HOSTNAME),
+            String::from(INSTANCE_ID),
+            pop.verifying_key(),
+        );
+        let (mut client, mut server) = tokio::io::duplex(4096);
+        let server_task =
+            tokio::spawn(async move { authenticator.renew(&mut server, &identity, e1).await });
+
+        let challenge: Challenge = read_message(&mut client).await.unwrap();
+        write_message(
+            &mut client,
+            &renewal_response(&challenge, &pop, token, HOSTNAME),
+        )
+        .await
+        .unwrap();
+        assert_eq!(server_task.await.unwrap().unwrap(), e2);
+    }
+
+    #[tokio::test]
+    async fn acceptance_criterion_renewal_7_complete_invalid_response_is_retryable() {
+        let (verifier, pop) = fixture();
+        let now = unix_seconds().unwrap();
+        let authenticator = PopAuthenticator::new(Arc::new(verifier), String::from(BRIDGE_ID));
+        let identity = RenewalIdentity::new(
+            String::from(HOSTNAME),
+            String::from(INSTANCE_ID),
+            pop.verifying_key(),
+        );
+        let (mut client, mut server) = tokio::io::duplex(4096);
+        let server_task =
+            tokio::spawn(
+                async move { authenticator.renew(&mut server, &identity, now + 600).await },
+            );
+
+        let _: Challenge = read_message(&mut client).await.unwrap();
+        client.write_u32(1).await.unwrap();
+        client.write_all(b"{").await.unwrap();
+        client.flush().await.unwrap();
+        assert!(matches!(
+            server_task.await.unwrap(),
+            Err(RenewalError::Retryable(PopError::InvalidMessage))
+        ));
+    }
+
+    #[tokio::test]
+    async fn acceptance_criterion_renewal_11_wire_mutations_are_retryable_after_a_complete_frame() {
+        for body in [
+            r#"{"token":"first","token":"second","hostname":"journal.test","signature":"x"}"#,
+            r#"{"token":"token","hostname":"journal.test","signature":"x","extra":true}"#,
+        ] {
+            let (verifier, pop) = fixture();
+            let now = unix_seconds().unwrap();
+            let authenticator = PopAuthenticator::new(Arc::new(verifier), String::from(BRIDGE_ID));
+            let identity = RenewalIdentity::new(
+                String::from(HOSTNAME),
+                String::from(INSTANCE_ID),
+                pop.verifying_key(),
+            );
+            let (mut client, mut server) = tokio::io::duplex(4096);
+            let server_task = tokio::spawn(async move {
+                authenticator.renew(&mut server, &identity, now + 600).await
+            });
+
+            let _: Challenge = read_message(&mut client).await.unwrap();
+            client
+                .write_u32(body.len().try_into().unwrap())
+                .await
+                .unwrap();
+            client.write_all(body.as_bytes()).await.unwrap();
+            client.flush().await.unwrap();
+            assert!(matches!(
+                server_task.await.unwrap(),
+                Err(RenewalError::Retryable(PopError::InvalidMessage))
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn acceptance_criterion_renewal_7_partial_response_is_terminal() {
+        let (verifier, pop) = fixture();
+        let now = unix_seconds().unwrap();
+        let authenticator = PopAuthenticator::new(Arc::new(verifier), String::from(BRIDGE_ID));
+        let identity = RenewalIdentity::new(
+            String::from(HOSTNAME),
+            String::from(INSTANCE_ID),
+            pop.verifying_key(),
+        );
+        let (mut client, mut server) = tokio::io::duplex(4096);
+        let server_task =
+            tokio::spawn(
+                async move { authenticator.renew(&mut server, &identity, now + 600).await },
+            );
+
+        let _: Challenge = read_message(&mut client).await.unwrap();
+        client.write_u32(16).await.unwrap();
+        client.write_all(b"partial").await.unwrap();
+        client.shutdown().await.unwrap();
+        assert!(matches!(
+            server_task.await.unwrap(),
+            Err(RenewalError::Terminal)
+        ));
+    }
+
+    #[tokio::test]
+    async fn acceptance_criterion_renewal_5_wrong_successor_key_releases_the_unspent_nonce() {
+        let (verifier, pop) = fixture();
+        let wrong_pop = SigningKey::from_bytes(&WRONG_POP_KEY);
+        let now = unix_seconds().unwrap();
+        let e1 = now + 600;
+        let e2 = now + 900;
+        let token = mint_token(&verifier, &wrong_pop, now, e2);
+        let authenticator = PopAuthenticator::new(Arc::new(verifier), String::from(BRIDGE_ID));
+        let identity = RenewalIdentity::new(
+            String::from(HOSTNAME),
+            String::from(INSTANCE_ID),
+            pop.verifying_key(),
+        );
+        let cache = Arc::clone(&authenticator.nonces);
+        let (mut client, mut server) = tokio::io::duplex(4096);
+        let server_task =
+            tokio::spawn(async move { authenticator.renew(&mut server, &identity, e1).await });
+
+        let challenge: Challenge = read_message(&mut client).await.unwrap();
+        write_message(
+            &mut client,
+            &renewal_response(&challenge, &wrong_pop, token, HOSTNAME),
+        )
+        .await
+        .unwrap();
+
+        assert!(matches!(
+            server_task.await.unwrap(),
+            Err(RenewalError::Retryable(PopError::InvalidProof))
+        ));
+        let cache = lock_nonce_cache(&cache);
+        assert!(cache.outstanding.is_empty());
+        assert!(cache.spent.is_empty());
+    }
+
+    #[tokio::test]
+    async fn acceptance_criterion_renewal_5_identity_mismatch_spends_through_e2() {
+        let (verifier, pop) = fixture();
+        let now = unix_seconds().unwrap();
+        let e1 = now + 600;
+        let e2 = now + 900;
+        let token = mint_token(&verifier, &pop, now, e2);
+        let authenticator = PopAuthenticator::new(Arc::new(verifier), String::from(BRIDGE_ID));
+        let identity = RenewalIdentity::new(
+            String::from(HOSTNAME),
+            String::from(INSTANCE_ID),
+            pop.verifying_key(),
+        );
+        let cache = Arc::clone(&authenticator.nonces);
+        let (mut client, mut server) = tokio::io::duplex(4096);
+        let server_task =
+            tokio::spawn(async move { authenticator.renew(&mut server, &identity, e1).await });
+
+        let challenge: Challenge = read_message(&mut client).await.unwrap();
+        write_message(
+            &mut client,
+            &renewal_response(&challenge, &pop, token, "other.solstone.me"),
+        )
+        .await
+        .unwrap();
+
+        assert!(matches!(
+            server_task.await.unwrap(),
+            Err(RenewalError::Retryable(PopError::TokenRejected))
+        ));
+        let mut cache = lock_nonce_cache(&cache);
+        assert!(cache.outstanding.is_empty());
+        assert_eq!(cache.spent.len(), 1);
+        cache.prune(e2 - 1);
+        assert_eq!(cache.spent.len(), 1);
+        cache.prune(e2);
+        assert!(cache.spent.is_empty());
+    }
+
+    #[tokio::test]
+    async fn acceptance_criterion_renewal_5_jwt_claim_hostname_mismatch_spends_through_e2() {
+        let (verifier, pop) = fixture();
+        let now = unix_seconds().unwrap();
+        let e1 = now + 600;
+        let e2 = now + 900;
+        let token = verifier
+            .mint(
+                "fixture",
+                INSTANCE_ID,
+                "bbbbbbbb.solstone.me",
+                now,
+                e2,
+                &pop.verifying_key(),
+            )
+            .unwrap();
+        let authenticator = PopAuthenticator::new(Arc::new(verifier), String::from(BRIDGE_ID));
+        let identity = RenewalIdentity::new(
+            String::from(HOSTNAME),
+            String::from(INSTANCE_ID),
+            pop.verifying_key(),
+        );
+        let cache = Arc::clone(&authenticator.nonces);
+        let (mut client, mut server) = tokio::io::duplex(4096);
+        let server_task =
+            tokio::spawn(async move { authenticator.renew(&mut server, &identity, e1).await });
+
+        let challenge: Challenge = read_message(&mut client).await.unwrap();
+        write_message(
+            &mut client,
+            &renewal_response(&challenge, &pop, token, "bbbbbbbb.solstone.me"),
+        )
+        .await
+        .unwrap();
+
+        assert!(matches!(
+            server_task.await.unwrap(),
+            Err(RenewalError::Retryable(PopError::TokenRejected))
+        ));
+        let mut cache = lock_nonce_cache(&cache);
+        assert!(cache.outstanding.is_empty());
+        assert_eq!(cache.spent.len(), 1);
+        cache.prune(e2 - 1);
+        assert_eq!(cache.spent.len(), 1);
+        cache.prune(e2);
+        assert!(cache.spent.is_empty());
+    }
+
+    #[test]
+    fn acceptance_criterion_renewal_5_spent_capacity_keeps_the_outstanding_nonce() {
+        let now = 10;
+        let e1 = 100;
+        let e2 = 200;
+        let mut cache = nonce_cache();
+        for index in 0..SPENT_NONCE_LIMIT {
+            cache
+                .spent
+                .insert(nonce_from_index(index), NonceEntry { expires_at: e2 });
+        }
+        let nonce = [0xFF; NONCE_BYTES];
+        cache.issue_with(now, e1, || Ok(nonce)).unwrap();
+
+        assert!(matches!(
+            cache.redeem_renewal(nonce, e1, e2, now),
+            Err(PopError::NonceSpentCapacity)
+        ));
+        assert!(cache.outstanding.contains_key(&nonce));
+        assert_eq!(cache.outstanding.len(), 1);
+        assert_eq!(cache.spent.len(), SPENT_NONCE_LIMIT);
+    }
+
+    #[tokio::test]
+    async fn acceptance_criterion_renewal_7_prefix_body_oversize_and_eof_are_terminal() {
+        enum BrokenResponse {
+            Prefix,
+            Body,
+            Oversize,
+            Eof,
+        }
+
+        for broken in [
+            BrokenResponse::Prefix,
+            BrokenResponse::Body,
+            BrokenResponse::Oversize,
+            BrokenResponse::Eof,
+        ] {
+            let (verifier, pop) = fixture();
+            let now = unix_seconds().unwrap();
+            let authenticator = PopAuthenticator::new(Arc::new(verifier), String::from(BRIDGE_ID));
+            let identity = RenewalIdentity::new(
+                String::from(HOSTNAME),
+                String::from(INSTANCE_ID),
+                pop.verifying_key(),
+            );
+            let (mut client, mut server) = tokio::io::duplex(4096);
+            let server_task = tokio::spawn(async move {
+                authenticator.renew(&mut server, &identity, now + 600).await
+            });
+
+            let _: Challenge = read_message(&mut client).await.unwrap();
+            match broken {
+                BrokenResponse::Prefix => client.write_all(&[0, 0]).await.unwrap(),
+                BrokenResponse::Body => {
+                    client.write_u32(8).await.unwrap();
+                    client.write_all(b"short").await.unwrap();
+                }
+                BrokenResponse::Oversize => {
+                    client
+                        .write_u32((MAX_MESSAGE_BYTES as u32) + 1)
+                        .await
+                        .unwrap();
+                }
+                BrokenResponse::Eof => {}
+            }
+            client.shutdown().await.unwrap();
+            assert!(matches!(
+                server_task.await.unwrap(),
+                Err(RenewalError::Terminal)
+            ));
+        }
     }
 
     #[tokio::test]
@@ -1663,6 +2204,37 @@ mod tests {
             cache.redeem(nonce, 300, 1),
             Err(PopError::NonceReplay)
         ));
+    }
+
+    #[test]
+    fn renewal_redemption_checks_current_expiry_and_retains_through_successor_expiry() {
+        let mut cache = nonce_cache();
+        let nonce = [8; NONCE_BYTES];
+        cache
+            .outstanding
+            .insert(nonce, NonceEntry { expires_at: 100 });
+        cache.redeem_renewal(nonce, 100, 200, 1).unwrap();
+        assert!(matches!(
+            cache.redeem_renewal(nonce, 100, 200, 101),
+            Err(PopError::NonceReplay)
+        ));
+        cache.prune(199);
+        assert!(cache.spent.contains_key(&nonce));
+        cache.prune(200);
+        assert!(!cache.spent.contains_key(&nonce));
+    }
+
+    #[test]
+    fn renewal_nonce_lease_releases_when_extension_fails() {
+        let cache = Arc::new(Mutex::new(nonce_cache()));
+        let mut lease = NonceLease::issue(Arc::clone(&cache), 1, 100).unwrap();
+        let nonce = *lease.bytes();
+        assert!(matches!(
+            lease.redeem_and_extend(99, 200, 1),
+            Err(PopError::NonceReplay)
+        ));
+        drop(lease);
+        assert!(!lock_nonce_cache(&cache).outstanding.contains_key(&nonce));
     }
 
     #[test]

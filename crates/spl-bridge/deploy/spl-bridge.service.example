@@ -1,0 +1,8 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (c) 2026 sol pbc
+
+[Unit]
+Description=SPL bridge
+
+[Service]
+ExecStart=spl-bridge --client-listen 0.0.0.0:443 --control-tls-cert CERTIFICATE --control-tls-key PRIVATE_KEY --jwks-url JWKS_URL --bridge-id BRIDGE_ID

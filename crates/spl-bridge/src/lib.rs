@@ -315,7 +315,9 @@ fn registry_admission_event(error: &registry::RegistryError) -> BridgeLogEvent {
 /// Accept raw client TLS connections indefinitely on `listener`.
 ///
 /// Client TLS remains opaque: this listener peeks only far enough to route by
-/// SNI, writes a PROXY v1 header to the journal stream, and then splices bytes.
+/// SNI. Registered journal hostnames receive a PROXY v1 header before bytes are
+/// spliced; the reserved control hostname is spliced directly to the internal
+/// control listener without a PROXY header.
 pub async fn run_client_listener(
     listener: TcpListener,
     registry: registry::Registry,

@@ -280,18 +280,18 @@ async fn acceptance_criteria_3_and_5_admission_deadline_closes_stalled_peers_and
         String::from(BRIDGE_ID),
     );
     let registry = Registry::default();
-    let (control_address, certificate, control_task, client_task) = start_bridge(
+    let (public_address, certificate, control_task, client_task) = start_bridge(
         registry.clone(),
         verifier.clone(),
         Duration::from_millis(200),
     )
     .await;
 
-    let mut before_tls = TcpStream::connect(control_address).await.unwrap();
+    let mut before_tls = TcpStream::connect(public_address).await.unwrap();
     assert_connection_closed(&mut before_tls).await;
     assert!(registry.lookup(HOSTNAME).await.is_none());
 
-    let mut mid_tls = TcpStream::connect(control_address).await.unwrap();
+    let mut mid_tls = TcpStream::connect(public_address).await.unwrap();
     mid_tls
         .write_all(&[0x16, 0x03, 0x03, 0x00, 0x20, 0x01])
         .await
@@ -301,7 +301,7 @@ async fn acceptance_criteria_3_and_5_admission_deadline_closes_stalled_peers_and
     assert!(registry.lookup(HOSTNAME).await.is_none());
 
     let token = mint_token(&verifier, &pop_key, HOSTNAME);
-    let mut slow_proof = connect_control(control_address, certificate.clone()).await;
+    let mut slow_proof = connect_control(public_address, certificate.clone()).await;
     write_message(
         &mut slow_proof,
         &RegistrationRequest {
@@ -323,7 +323,7 @@ async fn acceptance_criteria_3_and_5_admission_deadline_closes_stalled_peers_and
     let _ = slow_proof.flush().await;
 
     let journal = connect_and_authenticate(
-        control_address,
+        public_address,
         certificate,
         token,
         SigningKey::from_bytes(&[19; 32]),
@@ -353,7 +353,7 @@ async fn acceptance_criteria_11_and_12_use_verified_identity_and_fixed_admission
         String::from(BRIDGE_ID),
     );
     let registry = Registry::default();
-    let (control_address, certificate, control_task, client_task) = start_bridge(
+    let (public_address, certificate, control_task, client_task) = start_bridge(
         registry.clone(),
         verifier.clone(),
         Duration::from_millis(200),
@@ -362,7 +362,7 @@ async fn acceptance_criteria_11_and_12_use_verified_identity_and_fixed_admission
 
     let rejected_token = String::from("token-must-not-appear-in-logs");
     let rejected_hostname = String::from("hostname-must-not-appear-in-logs.test");
-    let mut token_rejection = connect_control(control_address, certificate.clone()).await;
+    let mut token_rejection = connect_control(public_address, certificate.clone()).await;
     write_message(
         &mut token_rejection,
         &RegistrationRequest {
@@ -376,7 +376,7 @@ async fn acceptance_criteria_11_and_12_use_verified_identity_and_fixed_admission
 
     let claimed_hostname = String::from("claimed-hostname-must-not-appear-in-logs.test");
     let token = mint_token(&verifier, &pop_key, HOSTNAME);
-    let mut mismatched_hostname = connect_control(control_address, certificate.clone()).await;
+    let mut mismatched_hostname = connect_control(public_address, certificate.clone()).await;
     write_message(
         &mut mismatched_hostname,
         &RegistrationRequest {
@@ -390,7 +390,7 @@ async fn acceptance_criteria_11_and_12_use_verified_identity_and_fixed_admission
     assert!(registry.lookup(&claimed_hostname).await.is_none());
 
     let framing_payload = b"framing-payload-must-not-appear-in-logs";
-    let mut framing_rejection = connect_control(control_address, certificate.clone()).await;
+    let mut framing_rejection = connect_control(public_address, certificate.clone()).await;
     framing_rejection
         .write_u32(framing_payload.len().try_into().unwrap())
         .await
@@ -399,11 +399,11 @@ async fn acceptance_criteria_11_and_12_use_verified_identity_and_fixed_admission
     framing_rejection.flush().await.unwrap();
     assert_connection_closed(&mut framing_rejection).await;
 
-    let mut timeout_rejection = connect_control(control_address, certificate.clone()).await;
+    let mut timeout_rejection = connect_control(public_address, certificate.clone()).await;
     assert_connection_closed(&mut timeout_rejection).await;
 
     let journal = connect_and_authenticate(
-        control_address,
+        public_address,
         certificate,
         token.clone(),
         SigningKey::from_bytes(&[19; 32]),

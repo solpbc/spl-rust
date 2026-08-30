@@ -61,9 +61,10 @@ pub enum SniError {
 
 /// Extract the first `host_name` SNI value from a TLS `ClientHello` without consuming it.
 ///
-/// The listener can subsequently splice the untouched `ClientHello` to the
-/// selected journal tunnel. `deadline` applies to the whole peek-and-parse
-/// operation rather than to each individual socket readiness wait.
+/// The listener can subsequently splice the untouched `ClientHello` to either
+/// the selected journal tunnel or the internal control listener. `deadline`
+/// applies to the whole peek-and-parse operation rather than to each
+/// individual socket readiness wait.
 ///
 /// # Errors
 ///

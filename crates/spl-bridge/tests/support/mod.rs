@@ -26,6 +26,8 @@ const REJECTED_DEPENDENCIES: &[&str] = &[
     "redis",
 ];
 
+const DEPENDENCY_SECTIONS: &[&str] = &["dependencies", "dev-dependencies", "build-dependencies"];
+
 const ALLOWED_BINARY_OPTIONS: &[&str] = &[
     "--client-listen",
     "--control-tls-cert",
@@ -345,34 +347,75 @@ fn check_workspace_manifest(manifest: &str, violations: &mut Vec<String>) {
 }
 
 fn dependencies_in_section(manifest: &str, section: &str) -> Vec<String> {
-    let mut names = Vec::new();
-    let mut in_section = false;
-    for line in manifest.lines().map(str::trim) {
-        if line.starts_with('[') && line.ends_with(']') {
-            let section_name = line.trim_matches(['[', ']']);
-            in_section = section_name == section || section_name.ends_with(&format!(".{section}"));
-            continue;
-        }
-        if in_section && let Some((name, value)) = dependency_line(line) {
-            names.push(package_name(name, value));
-        }
-    }
-    names
+    dependency_entries(manifest)
+        .into_iter()
+        .filter_map(|(actual_section, name)| (actual_section == section).then_some(name))
+        .collect()
 }
 
 fn all_dependencies(manifest: &str) -> Vec<String> {
-    let mut names = Vec::new();
-    let mut in_dependencies = false;
+    dependency_entries(manifest)
+        .into_iter()
+        .map(|(_, name)| name)
+        .collect()
+}
+
+fn dependency_entries(manifest: &str) -> Vec<(&'static str, String)> {
+    let mut entries = Vec::new();
+    let mut inline_section = None;
+    let mut table_dependency = None;
     for line in manifest.lines().map(str::trim) {
         if line.starts_with('[') && line.ends_with(']') {
-            in_dependencies = line.trim_matches(['[', ']']).ends_with("dependencies");
+            if let Some(table_dependency) = table_dependency.take() {
+                entries.push(table_dependency);
+            }
+            let section_name = line.trim_matches(['[', ']']);
+            inline_section = dependency_section(section_name);
+            table_dependency = dependency_table_header(section_name);
             continue;
         }
-        if in_dependencies && let Some((name, value)) = dependency_line(line) {
-            names.push(package_name(name, value));
+        if let Some((_section, name)) = table_dependency.as_mut() {
+            if let Some((key, value)) = dependency_line(line)
+                && key == "package"
+                && let Some(package) = quoted_value(value)
+            {
+                *name = package;
+            }
+        } else if let Some(section) = inline_section
+            && let Some((name, value)) = dependency_line(line)
+        {
+            entries.push((section, package_name(name, value)));
         }
     }
-    names
+    if let Some(table_dependency) = table_dependency {
+        entries.push(table_dependency);
+    }
+    entries
+}
+
+fn dependency_section(section_name: &str) -> Option<&'static str> {
+    DEPENDENCY_SECTIONS
+        .iter()
+        .copied()
+        .find(|section| section_name == *section || section_name.ends_with(&format!(".{section}")))
+}
+
+fn dependency_table_header(section_name: &str) -> Option<(&'static str, String)> {
+    for section in DEPENDENCY_SECTIONS {
+        let direct_prefix = format!("{section}.");
+        let nested_marker = format!(".{section}.");
+        let Some(name) = section_name.strip_prefix(&direct_prefix).or_else(|| {
+            section_name
+                .rsplit_once(&nested_marker)
+                .map(|(_, name)| name)
+        }) else {
+            continue;
+        };
+        if !name.is_empty() {
+            return Some((*section, name.to_owned()));
+        }
+    }
+    None
 }
 
 fn dependency_assignment<'a>(manifest: &'a str, wanted: &str) -> Option<&'a str> {
@@ -395,10 +438,14 @@ fn package_name(name: &str, value: &str) -> String {
         .split("package")
         .nth(1)
         .and_then(|rest| rest.split_once('='))
-        .map(|(_, rest)| rest.trim_start().trim_start_matches('"'))
-        .and_then(|rest| rest.split('"').next())
-        .filter(|package| !package.is_empty())
-        .map_or_else(|| name.to_owned(), ToOwned::to_owned)
+        .and_then(|(_, package)| quoted_value(package))
+        .unwrap_or_else(|| name.to_owned())
+}
+
+fn quoted_value(value: &str) -> Option<String> {
+    let value = value.trim().strip_prefix('"')?;
+    let (value, _) = value.split_once('"')?;
+    (!value.is_empty()).then(|| value.to_owned())
 }
 
 fn check_runtime_log_calls(path: &Path, source: &str, violations: &mut Vec<String>) {
@@ -461,6 +508,10 @@ fn log_aliases(source: &str) -> BTreeMap<String, String> {
                     );
                 }
             }
+        } else if let Some(canonical) = canonical_log_macro(rest)
+            && let Some(alias) = rest.rsplit("::").next()
+        {
+            aliases.insert(alias.to_owned(), canonical.to_owned());
         }
         if let Some((module, group)) = rest
             .split_once("::{")

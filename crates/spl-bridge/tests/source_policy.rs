@@ -90,6 +90,16 @@ fn aliased_library_filesystem_use_fails_source_policy() -> Result<(), Box<dyn Er
 }
 
 #[test]
+fn bare_imported_log_macro_with_a_field_fails_source_policy() -> Result<(), Box<dyn Error>> {
+    let (corpus, snapshot) = copied_real_corpus()?;
+    append(
+        &corpus.crate_root.join("src/lib.rs"),
+        "\nuse tracing::warn;\nfn policy_fixture_bare_import(h: &str) { warn!(hostname = %h, \"message\"); }\n",
+    )?;
+    assert_rejected(&corpus, &snapshot)
+}
+
+#[test]
 fn binary_state_path_environment_input_fails_source_policy() -> Result<(), Box<dyn Error>> {
     let (corpus, snapshot) = copied_real_corpus()?;
     append(
@@ -107,6 +117,16 @@ fn direct_storage_dependency_fails_source_policy() -> Result<(), Box<dyn Error>>
 }
 
 #[test]
+fn table_storage_dependency_fails_source_policy() -> Result<(), Box<dyn Error>> {
+    let (corpus, snapshot) = copied_real_corpus()?;
+    append(
+        &corpus.crate_root.join("Cargo.toml"),
+        "\n[dependencies.rusqlite]\nversion = \"0.31\"\n",
+    )?;
+    assert_rejected(&corpus, &snapshot)
+}
+
+#[test]
 fn package_aliased_storage_dependency_fails_source_policy() -> Result<(), Box<dyn Error>> {
     let (corpus, snapshot) = copied_real_corpus()?;
     add_dependency(
@@ -117,10 +137,24 @@ fn package_aliased_storage_dependency_fails_source_policy() -> Result<(), Box<dy
 }
 
 #[test]
+fn package_aliased_table_storage_dependency_fails_source_policy() -> Result<(), Box<dyn Error>> {
+    let (corpus, snapshot) = copied_real_corpus()?;
+    append(
+        &corpus.crate_root.join("Cargo.toml"),
+        "\n[dependencies.db]\npackage = \"rusqlite\"\nversion = \"0.31\"\n",
+    )?;
+    assert_rejected(&corpus, &snapshot)
+}
+
+#[test]
 fn runtime_log_field_or_interpolation_fails_source_policy() -> Result<(), Box<dyn Error>> {
     for source in [
-        "\nfn policy_fixture_log_field(h: &str) { tracing::warn!(hostname = %h, \"message\"); }\n",
-        "\nuse tracing::warn as bridge_warn;\nfn policy_fixture_log_interpolation(h: &str) { bridge_warn!(\"message {}\", h); }\n",
+        "\nfn policy_fixture_log_field(value: &str) { tracing::warn!(field = value, \"message\"); }\n",
+        "\nfn policy_fixture_log_shorthand(field: &str) { tracing::warn!(field, \"message\"); }\n",
+        "\nfn policy_fixture_log_target() { tracing::warn!(target: \"module\", \"message\"); }\n",
+        "\nfn policy_fixture_log_level() { tracing::warn!(tracing::Level::INFO, \"message\"); }\n",
+        "\nfn policy_fixture_log_interpolation(value: &str) { tracing::warn!(\"message {}\", value); }\n",
+        "\nfn policy_fixture_log_nonliteral(message: &str) { tracing::warn!(message); }\n",
     ] {
         let (corpus, snapshot) = copied_real_corpus()?;
         append(&corpus.crate_root.join("src/lib.rs"), source)?;

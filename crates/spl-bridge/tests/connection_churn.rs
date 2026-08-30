@@ -21,7 +21,15 @@ const STREAMS: usize = 256;
 async fn stream_churn_returns_registry_state_to_its_empty_baseline() {
     let registry = Registry::default();
     let (carrier, mut peer) = tokio::io::duplex(128 * 1024);
-    let journal = registry.register(String::from("churn.test"), carrier).await;
+    let journal = registry
+        .register(
+            String::from("churn.test"),
+            carrier,
+            u64::MAX,
+            tokio::time::Instant::now() + Duration::from_secs(10),
+        )
+        .await
+        .unwrap();
     let mut acceptor = MuxAcceptor::new(MuxLimits::default()).unwrap();
 
     for _ in 0..STREAMS {

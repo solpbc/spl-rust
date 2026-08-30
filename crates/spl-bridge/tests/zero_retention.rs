@@ -26,7 +26,9 @@ use spl_bridge::pop_auth::{
     Challenge, ChallengeResponse, FixtureTokenVerifier, PopAuthenticator, RegistrationRequest,
 };
 use spl_bridge::registry::Registry;
-use spl_bridge::{run_client_listener, run_control_listener, server_tls_config};
+use spl_bridge::{
+    DEFAULT_ADMISSION_DEADLINE, run_client_listener, run_control_listener, server_tls_config,
+};
 use spl_home::{MuxAcceptor, MuxEvent, MuxLimits};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -35,7 +37,6 @@ use tokio_rustls::TlsConnector;
 const HOSTNAME: &str = "aaaqeaye.solstone.me";
 const INSTANCE_ID: &str = "8488ae64-b592-80a3-97c6-490e995daa85";
 const BRIDGE_ID: &str = "mcp-bridge-zero-retention";
-const POP_DOMAIN_SEPARATOR: &[u8] = b"spl-bridge-pop-v1\0";
 
 #[derive(Clone)]
 struct LogBuffer(Arc<Mutex<Vec<u8>>>);
@@ -80,7 +81,7 @@ async fn listener_splice_keeps_payload_out_of_logs_and_scratch_files() {
         HashMap::from([(String::from("fixture"), fixture_key)]),
         String::from(BRIDGE_ID),
     );
-    let authenticator = PopAuthenticator::new(Arc::new(verifier.clone()));
+    let authenticator = PopAuthenticator::new(Arc::new(verifier.clone()), String::from(BRIDGE_ID));
     let registry = Registry::default();
     let (certificate, private_key) = certificate_fixture();
     let tls_config = Arc::new(server_tls_config(vec![certificate.clone()], private_key).unwrap());
@@ -94,6 +95,7 @@ async fn listener_splice_keeps_payload_out_of_logs_and_scratch_files() {
         tls_config,
         registry.clone(),
         authenticator,
+        DEFAULT_ADMISSION_DEADLINE,
     ));
     let client_task = tokio::spawn(run_client_listener(
         client_listener,
@@ -164,6 +166,200 @@ async fn listener_splice_keeps_payload_out_of_logs_and_scratch_files() {
     client_task.abort();
 }
 
+#[tokio::test(flavor = "current_thread")]
+async fn acceptance_criteria_3_and_5_admission_deadline_closes_stalled_peers_and_releases_nonce() {
+    let fixture_key = SigningKey::from_bytes(&[7; 32]);
+    let pop_key = SigningKey::from_bytes(&[19; 32]);
+    let verifier = FixtureTokenVerifier::new(
+        HashMap::from([(String::from("fixture"), fixture_key)]),
+        String::from(BRIDGE_ID),
+    );
+    let registry = Registry::default();
+    let (control_address, certificate, control_task) = start_control_listener(
+        registry.clone(),
+        verifier.clone(),
+        Duration::from_millis(200),
+    )
+    .await;
+
+    let mut before_tls = TcpStream::connect(control_address).await.unwrap();
+    assert_connection_closed(&mut before_tls).await;
+    assert!(registry.lookup(HOSTNAME).await.is_none());
+
+    let mut mid_tls = TcpStream::connect(control_address).await.unwrap();
+    mid_tls
+        .write_all(&[0x16, 0x03, 0x03, 0x00, 0x20, 0x01])
+        .await
+        .unwrap();
+    mid_tls.flush().await.unwrap();
+    assert_connection_closed(&mut mid_tls).await;
+    assert!(registry.lookup(HOSTNAME).await.is_none());
+
+    let token = mint_token(&verifier, &pop_key, HOSTNAME);
+    let mut slow_proof = connect_control(control_address, certificate.clone()).await;
+    write_message(
+        &mut slow_proof,
+        &RegistrationRequest {
+            token: token.clone(),
+            hostname: String::from(HOSTNAME),
+        },
+    )
+    .await;
+    let challenge: Challenge = read_message(&mut slow_proof).await;
+    let response = challenge_response(&challenge, &pop_key);
+    let response_bytes = serde_json::to_vec(&response).unwrap();
+    slow_proof
+        .write_u32(response_bytes.len().try_into().unwrap())
+        .await
+        .unwrap();
+    slow_proof.flush().await.unwrap();
+    tokio::time::sleep(Duration::from_millis(80)).await;
+    let _ = slow_proof.write_all(&response_bytes[..1]).await;
+    let _ = slow_proof.flush().await;
+
+    let journal = connect_and_authenticate(
+        control_address,
+        certificate,
+        token,
+        SigningKey::from_bytes(&[19; 32]),
+    )
+    .await;
+    wait_for_registration(&registry).await;
+    assert_connection_closed(&mut slow_proof).await;
+    drop(journal);
+    control_task.abort();
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn acceptance_criteria_11_and_12_use_verified_identity_and_fixed_admission_reasons() {
+    let logs = LogBuffer(Arc::new(Mutex::new(Vec::new())));
+    let subscriber = tracing_subscriber::fmt()
+        .with_ansi(false)
+        .without_time()
+        .with_writer(logs.clone())
+        .finish();
+    let _subscriber = tracing::subscriber::set_default(subscriber);
+
+    let fixture_key = SigningKey::from_bytes(&[7; 32]);
+    let pop_key = SigningKey::from_bytes(&[19; 32]);
+    let verifier = FixtureTokenVerifier::new(
+        HashMap::from([(String::from("fixture"), fixture_key)]),
+        String::from(BRIDGE_ID),
+    );
+    let registry = Registry::default();
+    let (control_address, certificate, control_task) = start_control_listener(
+        registry.clone(),
+        verifier.clone(),
+        Duration::from_millis(200),
+    )
+    .await;
+
+    let rejected_token = String::from("token-must-not-appear-in-logs");
+    let rejected_hostname = String::from("hostname-must-not-appear-in-logs.test");
+    let mut token_rejection = connect_control(control_address, certificate.clone()).await;
+    write_message(
+        &mut token_rejection,
+        &RegistrationRequest {
+            token: rejected_token.clone(),
+            hostname: rejected_hostname.clone(),
+        },
+    )
+    .await;
+    assert_connection_closed(&mut token_rejection).await;
+    assert!(registry.lookup(&rejected_hostname).await.is_none());
+
+    let claimed_hostname = String::from("claimed-hostname-must-not-appear-in-logs.test");
+    let token = mint_token(&verifier, &pop_key, HOSTNAME);
+    let mut mismatched_hostname = connect_control(control_address, certificate.clone()).await;
+    write_message(
+        &mut mismatched_hostname,
+        &RegistrationRequest {
+            token: token.clone(),
+            hostname: claimed_hostname.clone(),
+        },
+    )
+    .await;
+    assert_connection_closed(&mut mismatched_hostname).await;
+    assert!(registry.lookup(HOSTNAME).await.is_none());
+    assert!(registry.lookup(&claimed_hostname).await.is_none());
+
+    let framing_payload = b"framing-payload-must-not-appear-in-logs";
+    let mut framing_rejection = connect_control(control_address, certificate.clone()).await;
+    framing_rejection
+        .write_u32(framing_payload.len().try_into().unwrap())
+        .await
+        .unwrap();
+    framing_rejection.write_all(framing_payload).await.unwrap();
+    framing_rejection.flush().await.unwrap();
+    assert_connection_closed(&mut framing_rejection).await;
+
+    let mut timeout_rejection = TcpStream::connect(control_address).await.unwrap();
+    assert_connection_closed(&mut timeout_rejection).await;
+
+    let journal = connect_and_authenticate(
+        control_address,
+        certificate,
+        token.clone(),
+        SigningKey::from_bytes(&[19; 32]),
+    )
+    .await;
+    wait_for_registration(&registry).await;
+    drop(journal);
+
+    let captured = wait_for_log_fragments(
+        &logs,
+        [
+            "token_rejection",
+            "framing_or_proof_rejection",
+            "admission_timeout",
+            "peer",
+            "generation",
+        ],
+    )
+    .await;
+    for protected in [
+        rejected_token.as_bytes(),
+        rejected_hostname.as_bytes(),
+        claimed_hostname.as_bytes(),
+        HOSTNAME.as_bytes(),
+        token.as_bytes(),
+        framing_payload.as_slice(),
+    ] {
+        assert!(
+            !captured
+                .windows(protected.len())
+                .any(|window| window == protected),
+            "admission logs must not include protected registration input"
+        );
+    }
+
+    control_task.abort();
+}
+
+async fn start_control_listener(
+    registry: Registry,
+    verifier: FixtureTokenVerifier,
+    admission_deadline: Duration,
+) -> (
+    std::net::SocketAddr,
+    CertificateDer<'static>,
+    tokio::task::JoinHandle<()>,
+) {
+    let (certificate, private_key) = certificate_fixture();
+    let tls_config = Arc::new(server_tls_config(vec![certificate.clone()], private_key).unwrap());
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let authenticator = PopAuthenticator::new(Arc::new(verifier), String::from(BRIDGE_ID));
+    let task = tokio::spawn(run_control_listener(
+        listener,
+        tls_config,
+        registry,
+        authenticator,
+        admission_deadline,
+    ));
+    (address, certificate, task)
+}
+
 fn certificate_fixture() -> (CertificateDer<'static>, PrivateKeyDer<'static>) {
     let key = KeyPair::generate().unwrap();
     let params = CertificateParams::new(vec![String::from("bridge.test")]).unwrap();
@@ -180,19 +376,7 @@ async fn connect_and_authenticate(
     token: String,
     pop_key: SigningKey,
 ) -> tokio_rustls::client::TlsStream<TcpStream> {
-    let mut roots = RootCertStore::empty();
-    roots.add(certificate).unwrap();
-    let provider = Arc::new(rustls::crypto::ring::default_provider());
-    let config = ClientConfig::builder_with_provider(provider)
-        .with_safe_default_protocol_versions()
-        .unwrap()
-        .with_root_certificates(roots)
-        .with_no_client_auth();
-    let server_name = ServerName::try_from("bridge.test").unwrap().to_owned();
-    let mut journal = TlsConnector::from(Arc::new(config))
-        .connect(server_name, TcpStream::connect(address).await.unwrap())
-        .await
-        .unwrap();
+    let mut journal = connect_control(address, certificate).await;
     write_message(
         &mut journal,
         &RegistrationRequest {
@@ -202,22 +386,88 @@ async fn connect_and_authenticate(
     )
     .await;
     let challenge: Challenge = read_message(&mut journal).await;
-    let nonce: [u8; 32] = URL_SAFE_NO_PAD
-        .decode(challenge.nonce)
+    write_message(&mut journal, &challenge_response(&challenge, &pop_key)).await;
+    journal
+}
+
+async fn connect_control(
+    address: std::net::SocketAddr,
+    certificate: CertificateDer<'static>,
+) -> tokio_rustls::client::TlsStream<TcpStream> {
+    let mut roots = RootCertStore::empty();
+    roots.add(certificate).unwrap();
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let config = ClientConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    let server_name = ServerName::try_from("bridge.test").unwrap().to_owned();
+    TlsConnector::from(Arc::new(config))
+        .connect(server_name, TcpStream::connect(address).await.unwrap())
+        .await
+        .unwrap()
+}
+
+fn challenge_response(challenge: &Challenge, pop_key: &SigningKey) -> ChallengeResponse {
+    let nonce: [u8; 16] = URL_SAFE_NO_PAD
+        .decode(&challenge.nonce)
         .unwrap()
         .try_into()
         .unwrap();
-    let timestamp = unix_seconds();
     let mut signed = Vec::new();
-    signed.extend_from_slice(POP_DOMAIN_SEPARATOR);
     signed.extend_from_slice(&nonce);
-    signed.extend_from_slice(&timestamp.to_be_bytes());
-    let response = ChallengeResponse {
-        timestamp,
+    signed.extend_from_slice(challenge.bridge_id.as_bytes());
+    signed.extend_from_slice(&challenge.timestamp.to_be_bytes());
+    ChallengeResponse {
         signature: URL_SAFE_NO_PAD.encode(pop_key.sign(&signed).to_bytes()),
-    };
-    write_message(&mut journal, &response).await;
-    journal
+    }
+}
+
+fn mint_token(verifier: &FixtureTokenVerifier, pop_key: &SigningKey, hostname: &str) -> String {
+    let issued_at = u64::try_from(unix_seconds()).unwrap();
+    verifier
+        .mint(
+            "fixture",
+            INSTANCE_ID,
+            hostname,
+            issued_at,
+            issued_at + 600,
+            &pop_key.verifying_key(),
+        )
+        .unwrap()
+}
+
+async fn assert_connection_closed<S>(carrier: &mut S)
+where
+    S: AsyncRead + Unpin,
+{
+    let mut byte = [0u8; 1];
+    let result = tokio::time::timeout(Duration::from_secs(1), carrier.read(&mut byte))
+        .await
+        .unwrap();
+    assert!(
+        matches!(result, Ok(0) | Err(_)),
+        "timed-out admission must close its carrier"
+    );
+}
+
+async fn wait_for_log_fragments<const N: usize>(logs: &LogBuffer, fragments: [&str; N]) -> Vec<u8> {
+    tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            let captured = logs.0.lock().unwrap().clone();
+            if fragments.iter().all(|fragment| {
+                captured
+                    .windows(fragment.len())
+                    .any(|window| window == fragment.as_bytes())
+            }) {
+                return captured;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap()
 }
 
 async fn write_message<S, T>(carrier: &mut S, message: &T)

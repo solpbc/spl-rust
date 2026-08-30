@@ -19,17 +19,18 @@
 //! verified token claims contain the fixed issuer, bridge audience, a
 //! `home:<instance-id>` subject, Unix-second `exp` and `iat`, a constrained
 //! Solstone hostname, and `cnf.jwk`, a base64url-without-padding raw 32-byte
-//! Ed25519 public key. The bridge replies with `{"nonce":"..."}`, containing a
-//! base64url 32-byte nonce. The journal then sends
-//! `{"timestamp":...,"signature":"..."}`, where `signature` is an
-//! Ed25519 signature over `b"spl-bridge-pop-v1\\0" || nonce || timestamp`,
-//! with the timestamp encoded as an eight-byte big-endian signed integer.
+//! Ed25519 public key. The bridge replies with
+//! `{"nonce":"...","bridge_id":"...","timestamp":...}`, containing a
+//! base64url 16-byte nonce and bridge-issued Unix-second timestamp. The journal
+//! then sends `{"signature":"..."}`, where `signature` is an Ed25519
+//! signature over `nonce || bridge_id UTF-8 bytes || timestamp`, with the
+//! timestamp encoded as an eight-byte big-endian signed integer.
 //! Each JSON value is prefixed by a four-byte big-endian byte length.
 
 use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use base64::Engine;
@@ -41,18 +42,20 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
-use tokio::sync::{Mutex, mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot};
 use tokio_rustls::TlsConnector;
 
 const MAX_MESSAGE_BYTES: usize = 64 * 1024;
-const NONCE_BYTES: usize = 32;
+const NONCE_BYTES: usize = 16;
 const POP_SKEW: u64 = 60;
+const OUTSTANDING_NONCE_LIMIT: usize = 256;
+const SPENT_NONCE_LIMIT: usize = 4096;
+const NONCE_GENERATION_ATTEMPTS: usize = 8;
 const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
 const DEFAULT_FETCH_TIMEOUT: Duration = Duration::from_secs(3);
 const JWKS_CACHE_TTL: Duration = Duration::from_mins(5);
 const JWKS_CACHE_LIMIT: usize = 64;
 const MAX_JWKS_RESPONSE_BYTES: usize = 1024 * 1024;
-const POP_DOMAIN_SEPARATOR: &[u8] = b"spl-bridge-pop-v1\0";
 const EXPECTED_ISSUER: &str = "services.solstone.app";
 
 /// A source of Unix seconds used only for JWT time-claim validation.
@@ -114,9 +117,9 @@ pub enum PopError {
     /// The token was expired or its issue time was not plausible.
     #[error("journal token time claims are invalid")]
     TokenTimeInvalid,
-    /// The challenge response carried an implausible timestamp.
-    #[error("proof-of-possession response timestamp is invalid")]
-    ResponseTimeInvalid,
+    /// A bridge-issued challenge timestamp was too old or too far in the future.
+    #[error("proof-of-possession challenge timestamp is invalid")]
+    ChallengeTimeInvalid,
     /// The challenge response signature did not verify with the claimed key.
     #[error("proof-of-possession signature is invalid")]
     InvalidProof,
@@ -126,6 +129,15 @@ pub enum PopError {
     /// Random nonce generation failed.
     #[error("proof-of-possession nonce generation failed")]
     Randomness,
+    /// The outstanding nonce cache reached its fixed capacity.
+    #[error("proof-of-possession outstanding nonce capacity is exhausted")]
+    NonceOutstandingCapacity,
+    /// The spent nonce cache reached its fixed capacity.
+    #[error("proof-of-possession spent nonce capacity is exhausted")]
+    NonceSpentCapacity,
+    /// The nonce generator repeatedly collided with a live nonce.
+    #[error("proof-of-possession nonce generation collided repeatedly")]
+    NonceCollisionExhausted,
     /// The configured JWKS URL is not a valid HTTPS URL.
     #[error("JWKS URL is invalid")]
     JwksUrl,
@@ -142,6 +154,7 @@ pub enum PopError {
 
 /// The initial length-prefixed JSON message sent by a registering journal.
 #[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RegistrationRequest {
     /// `EdDSA` JWT authorizing the named hostname and challenge public key.
     pub token: String,
@@ -151,16 +164,20 @@ pub struct RegistrationRequest {
 
 /// The bridge's length-prefixed JSON challenge message.
 #[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Challenge {
-    /// Base64url-without-padding encoding of the random 32-byte nonce.
+    /// Base64url-without-padding encoding of the random 16-byte nonce.
     pub nonce: String,
+    /// Configured bridge identifier bound into the proof signature.
+    pub bridge_id: String,
+    /// Bridge-issued Unix seconds bound into the proof signature.
+    pub timestamp: i64,
 }
 
 /// The length-prefixed JSON response to a [`Challenge`].
 #[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ChallengeResponse {
-    /// Unix seconds included in the signature and bounded to 60 seconds of bridge time.
-    pub timestamp: i64,
     /// Base64url-without-padding encoding of the 64-byte Ed25519 signature.
     pub signature: String,
 }
@@ -198,6 +215,7 @@ pub trait TokenVerifier: Send + Sync {
 pub struct PopAuthenticator {
     verifier: Arc<dyn TokenVerifier>,
     nonces: Arc<Mutex<NonceCache>>,
+    bridge_id: String,
 }
 
 /// A deterministic, in-memory `EdDSA` token verifier for tests and fixtures.
@@ -261,12 +279,19 @@ struct PopJwk {
 }
 
 struct NonceCache {
-    entries: HashMap<[u8; NONCE_BYTES], NonceEntry>,
+    outstanding: HashMap<[u8; NONCE_BYTES], NonceEntry>,
+    spent: HashMap<[u8; NONCE_BYTES], NonceEntry>,
 }
 
 struct NonceEntry {
     expires_at: u64,
-    consumed: bool,
+}
+
+/// An issued nonce slot that is released unless it is redeemed.
+struct NonceLease {
+    cache: Arc<Mutex<NonceCache>>,
+    nonce: [u8; NONCE_BYTES],
+    armed: bool,
 }
 
 #[derive(Clone)]
@@ -323,13 +348,15 @@ struct ParsedToken {
 }
 
 impl PopAuthenticator {
-    /// Construct an authenticator using `verifier` and an empty replay cache.
-    pub fn new(verifier: Arc<dyn TokenVerifier>) -> Self {
+    /// Construct an authenticator using `verifier`, `bridge_id`, and an empty replay cache.
+    pub fn new(verifier: Arc<dyn TokenVerifier>, bridge_id: String) -> Self {
         Self {
             verifier,
             nonces: Arc::new(Mutex::new(NonceCache {
-                entries: HashMap::new(),
+                outstanding: HashMap::new(),
+                spent: HashMap::new(),
             })),
+            bridge_id,
         }
     }
 
@@ -355,30 +382,29 @@ impl PopAuthenticator {
         let now = unix_seconds()?;
         validate_registration_hostname(&claims, &request.hostname)?;
 
-        let nonce = {
-            let mut cache = self.nonces.lock().await;
-            cache.issue(now, claims.expires_at())?
-        };
+        let issued_at = i64::try_from(now).map_err(|_| PopError::ChallengeTimeInvalid)?;
+        let mut nonce = NonceLease::issue(Arc::clone(&self.nonces), now, claims.expires_at())?;
         let challenge = Challenge {
-            nonce: URL_SAFE_NO_PAD.encode(nonce),
+            nonce: URL_SAFE_NO_PAD.encode(nonce.bytes()),
+            bridge_id: self.bridge_id.clone(),
+            timestamp: issued_at,
         };
         write_message(carrier, &challenge).await?;
 
         let response: ChallengeResponse = read_message(carrier).await?;
-        let response_now = i64::try_from(now).map_err(|_| PopError::ResponseTimeInvalid)?;
-        if response.timestamp.abs_diff(response_now) > POP_SKEW {
-            return Err(PopError::ResponseTimeInvalid);
+        let verified_now = unix_seconds()?;
+        let verified_at =
+            i64::try_from(verified_now).map_err(|_| PopError::ChallengeTimeInvalid)?;
+        if !challenge_timestamp_is_fresh(issued_at, verified_at) {
+            return Err(PopError::ChallengeTimeInvalid);
         }
         let signature = decode_signature(&response.signature)?;
-        let signed = proof_message(&nonce, response.timestamp);
+        let signed = proof_message(nonce.bytes(), &self.bridge_id, issued_at);
         claims
             .pop_key()
             .verify_strict(&signed, &signature)
             .map_err(|_| PopError::InvalidProof)?;
-        self.nonces
-            .lock()
-            .await
-            .redeem(nonce, claims.expires_at(), now)?;
+        nonce.redeem(claims.expires_at(), verified_now)?;
 
         Ok(AuthenticatedRegistration {
             hostname: request.hostname,
@@ -740,22 +766,35 @@ async fn fetch_jwks(
 
 impl NonceCache {
     fn issue(&mut self, now: u64, expires_at: u64) -> Result<[u8; NONCE_BYTES], PopError> {
-        self.entries.retain(|_, entry| entry.expires_at > now);
-        loop {
+        self.issue_with(now, expires_at, || {
             let mut nonce = [0u8; NONCE_BYTES];
             getrandom::getrandom(&mut nonce).map_err(|_| PopError::Randomness)?;
-            if self.entries.contains_key(&nonce) {
+            Ok(nonce)
+        })
+    }
+
+    fn issue_with<F>(
+        &mut self,
+        now: u64,
+        expires_at: u64,
+        mut next_nonce: F,
+    ) -> Result<[u8; NONCE_BYTES], PopError>
+    where
+        F: FnMut() -> Result<[u8; NONCE_BYTES], PopError>,
+    {
+        self.prune(now);
+        if self.outstanding.len() >= OUTSTANDING_NONCE_LIMIT {
+            return Err(PopError::NonceOutstandingCapacity);
+        }
+        for _ in 0..NONCE_GENERATION_ATTEMPTS {
+            let nonce = next_nonce()?;
+            if self.outstanding.contains_key(&nonce) || self.spent.contains_key(&nonce) {
                 continue;
             }
-            self.entries.insert(
-                nonce,
-                NonceEntry {
-                    expires_at,
-                    consumed: false,
-                },
-            );
+            self.outstanding.insert(nonce, NonceEntry { expires_at });
             return Ok(nonce);
         }
+        Err(PopError::NonceCollisionExhausted)
     }
 
     fn redeem(
@@ -764,13 +803,66 @@ impl NonceCache {
         expires_at: u64,
         now: u64,
     ) -> Result<(), PopError> {
-        self.entries.retain(|_, entry| entry.expires_at > now);
-        let entry = self.entries.get_mut(&nonce).ok_or(PopError::NonceReplay)?;
-        if entry.expires_at != expires_at || entry.consumed {
+        self.prune(now);
+        let entry = self.outstanding.get(&nonce).ok_or(PopError::NonceReplay)?;
+        if entry.expires_at != expires_at {
             return Err(PopError::NonceReplay);
         }
-        entry.consumed = true;
+        if self.spent.len() >= SPENT_NONCE_LIMIT {
+            return Err(PopError::NonceSpentCapacity);
+        }
+        let entry = self
+            .outstanding
+            .remove(&nonce)
+            .ok_or(PopError::NonceReplay)?;
+        self.spent.insert(nonce, entry);
         Ok(())
+    }
+
+    fn prune(&mut self, now: u64) {
+        self.outstanding.retain(|_, entry| entry.expires_at > now);
+        self.spent.retain(|_, entry| entry.expires_at > now);
+    }
+}
+
+impl NonceLease {
+    fn issue(cache: Arc<Mutex<NonceCache>>, now: u64, expires_at: u64) -> Result<Self, PopError> {
+        let nonce = lock_nonce_cache(&cache).issue(now, expires_at)?;
+        Ok(Self {
+            cache,
+            nonce,
+            armed: true,
+        })
+    }
+
+    fn bytes(&self) -> &[u8; NONCE_BYTES] {
+        &self.nonce
+    }
+
+    fn redeem(&mut self, expires_at: u64, now: u64) -> Result<(), PopError> {
+        if !self.armed {
+            return Err(PopError::NonceReplay);
+        }
+        lock_nonce_cache(&self.cache).redeem(self.nonce, expires_at, now)?;
+        self.armed = false;
+        Ok(())
+    }
+}
+
+impl Drop for NonceLease {
+    fn drop(&mut self) {
+        if self.armed {
+            lock_nonce_cache(&self.cache)
+                .outstanding
+                .remove(&self.nonce);
+        }
+    }
+}
+
+fn lock_nonce_cache(cache: &Mutex<NonceCache>) -> MutexGuard<'_, NonceCache> {
+    match cache.lock() {
+        Ok(cache) => cache,
+        Err(poisoned) => poisoned.into_inner(),
     }
 }
 
@@ -902,10 +994,15 @@ fn unix_seconds() -> Result<u64, PopError> {
         .as_secs())
 }
 
-fn proof_message(nonce: &[u8; NONCE_BYTES], timestamp: i64) -> Vec<u8> {
-    let mut message = Vec::with_capacity(POP_DOMAIN_SEPARATOR.len() + NONCE_BYTES + 8);
-    message.extend_from_slice(POP_DOMAIN_SEPARATOR);
+fn challenge_timestamp_is_fresh(issued_at: i64, verified_at: i64) -> bool {
+    issued_at.abs_diff(verified_at) <= POP_SKEW
+}
+
+fn proof_message(nonce: &[u8; NONCE_BYTES], bridge_id: &str, timestamp: i64) -> Vec<u8> {
+    // Fixed nonce and timestamp widths leave bridge_id as the unique middle span.
+    let mut message = Vec::with_capacity(NONCE_BYTES + bridge_id.len() + 8);
     message.extend_from_slice(nonce);
+    message.extend_from_slice(bridge_id.as_bytes());
     message.extend_from_slice(&timestamp.to_be_bytes());
     message
 }
@@ -1173,17 +1270,49 @@ mod tests {
         read_message(client).await
     }
 
-    fn response(challenge: &Challenge, signing: &SigningKey, timestamp: u64) -> ChallengeResponse {
+    fn response(challenge: &Challenge, signing: &SigningKey) -> ChallengeResponse {
         let nonce: [u8; NONCE_BYTES] = URL_SAFE_NO_PAD
             .decode(&challenge.nonce)
             .unwrap()
             .try_into()
             .unwrap();
-        let timestamp = i64::try_from(timestamp).unwrap();
-        let signature = signing.sign(&proof_message(&nonce, timestamp));
+        let signature = signing.sign(&proof_message(
+            &nonce,
+            &challenge.bridge_id,
+            challenge.timestamp,
+        ));
         ChallengeResponse {
-            timestamp,
             signature: URL_SAFE_NO_PAD.encode(signature.to_bytes()),
+        }
+    }
+
+    async fn assert_framed_message_rejected<T>(body: &str)
+    where
+        T: for<'a> Deserialize<'a>,
+    {
+        let (mut client, mut server) = tokio::io::duplex(4096);
+        client
+            .write_u32(body.len().try_into().unwrap())
+            .await
+            .unwrap();
+        client.write_all(body.as_bytes()).await.unwrap();
+        client.flush().await.unwrap();
+        assert!(matches!(
+            read_message::<_, T>(&mut server).await,
+            Err(PopError::InvalidMessage)
+        ));
+    }
+
+    fn nonce_from_index(index: usize) -> [u8; NONCE_BYTES] {
+        let mut nonce = [0u8; NONCE_BYTES];
+        nonce[..2].copy_from_slice(&(index as u16).to_be_bytes());
+        nonce
+    }
+
+    fn nonce_cache() -> NonceCache {
+        NonceCache {
+            outstanding: HashMap::new(),
+            spent: HashMap::new(),
         }
     }
 
@@ -1251,20 +1380,82 @@ mod tests {
 
     #[tokio::test]
     async fn valid_token_and_matching_proof_succeeds() {
-        let (fixture, pop) = fixture();
+        let (verifier, pop) = fixture();
         let now = unix_seconds().unwrap();
-        let token = mint_token(&fixture, &pop, now, now + 600);
-        let authenticator = PopAuthenticator::new(Arc::new(fixture));
+        let token = mint_token(&verifier, &pop, now, now + 600);
+        let authenticator = PopAuthenticator::new(Arc::new(verifier), String::from(BRIDGE_ID));
         let (mut client, mut server) = tokio::io::duplex(4096);
         let server_task =
             tokio::spawn(async move { authenticator.authenticate(&mut server).await });
 
         let challenge = send_request(&mut client, token).await.unwrap();
-        write_message(&mut client, &response(&challenge, &pop, now))
+        write_message(&mut client, &response(&challenge, &pop))
             .await
             .unwrap();
         let registration = server_task.await.unwrap().unwrap();
         assert_eq!(registration.hostname(), HOSTNAME);
+    }
+
+    #[tokio::test]
+    async fn acceptance_criterion_1_rejects_duplicate_and_unknown_wire_fields() {
+        for body in [
+            r#"{"token":"first","token":"second","hostname":"journal.test"}"#,
+            r#"{"token":"token","hostname":"journal.test","extra":true}"#,
+            "{",
+        ] {
+            assert_framed_message_rejected::<RegistrationRequest>(body).await;
+        }
+        for body in [
+            r#"{"nonce":"AAECAwQFBgcICQoLDA0ODw","nonce":"AAECAwQFBgcICQoLDA0ODw","bridge_id":"bridge","timestamp":1}"#,
+            r#"{"nonce":"AAECAwQFBgcICQoLDA0ODw","bridge_id":"bridge","timestamp":1,"extra":true}"#,
+        ] {
+            assert_framed_message_rejected::<Challenge>(body).await;
+        }
+        for body in [
+            r#"{"signature":"first","signature":"second"}"#,
+            r#"{"signature":"signature","timestamp":1}"#,
+        ] {
+            assert_framed_message_rejected::<ChallengeResponse>(body).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn acceptance_criterion_1_rejects_oversize_frames_before_body_allocation() {
+        let (mut client, mut server) = tokio::io::duplex(16);
+        client.write_u32(65_537).await.unwrap();
+        client.flush().await.unwrap();
+        assert!(matches!(
+            read_message::<_, RegistrationRequest>(&mut server).await,
+            Err(PopError::MessageTooLarge)
+        ));
+    }
+
+    #[test]
+    fn acceptance_criterion_1_fixed_wire_fixture_binds_exact_proof_bytes() {
+        const CHALLENGE_FRAME: &[u8] = b"\0\0\0\x5b{\"nonce\":\"AAECAwQFBgcICQoLDA0ODw\",\"bridge_id\":\"bridge:alpha\",\"timestamp\":72623859790382856}";
+        const NONCE: [u8; NONCE_BYTES] = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15];
+        const TIMESTAMP: i64 = 72_623_859_790_382_856;
+        const EXPECTED_PROOF: &[u8] = b"\0\x01\x02\x03\x04\x05\x06\x07\x08\x09\x0a\x0b\x0c\x0d\x0e\x0fbridge:alpha\x01\x02\x03\x04\x05\x06\x07\x08";
+
+        assert_eq!(URL_SAFE_NO_PAD.encode(NONCE), "AAECAwQFBgcICQoLDA0ODw");
+        assert_eq!(&CHALLENGE_FRAME[..4], &[0, 0, 0, 91]);
+        assert_eq!(CHALLENGE_FRAME.len(), 95);
+        assert_eq!(&CHALLENGE_FRAME[4..], b"{\"nonce\":\"AAECAwQFBgcICQoLDA0ODw\",\"bridge_id\":\"bridge:alpha\",\"timestamp\":72623859790382856}");
+        assert_eq!(
+            proof_message(&NONCE, "bridge:alpha", TIMESTAMP),
+            EXPECTED_PROOF
+        );
+
+        let signing = SigningKey::from_bytes(&POP_KEY);
+        let signature = signing.sign(EXPECTED_PROOF);
+        signing
+            .verifying_key()
+            .verify_strict(EXPECTED_PROOF, &signature)
+            .unwrap();
+        assert!(signing
+            .verifying_key()
+            .verify_strict(b"spl-bridge-pop-v1\0\0\x01\x02\x03\x04\x05\x06\x07\x08\x09\x0a\x0b\x0c\x0d\x0e\x0fbridge:alpha\x01\x02\x03\x04\x05\x06\x07\x08", &signature)
+            .is_err());
     }
 
     #[tokio::test]
@@ -1273,7 +1464,7 @@ mod tests {
         let now = unix_seconds().unwrap();
         let mut token = mint_token(&fixture, &pop, now, now + 600);
         token.push('x');
-        let authenticator = PopAuthenticator::new(Arc::new(fixture));
+        let authenticator = PopAuthenticator::new(Arc::new(fixture), String::from(BRIDGE_ID));
         let (mut client, mut server) = tokio::io::duplex(4096);
         let server_task =
             tokio::spawn(async move { authenticator.authenticate(&mut server).await });
@@ -1297,17 +1488,17 @@ mod tests {
 
     #[tokio::test]
     async fn proof_with_the_wrong_ed25519_key_is_rejected() {
-        let (fixture, pop) = fixture();
+        let (verifier, pop) = fixture();
         let now = unix_seconds().unwrap();
-        let token = mint_token(&fixture, &pop, now, now + 600);
-        let authenticator = PopAuthenticator::new(Arc::new(fixture));
+        let token = mint_token(&verifier, &pop, now, now + 600);
+        let authenticator = PopAuthenticator::new(Arc::new(verifier), String::from(BRIDGE_ID));
         let (mut client, mut server) = tokio::io::duplex(4096);
         let server_task =
             tokio::spawn(async move { authenticator.authenticate(&mut server).await });
 
         let challenge = send_request(&mut client, token).await.unwrap();
         let wrong = SigningKey::from_bytes(&WRONG_POP_KEY);
-        write_message(&mut client, &response(&challenge, &wrong, now))
+        write_message(&mut client, &response(&challenge, &wrong))
             .await
             .unwrap();
         assert!(matches!(
@@ -1317,38 +1508,156 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn proof_timestamp_outside_the_skew_window_is_rejected() {
-        let (fixture, pop) = fixture();
+    async fn acceptance_criterion_2_rejects_wrong_bridge_and_old_prototype_proofs() {
+        let (first_verifier, pop) = fixture();
         let now = unix_seconds().unwrap();
-        let token = mint_token(&fixture, &pop, now, now + 600);
-        let authenticator = PopAuthenticator::new(Arc::new(fixture));
+        let token = mint_token(&first_verifier, &pop, now, now + 600);
+        let authenticator =
+            PopAuthenticator::new(Arc::new(first_verifier), String::from(BRIDGE_ID));
         let (mut client, mut server) = tokio::io::duplex(4096);
         let server_task =
             tokio::spawn(async move { authenticator.authenticate(&mut server).await });
 
         let challenge = send_request(&mut client, token).await.unwrap();
-        write_message(&mut client, &response(&challenge, &pop, now + 90))
-            .await
+        let nonce: [u8; NONCE_BYTES] = URL_SAFE_NO_PAD
+            .decode(&challenge.nonce)
+            .unwrap()
+            .try_into()
             .unwrap();
+        let wrong_bridge = proof_message(&nonce, "other-bridge", challenge.timestamp);
+        write_message(
+            &mut client,
+            &ChallengeResponse {
+                signature: URL_SAFE_NO_PAD.encode(pop.sign(&wrong_bridge).to_bytes()),
+            },
+        )
+        .await
+        .unwrap();
         assert!(matches!(
             server_task.await.unwrap(),
-            Err(PopError::ResponseTimeInvalid)
+            Err(PopError::InvalidProof)
+        ));
+
+        let (fixture, pop) = fixture();
+        let now = unix_seconds().unwrap();
+        let token = mint_token(&fixture, &pop, now, now + 600);
+        let authenticator = PopAuthenticator::new(Arc::new(fixture), String::from(BRIDGE_ID));
+        let (mut client, mut server) = tokio::io::duplex(4096);
+        let server_task =
+            tokio::spawn(async move { authenticator.authenticate(&mut server).await });
+        let challenge = send_request(&mut client, token).await.unwrap();
+        let nonce: [u8; NONCE_BYTES] = URL_SAFE_NO_PAD
+            .decode(&challenge.nonce)
+            .unwrap()
+            .try_into()
+            .unwrap();
+        let mut prototype = b"spl-bridge-pop-v1\0".to_vec();
+        prototype.extend_from_slice(&nonce);
+        prototype.extend_from_slice(&challenge.timestamp.to_be_bytes());
+        write_message(
+            &mut client,
+            &ChallengeResponse {
+                signature: URL_SAFE_NO_PAD.encode(pop.sign(&prototype).to_bytes()),
+            },
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            server_task.await.unwrap(),
+            Err(PopError::InvalidProof)
+        ));
+    }
+
+    #[test]
+    fn acceptance_criterion_2_rejects_stale_and_future_bridge_timestamps() {
+        assert!(challenge_timestamp_is_fresh(1_000, 1_060));
+        assert!(!challenge_timestamp_is_fresh(1_000, 1_061));
+        assert!(!challenge_timestamp_is_fresh(1_061, 1_000));
+    }
+
+    #[tokio::test]
+    async fn acceptance_criterion_2_rejects_a_32_byte_prototype_nonce_proof() {
+        let (fixture, pop) = fixture();
+        let now = unix_seconds().unwrap();
+        let token = mint_token(&fixture, &pop, now, now + 600);
+        let authenticator = PopAuthenticator::new(Arc::new(fixture), String::from(BRIDGE_ID));
+        let (mut client, mut server) = tokio::io::duplex(4096);
+        let server_task =
+            tokio::spawn(async move { authenticator.authenticate(&mut server).await });
+        let challenge = send_request(&mut client, token).await.unwrap();
+        let nonce: [u8; NONCE_BYTES] = URL_SAFE_NO_PAD
+            .decode(&challenge.nonce)
+            .unwrap()
+            .try_into()
+            .unwrap();
+        let mut prototype = nonce.to_vec();
+        prototype.extend_from_slice(&[0; NONCE_BYTES]);
+        prototype.extend_from_slice(challenge.bridge_id.as_bytes());
+        prototype.extend_from_slice(&challenge.timestamp.to_be_bytes());
+        write_message(
+            &mut client,
+            &ChallengeResponse {
+                signature: URL_SAFE_NO_PAD.encode(pop.sign(&prototype).to_bytes()),
+            },
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            server_task.await.unwrap(),
+            Err(PopError::InvalidProof)
+        ));
+    }
+
+    #[tokio::test]
+    async fn acceptance_criterion_2_rejects_wrong_hostname_and_old_response_shape() {
+        let (first_verifier, pop) = fixture();
+        let now = unix_seconds().unwrap();
+        let token = mint_token(&first_verifier, &pop, now, now + 600);
+        let authenticator =
+            PopAuthenticator::new(Arc::new(first_verifier), String::from(BRIDGE_ID));
+        let (mut client, mut server) = tokio::io::duplex(4096);
+        let server_task =
+            tokio::spawn(async move { authenticator.authenticate(&mut server).await });
+        write_message(
+            &mut client,
+            &RegistrationRequest {
+                token,
+                hostname: String::from("other.solstone.me"),
+            },
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            server_task.await.unwrap(),
+            Err(PopError::HostnameMismatch)
+        ));
+
+        let (fixture, pop) = fixture();
+        let now = unix_seconds().unwrap();
+        let token = mint_token(&fixture, &pop, now, now + 600);
+        let authenticator = PopAuthenticator::new(Arc::new(fixture), String::from(BRIDGE_ID));
+        let (mut client, mut server) = tokio::io::duplex(4096);
+        let server_task =
+            tokio::spawn(async move { authenticator.authenticate(&mut server).await });
+        let _challenge = send_request(&mut client, token).await.unwrap();
+        client
+            .write_all(b"\0\0\0\x1e{\"timestamp\":1,\"signature\":\"x\"}")
+            .await
+            .unwrap();
+        client.flush().await.unwrap();
+        assert!(matches!(
+            server_task.await.unwrap(),
+            Err(PopError::InvalidMessage)
         ));
     }
 
     #[test]
     fn replayed_nonce_is_rejected_within_its_token_lifetime() {
-        let mut cache = NonceCache {
-            entries: HashMap::new(),
-        };
+        let mut cache = nonce_cache();
         let nonce = [1; NONCE_BYTES];
-        cache.entries.insert(
-            nonce,
-            NonceEntry {
-                expires_at: 300,
-                consumed: false,
-            },
-        );
+        cache
+            .outstanding
+            .insert(nonce, NonceEntry { expires_at: 300 });
         cache.redeem(nonce, 300, 1).unwrap();
         assert!(matches!(
             cache.redeem(nonce, 300, 1),
@@ -1356,12 +1665,210 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn acceptance_criterion_6_5_caps_outstanding_nonces_without_live_eviction() {
+        let mut cache = nonce_cache();
+        for index in 0..OUTSTANDING_NONCE_LIMIT {
+            let nonce = nonce_from_index(index);
+            assert_eq!(cache.issue_with(1, 100, || Ok(nonce)).unwrap(), nonce);
+        }
+        assert!(matches!(
+            cache.issue_with(1, 100, || Ok([255; NONCE_BYTES])),
+            Err(PopError::NonceOutstandingCapacity)
+        ));
+        assert_eq!(cache.outstanding.len(), OUTSTANDING_NONCE_LIMIT);
+        assert!(cache.outstanding.contains_key(&nonce_from_index(42)));
+    }
+
+    #[test]
+    fn acceptance_criterion_6_5_caps_spent_nonces_without_live_eviction() {
+        let mut cache = nonce_cache();
+        for index in 0..SPENT_NONCE_LIMIT {
+            cache
+                .spent
+                .insert(nonce_from_index(index), NonceEntry { expires_at: 100 });
+        }
+        let nonce = [42; NONCE_BYTES];
+        cache
+            .outstanding
+            .insert(nonce, NonceEntry { expires_at: 100 });
+        assert!(matches!(
+            cache.redeem(nonce, 100, 1),
+            Err(PopError::NonceSpentCapacity)
+        ));
+        assert!(cache.outstanding.contains_key(&nonce));
+        assert_eq!(cache.spent.len(), SPENT_NONCE_LIMIT);
+        assert!(cache.spent.contains_key(&nonce_from_index(42)));
+    }
+
+    #[test]
+    fn acceptance_criterion_6_5_prunes_exact_expiry_from_both_nonce_sets() {
+        let mut cache = nonce_cache();
+        let outstanding = [1; NONCE_BYTES];
+        let spent = [2; NONCE_BYTES];
+        cache
+            .outstanding
+            .insert(outstanding, NonceEntry { expires_at: 10 });
+        cache.spent.insert(spent, NonceEntry { expires_at: 10 });
+        cache.prune(9);
+        assert!(cache.outstanding.contains_key(&outstanding));
+        assert!(cache.spent.contains_key(&spent));
+        cache.prune(10);
+        assert!(!cache.outstanding.contains_key(&outstanding));
+        assert!(!cache.spent.contains_key(&spent));
+    }
+
+    #[test]
+    fn acceptance_criterion_6_5_bounds_collisions_and_never_reissues_spent_nonce() {
+        let mut cache = nonce_cache();
+        let spent = [5; NONCE_BYTES];
+        cache
+            .outstanding
+            .insert(spent, NonceEntry { expires_at: 100 });
+        cache.redeem(spent, 100, 1).unwrap();
+        assert!(matches!(
+            cache.issue_with(1, 100, || Ok(spent)),
+            Err(PopError::NonceCollisionExhausted)
+        ));
+        let mut attempts = 0;
+        let fresh = [6; NONCE_BYTES];
+        assert_eq!(
+            cache
+                .issue_with(1, 100, || {
+                    attempts += 1;
+                    Ok(if attempts == 1 { spent } else { fresh })
+                })
+                .unwrap(),
+            fresh
+        );
+        assert!(cache.spent.contains_key(&spent));
+        assert!(cache.outstanding.contains_key(&fresh));
+    }
+
+    #[test]
+    fn acceptance_criterion_6_5_nonce_lease_releases_on_early_drop() {
+        let cache = Arc::new(Mutex::new(nonce_cache()));
+        let lease = NonceLease::issue(Arc::clone(&cache), 1, 100).unwrap();
+        let issued = *lease.bytes();
+        assert!(lock_nonce_cache(&cache).outstanding.contains_key(&issued));
+        drop(lease);
+        assert!(!lock_nonce_cache(&cache).outstanding.contains_key(&issued));
+        let replacement = [7; NONCE_BYTES];
+        assert_eq!(
+            lock_nonce_cache(&cache)
+                .issue_with(1, 100, || Ok(replacement))
+                .unwrap(),
+            replacement
+        );
+    }
+
+    #[tokio::test]
+    async fn acceptance_criterion_6_5_releases_after_invalid_and_malformed_proofs() {
+        for signature in [
+            String::from("not-base64"),
+            URL_SAFE_NO_PAD.encode([0u8; 64]),
+        ] {
+            let (fixture, pop) = fixture();
+            let now = unix_seconds().unwrap();
+            let token = mint_token(&fixture, &pop, now, now + 600);
+            let authenticator = PopAuthenticator::new(Arc::new(fixture), String::from(BRIDGE_ID));
+            let observer = authenticator.clone();
+            let (mut client, mut server) = tokio::io::duplex(4096);
+            let server_task =
+                tokio::spawn(async move { authenticator.authenticate(&mut server).await });
+            let _challenge = send_request(&mut client, token).await.unwrap();
+            write_message(&mut client, &ChallengeResponse { signature })
+                .await
+                .unwrap();
+            assert!(matches!(
+                server_task.await.unwrap(),
+                Err(PopError::InvalidProof)
+            ));
+            assert!(lock_nonce_cache(&observer.nonces).outstanding.is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn acceptance_criterion_6_5_releases_after_prefix_and_body_read_failures() {
+        for partial_response in [None, Some(b"{".as_slice())] {
+            let (fixture, pop) = fixture();
+            let now = unix_seconds().unwrap();
+            let token = mint_token(&fixture, &pop, now, now + 600);
+            let authenticator = PopAuthenticator::new(Arc::new(fixture), String::from(BRIDGE_ID));
+            let observer = authenticator.clone();
+            let (mut client, mut server) = tokio::io::duplex(4096);
+            let server_task =
+                tokio::spawn(async move { authenticator.authenticate(&mut server).await });
+            let _challenge = send_request(&mut client, token).await.unwrap();
+            if let Some(partial_response) = partial_response {
+                client.write_u32(2).await.unwrap();
+                client.write_all(partial_response).await.unwrap();
+                client.flush().await.unwrap();
+            }
+            drop(client);
+            assert!(matches!(
+                tokio::time::timeout(Duration::from_secs(1), server_task)
+                    .await
+                    .unwrap()
+                    .unwrap(),
+                Err(PopError::Io)
+            ));
+            assert!(lock_nonce_cache(&observer.nonces).outstanding.is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn acceptance_criterion_6_5_releases_after_challenge_write_failure() {
+        let (fixture, pop) = fixture();
+        let now = unix_seconds().unwrap();
+        let token = mint_token(&fixture, &pop, now, now + 600);
+        let authenticator = PopAuthenticator::new(Arc::new(fixture), String::from(BRIDGE_ID));
+        let observer = authenticator.clone();
+        let (mut client, mut server) = tokio::io::duplex(4096);
+        let server_task =
+            tokio::spawn(async move { authenticator.authenticate(&mut server).await });
+        write_message(
+            &mut client,
+            &RegistrationRequest {
+                token,
+                hostname: String::from(HOSTNAME),
+            },
+        )
+        .await
+        .unwrap();
+        drop(client);
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(1), server_task)
+                .await
+                .unwrap()
+                .unwrap(),
+            Err(PopError::Io)
+        ));
+        assert!(lock_nonce_cache(&observer.nonces).outstanding.is_empty());
+    }
+
+    #[tokio::test]
+    async fn acceptance_criterion_6_5_releases_after_authentication_future_drop() {
+        let (fixture, pop) = fixture();
+        let now = unix_seconds().unwrap();
+        let token = mint_token(&fixture, &pop, now, now + 600);
+        let authenticator = PopAuthenticator::new(Arc::new(fixture), String::from(BRIDGE_ID));
+        let observer = authenticator.clone();
+        let (mut client, mut server) = tokio::io::duplex(4096);
+        let server_task =
+            tokio::spawn(async move { authenticator.authenticate(&mut server).await });
+        let _challenge = send_request(&mut client, token).await.unwrap();
+        server_task.abort();
+        assert!(server_task.await.is_err());
+        assert!(lock_nonce_cache(&observer.nonces).outstanding.is_empty());
+    }
+
     #[tokio::test]
     async fn expired_token_is_rejected_before_a_challenge_is_issued() {
         let (fixture, pop) = fixture();
         let now = unix_seconds().unwrap();
         let token = mint_token(&fixture, &pop, now - 600, now - 1);
-        let authenticator = PopAuthenticator::new(Arc::new(fixture));
+        let authenticator = PopAuthenticator::new(Arc::new(fixture), String::from(BRIDGE_ID));
         let (mut client, mut server) = tokio::io::duplex(4096);
         let server_task =
             tokio::spawn(async move { authenticator.authenticate(&mut server).await });

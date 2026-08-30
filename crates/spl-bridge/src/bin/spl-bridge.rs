@@ -69,13 +69,14 @@ async fn run() -> Result<(), String> {
         .map_err(|_| String::from("could not bind --client-listen"))?;
 
     let registry = spl_bridge::registry::Registry::default();
-    let authenticator = PopAuthenticator::new(Arc::new(verifier));
+    let authenticator = PopAuthenticator::new(Arc::new(verifier), options.bridge_id);
     tokio::join!(
         run_control_listener(
             control_listener,
             Arc::new(tls_config),
             registry.clone(),
             authenticator,
+            spl_bridge::DEFAULT_ADMISSION_DEADLINE,
         ),
         run_client_listener(
             client_listener,
@@ -102,7 +103,11 @@ fn parse_options(arguments: impl Iterator<Item = String>) -> Result<Options, Str
             .next()
             .ok_or_else(|| format!("missing value for {flag}"))?;
         match flag.as_str() {
-            "--control-listen" => control_listen = Some(parse_address(&value, &flag)?),
+            "--control-listen" => {
+                let address = parse_address(&value, &flag)?;
+                validate_control_listen(&address)?;
+                control_listen = Some(address);
+            }
             "--client-listen" => client_listen = Some(parse_address(&value, &flag)?),
             "--control-tls-cert" => control_tls_cert = Some(value),
             "--control-tls-key" => control_tls_key = Some(value),
@@ -133,6 +138,16 @@ fn parse_address(value: &str, flag: &str) -> Result<SocketAddr, String> {
     value
         .parse()
         .map_err(|_| format!("invalid address for {flag}"))
+}
+
+fn validate_control_listen(address: &SocketAddr) -> Result<(), String> {
+    if address.ip().is_loopback() {
+        Ok(())
+    } else {
+        Err(String::from(
+            "invalid --control-listen: address must be loopback",
+        ))
+    }
 }
 
 fn parse_timeout(value: &str, flag: &str) -> Result<u64, String> {
@@ -167,7 +182,7 @@ mod tests {
         reason = "test asserts on the rejection error directly"
     )]
 
-    use super::validate_bridge_id;
+    use super::{parse_options, validate_bridge_id, validate_control_listen};
 
     #[test]
     fn bridge_id_accepts_the_configured_grammar() {
@@ -197,5 +212,53 @@ mod tests {
                 "invalid --bridge-id: must be 1-128 characters from [A-Za-z0-9._:-]"
             );
         }
+    }
+
+    #[test]
+    fn control_listen_accepts_ipv4_and_ipv6_loopback() {
+        for value in ["127.0.0.1:8080", "[::1]:8080"] {
+            assert_eq!(validate_control_listen(&value.parse().unwrap()), Ok(()));
+        }
+    }
+
+    #[test]
+    fn control_listen_rejections_do_not_echo_the_input() {
+        for value in [
+            "0.0.0.0:8080",
+            "[::]:8080",
+            "10.0.0.1:8080",
+            "192.168.1.1:8080",
+            "169.254.1.1:8080",
+            "[fe80::1]:8080",
+            "1.1.1.1:8080",
+        ] {
+            let error = validate_control_listen(&value.parse().unwrap()).unwrap_err();
+            assert_eq!(error, "invalid --control-listen: address must be loopback");
+            assert!(!error.contains(value));
+        }
+    }
+
+    #[test]
+    fn client_listen_remains_unrestricted() {
+        let options = parse_options(
+            [
+                "--control-listen",
+                "127.0.0.1:8080",
+                "--client-listen",
+                "1.1.1.1:8443",
+                "--control-tls-cert",
+                "cert.pem",
+                "--control-tls-key",
+                "key.pem",
+                "--jwks-url",
+                "https://jwks.test/keys",
+                "--bridge-id",
+                "bridge",
+            ]
+            .into_iter()
+            .map(String::from),
+        )
+        .unwrap();
+        assert_eq!(options.client_listen, "1.1.1.1:8443".parse().unwrap());
     }
 }

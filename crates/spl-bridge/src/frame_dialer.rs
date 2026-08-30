@@ -188,6 +188,13 @@ impl FrameDialer {
             }
         }
     }
+
+    /// Send the shutdown command without waiting for the coordinator to stop.
+    ///
+    /// Used by registry cancellation-safety cleanup, which cannot `.await` inside `Drop`.
+    pub(crate) fn signal_shutdown(&self) {
+        let _ = self.commands.send(Command::Shutdown);
+    }
 }
 
 impl DialerStream {

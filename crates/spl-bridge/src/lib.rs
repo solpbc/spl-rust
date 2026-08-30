@@ -89,6 +89,9 @@ pub fn server_tls_config(
         .map_err(|_| BridgeError::TlsConfiguration)
 }
 
+/// Absolute time allowed for one journal control connection's admission.
+pub const DEFAULT_ADMISSION_DEADLINE: Duration = Duration::from_secs(10);
+
 /// Accept journal control connections indefinitely on `listener`.
 ///
 /// Every registration is handled in its own task so a slow peer cannot block
@@ -98,6 +101,7 @@ pub async fn run_control_listener(
     tls_config: Arc<ServerConfig>,
     registry: registry::Registry,
     authenticator: pop_auth::PopAuthenticator,
+    admission_deadline: Duration,
 ) {
     tracing::info!(address = %listener.local_addr().ok().map_or_else(String::new, |address| address.to_string()), "control listener started");
     loop {
@@ -105,27 +109,86 @@ pub async fn run_control_listener(
             tracing::warn!("control listener accept failed");
             continue;
         };
+        let deadline = tokio::time::Instant::now() + admission_deadline;
         let acceptor = TlsAcceptor::from(Arc::clone(&tls_config));
         let registry = registry.clone();
         let authenticator = authenticator.clone();
         tokio::spawn(async move {
-            let Ok(mut tls_stream) = acceptor.accept(stream).await else {
-                tracing::warn!(%peer, "control TLS handshake rejected");
-                return;
-            };
-            let Ok(registration) = authenticator.authenticate(&mut tls_stream).await else {
-                tracing::warn!(%peer, "journal registration rejected");
-                return;
-            };
-            let hostname = registration.hostname().to_owned();
-            let journal = registry.register(hostname.clone(), tls_stream).await;
-            let generation = journal.generation();
-            tracing::info!(%peer, hostname = ?hostname, generation, "journal registered");
-            tokio::spawn(async move {
-                journal.wait_until_gone().await;
-                tracing::info!(hostname = ?hostname, generation, "journal evicted");
-            });
+            if tokio::time::timeout_at(deadline, async move {
+                let Ok(mut tls_stream) = acceptor.accept(stream).await else {
+                    tracing::warn!(%peer, "control TLS handshake rejected");
+                    return;
+                };
+                let registration = match authenticator.authenticate(&mut tls_stream).await {
+                    Ok(registration) => registration,
+                    Err(error) => {
+                        tracing::warn!(%peer, reason = pop_admission_reason(&error), "journal registration rejected");
+                        return;
+                    }
+                };
+                let hostname = registration.hostname().to_owned();
+                let journal = match registry
+                    .register(
+                        hostname,
+                        tls_stream,
+                        registration.claims().expires_at(),
+                        deadline,
+                    )
+                    .await
+                {
+                    Ok(journal) => journal,
+                    Err(error) => {
+                        tracing::warn!(reason = registry_admission_reason(&error), "journal registration failed");
+                        return;
+                    }
+                };
+                let generation = journal.generation();
+                tracing::info!(%peer, generation, "journal registered");
+                tokio::spawn(async move {
+                    journal.wait_until_gone().await;
+                    tracing::info!(generation, "journal evicted");
+                });
+            })
+            .await
+            .is_err()
+            {
+                tracing::warn!(reason = "admission_timeout", "journal registration timed out");
+            }
         });
+    }
+}
+
+fn pop_admission_reason(error: &pop_auth::PopError) -> &'static str {
+    match error {
+        pop_auth::PopError::TokenRejected
+        | pop_auth::PopError::HostnameMismatch
+        | pop_auth::PopError::TokenTimeInvalid => "token_rejection",
+        pop_auth::PopError::JwksUnavailable
+        | pop_auth::PopError::JwksKeyUnavailable
+        | pop_auth::PopError::JwksUrl
+        | pop_auth::PopError::JwksTlsConfiguration => "jwks_unavailable",
+        pop_auth::PopError::NonceOutstandingCapacity => "nonce_outstanding_capacity",
+        pop_auth::PopError::NonceSpentCapacity => "nonce_spent_capacity",
+        pop_auth::PopError::NonceCollisionExhausted | pop_auth::PopError::Randomness => {
+            "nonce_generation_failure"
+        }
+        pop_auth::PopError::Io
+        | pop_auth::PopError::MessageTooLarge
+        | pop_auth::PopError::InvalidMessage
+        | pop_auth::PopError::ChallengeTimeInvalid
+        | pop_auth::PopError::InvalidProof
+        | pop_auth::PopError::NonceReplay => "framing_or_proof_rejection",
+    }
+}
+
+fn registry_admission_reason(error: &registry::RegistryError) -> &'static str {
+    match error {
+        registry::RegistryError::Expired | registry::RegistryError::AdmissionDeadlineExceeded => {
+            "admission_timeout"
+        }
+        registry::RegistryError::Retired
+        | registry::RegistryError::OpenTimedOut
+        | registry::RegistryError::Dialer(_) => "registry_failure",
     }
 }
 
@@ -192,6 +255,68 @@ async fn handle_client(
         }
         Err(_) => {
             tracing::warn!(%peer, hostname = ?hostname, stream_id, "client splice closed with I/O error");
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::frame_dialer::DialerError;
+    use crate::pop_auth::PopError;
+    use crate::registry::RegistryError;
+
+    #[test]
+    fn acceptance_criterion_12_admission_reason_categories_are_fixed_and_exhaustive() {
+        for error in [
+            PopError::TokenRejected,
+            PopError::HostnameMismatch,
+            PopError::TokenTimeInvalid,
+        ] {
+            assert_eq!(pop_admission_reason(&error), "token_rejection");
+        }
+        for error in [
+            PopError::JwksUnavailable,
+            PopError::JwksKeyUnavailable,
+            PopError::JwksUrl,
+            PopError::JwksTlsConfiguration,
+        ] {
+            assert_eq!(pop_admission_reason(&error), "jwks_unavailable");
+        }
+        assert_eq!(
+            pop_admission_reason(&PopError::NonceOutstandingCapacity),
+            "nonce_outstanding_capacity"
+        );
+        assert_eq!(
+            pop_admission_reason(&PopError::NonceSpentCapacity),
+            "nonce_spent_capacity"
+        );
+        for error in [PopError::NonceCollisionExhausted, PopError::Randomness] {
+            assert_eq!(pop_admission_reason(&error), "nonce_generation_failure");
+        }
+        for error in [
+            PopError::Io,
+            PopError::MessageTooLarge,
+            PopError::InvalidMessage,
+            PopError::ChallengeTimeInvalid,
+            PopError::InvalidProof,
+            PopError::NonceReplay,
+        ] {
+            assert_eq!(pop_admission_reason(&error), "framing_or_proof_rejection");
+        }
+
+        for error in [
+            RegistryError::Expired,
+            RegistryError::AdmissionDeadlineExceeded,
+        ] {
+            assert_eq!(registry_admission_reason(&error), "admission_timeout");
+        }
+        for error in [
+            RegistryError::Retired,
+            RegistryError::OpenTimedOut,
+            RegistryError::Dialer(DialerError::ConnectionClosed),
+        ] {
+            assert_eq!(registry_admission_reason(&error), "registry_failure");
         }
     }
 }

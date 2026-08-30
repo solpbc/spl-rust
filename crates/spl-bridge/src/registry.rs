@@ -6,7 +6,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncWrite};
@@ -36,6 +36,33 @@ pub struct RegisteredJournal {
     retired: AtomicBool,
 }
 
+/// Cleans up a candidate that was never made observable through the registry.
+struct CandidateGuard {
+    candidate: Arc<RegisteredJournal>,
+    armed: bool,
+}
+
+impl CandidateGuard {
+    fn new(candidate: Arc<RegisteredJournal>) -> Self {
+        Self {
+            candidate,
+            armed: true,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for CandidateGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            self.candidate.dialer.signal_shutdown();
+        }
+    }
+}
+
 /// Errors returned while opening a client stream through a registration.
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum RegistryError {
@@ -45,6 +72,12 @@ pub enum RegistryError {
     /// The journal did not flush the stream OPEN frame within three seconds.
     #[error("journal stream open timed out")]
     OpenTimedOut,
+    /// The registration token expired before the candidate could be committed.
+    #[error("journal registration token expired before commit")]
+    Expired,
+    /// The caller's absolute admission deadline elapsed before commit.
+    #[error("journal registration admission deadline elapsed before commit")]
+    AdmissionDeadlineExceeded,
     /// The journal tunnel connection could not open the stream.
     #[error("journal dialer error: {0}")]
     Dialer(#[from] DialerError),
@@ -53,10 +86,21 @@ pub enum RegistryError {
 impl Registry {
     /// Register `carrier` as the current journal tunnel for `hostname`.
     ///
-    /// Replacing an existing entry first makes that old entry reject new opens,
-    /// then waits up to 250 ms for its dialer shutdown to end all of its live
-    /// streams. The map swap happens before that bounded shutdown work.
-    pub async fn register<T>(&self, hostname: String, carrier: T) -> Arc<RegisteredJournal>
+    /// Expiry and deadline checks run at the actual commit instant under the
+    /// write lock. A displaced entry is retired before the map is updated in the
+    /// same atomic section; its bounded shutdown then runs in a registry task.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RegistryError::Expired`] or [`RegistryError::AdmissionDeadlineExceeded`]
+    /// when the candidate cannot be committed at the actual commit instant.
+    pub async fn register<T>(
+        &self,
+        hostname: String,
+        carrier: T,
+        expires_at: u64,
+        admission_deadline: tokio::time::Instant,
+    ) -> Result<Arc<RegisteredJournal>, RegistryError>
     where
         T: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
@@ -66,19 +110,23 @@ impl Registry {
             generation,
             retired: AtomicBool::new(false),
         });
+        let mut candidate = CandidateGuard::new(Arc::clone(&registered));
 
-        let displaced = self
-            .inner
-            .entries
-            .write()
-            .await
-            .insert(hostname.clone(), Arc::clone(&registered));
-
-        if let Some(displaced) = displaced {
-            displaced.retired.store(true, Ordering::Release);
-            let _ = tokio::time::timeout(REPLACEMENT_SHUTDOWN_BUDGET, displaced.dialer.shutdown())
-                .await;
-        }
+        let displaced = {
+            let mut entries = self.inner.entries.write().await;
+            if tokio::time::Instant::now() >= admission_deadline {
+                return Err(RegistryError::AdmissionDeadlineExceeded);
+            }
+            if unix_seconds() >= expires_at {
+                return Err(RegistryError::Expired);
+            }
+            let displaced = entries.get(&hostname).cloned();
+            if let Some(displaced) = &displaced {
+                displaced.retired.store(true, Ordering::Release);
+            }
+            entries.insert(hostname.clone(), Arc::clone(&registered));
+            displaced
+        };
 
         let registry = self.clone();
         let watcher = Arc::clone(&registered);
@@ -88,7 +136,16 @@ impl Registry {
             registry.remove_if_current(&hostname, generation).await;
         });
 
-        registered
+        if let Some(displaced) = displaced {
+            tokio::spawn(async move {
+                let _ =
+                    tokio::time::timeout(REPLACEMENT_SHUTDOWN_BUDGET, displaced.dialer.shutdown())
+                        .await;
+            });
+        }
+
+        candidate.disarm();
+        Ok(registered)
     }
 
     /// Return the currently registered journal for `hostname`, if one is live.
@@ -137,11 +194,23 @@ impl RegisteredJournal {
         if self.retired.load(Ordering::Acquire) {
             return Err(RegistryError::Retired);
         }
-        tokio::time::timeout(OPEN_STREAM_TIMEOUT, self.dialer.open_stream())
+        let stream = tokio::time::timeout(OPEN_STREAM_TIMEOUT, self.dialer.open_stream())
             .await
             .map_err(|_| RegistryError::OpenTimedOut)?
-            .map_err(RegistryError::from)
+            .map_err(RegistryError::from)?;
+        // Never hand out a stream opened by a registration retired mid-flight.
+        if self.retired.load(Ordering::Acquire) {
+            drop(stream);
+            return Err(RegistryError::Retired);
+        }
+        Ok(stream)
     }
+}
+
+fn unix_seconds() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(u64::MAX, |duration| duration.as_secs())
 }
 
 #[cfg(test)]
@@ -155,27 +224,61 @@ mod tests {
 
     use super::*;
     use crate::frame_dialer::StreamEnd;
+    use spl_core::frame::{FLAG_DATA, FrameDecoder};
     use tokio::io::AsyncReadExt;
+    use tokio::sync::oneshot;
+
+    fn admission_deadline() -> tokio::time::Instant {
+        tokio::time::Instant::now() + Duration::from_secs(10)
+    }
+
+    async fn assert_peer_stops(peer: &mut tokio::io::DuplexStream) {
+        let mut byte = [0u8; 1];
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), peer.read(&mut byte))
+                .await
+                .unwrap()
+                .unwrap(),
+            0
+        );
+    }
 
     #[tokio::test]
     async fn replacement_wins_and_ends_the_displaced_journals_streams() {
         let registry = Registry::default();
         let (first_carrier, mut first_peer) = tokio::io::duplex(1024);
         let first = registry
-            .register("journal.test".into(), first_carrier)
-            .await;
+            .register(
+                "journal.test".into(),
+                first_carrier,
+                u64::MAX,
+                admission_deadline(),
+            )
+            .await
+            .unwrap();
         let mut stream = first.open_stream().await.unwrap();
         let mut open_frame = [0u8; 16];
         assert_ne!(first_peer.read(&mut open_frame).await.unwrap(), 0);
 
         let (second_carrier, _second_peer) = tokio::io::duplex(1024);
         let second = registry
-            .register("journal.test".into(), second_carrier)
-            .await;
+            .register(
+                "journal.test".into(),
+                second_carrier,
+                u64::MAX,
+                admission_deadline(),
+            )
+            .await
+            .unwrap();
 
         let current = registry.lookup("journal.test").await.unwrap();
         assert!(Arc::ptr_eq(&current, &second));
-        assert_eq!(first.connection_state(), ConnectionState::Gone);
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), first.wait_until_gone())
+                .await
+                .unwrap(),
+            ConnectionState::Gone
+        );
         let mut byte = [0u8; 1];
         assert_eq!(
             tokio::time::timeout(Duration::from_secs(1), first_peer.read(&mut byte))
@@ -196,7 +299,15 @@ mod tests {
     async fn organic_connection_close_removes_its_hostname() {
         let registry = Registry::default();
         let (carrier, peer) = tokio::io::duplex(1024);
-        let _registered = registry.register("journal.test".into(), carrier).await;
+        let _registered = registry
+            .register(
+                "journal.test".into(),
+                carrier,
+                u64::MAX,
+                admission_deadline(),
+            )
+            .await
+            .unwrap();
         drop(peer);
 
         tokio::time::timeout(Duration::from_secs(1), async {
@@ -215,7 +326,15 @@ mod tests {
     async fn stalled_open_times_out_after_three_seconds() {
         let registry = Registry::default();
         let (carrier, _peer) = tokio::io::duplex(16);
-        let journal = registry.register("journal.test".into(), carrier).await;
+        let journal = registry
+            .register(
+                "journal.test".into(),
+                carrier,
+                u64::MAX,
+                admission_deadline(),
+            )
+            .await
+            .unwrap();
         let first = journal.open_stream().await.unwrap();
         let second = journal.open_stream().await.unwrap();
 
@@ -229,5 +348,263 @@ mod tests {
 
         drop(first);
         drop(second);
+    }
+
+    #[tokio::test]
+    async fn acceptance_criterion_4_rejects_expired_and_deadline_candidates_before_publish() {
+        let registry = Registry::default();
+        let (expired_carrier, mut expired_peer) = tokio::io::duplex(1024);
+        assert!(matches!(
+            registry
+                .register(
+                    "expired.test".into(),
+                    expired_carrier,
+                    0,
+                    admission_deadline(),
+                )
+                .await,
+            Err(RegistryError::Expired)
+        ));
+        assert!(registry.lookup("expired.test").await.is_none());
+        assert_peer_stops(&mut expired_peer).await;
+
+        let (deadline_carrier, mut deadline_peer) = tokio::io::duplex(1024);
+        assert!(matches!(
+            registry
+                .register(
+                    "deadline.test".into(),
+                    deadline_carrier,
+                    u64::MAX,
+                    tokio::time::Instant::now() - Duration::from_millis(1),
+                )
+                .await,
+            Err(RegistryError::AdmissionDeadlineExceeded)
+        ));
+        assert!(registry.lookup("deadline.test").await.is_none());
+        assert_peer_stops(&mut deadline_peer).await;
+    }
+
+    #[tokio::test]
+    async fn acceptance_criterion_4_rechecks_deadline_at_commit_after_lock_contention() {
+        let registry = Registry::default();
+        let entries = registry.inner.entries.write().await;
+        let pending_registry = registry.clone();
+        let (carrier, mut peer) = tokio::io::duplex(1024);
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(20);
+        let pending = tokio::spawn(async move {
+            pending_registry
+                .register("pending.test".into(), carrier, u64::MAX, deadline)
+                .await
+        });
+        tokio::task::yield_now().await;
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        drop(entries);
+
+        assert!(matches!(
+            pending.await.unwrap(),
+            Err(RegistryError::AdmissionDeadlineExceeded)
+        ));
+        assert!(registry.lookup("pending.test").await.is_none());
+        assert_peer_stops(&mut peer).await;
+
+        let (carrier, _peer) = tokio::io::duplex(1024);
+        assert!(
+            registry
+                .register(
+                    "pending.test".into(),
+                    carrier,
+                    u64::MAX,
+                    admission_deadline()
+                )
+                .await
+                .is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn acceptance_criterion_8_rejects_a_preacquired_handle_before_its_open_check() {
+        let registry = Registry::default();
+        let (old_carrier, mut old_peer) = tokio::io::duplex(1024);
+        let old = registry
+            .register(
+                "journal.test".into(),
+                old_carrier,
+                u64::MAX,
+                admission_deadline(),
+            )
+            .await
+            .unwrap();
+        let preacquired = registry.lookup("journal.test").await.unwrap();
+        let (ready_tx, ready_rx) = oneshot::channel();
+        let (release_tx, release_rx) = oneshot::channel();
+        let blocked_open = tokio::spawn(async move {
+            let _ = ready_tx.send(());
+            release_rx.await.unwrap();
+            preacquired.open_stream().await
+        });
+        ready_rx.await.unwrap();
+
+        let (new_carrier, _new_peer) = tokio::io::duplex(1024);
+        let new = registry
+            .register(
+                "journal.test".into(),
+                new_carrier,
+                u64::MAX,
+                admission_deadline(),
+            )
+            .await
+            .unwrap();
+
+        release_tx.send(()).unwrap();
+        assert!(matches!(
+            blocked_open.await.unwrap(),
+            Err(RegistryError::Retired)
+        ));
+        assert!(Arc::ptr_eq(
+            &registry.lookup("journal.test").await.unwrap(),
+            &new
+        ));
+        let stream = new.open_stream().await.unwrap();
+        drop(stream);
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), old.wait_until_gone())
+                .await
+                .unwrap(),
+            ConnectionState::Gone
+        );
+        assert_peer_stops(&mut old_peer).await;
+    }
+
+    #[tokio::test]
+    async fn acceptance_criterion_8_rechecks_a_preacquired_handle_after_stalled_open() {
+        let registry = Registry::default();
+        let (old_carrier, mut old_peer) = tokio::io::duplex(16);
+        let old = registry
+            .register(
+                "journal.test".into(),
+                old_carrier,
+                u64::MAX,
+                admission_deadline(),
+            )
+            .await
+            .unwrap();
+        let preacquired = registry.lookup("journal.test").await.unwrap();
+        let first = preacquired.open_stream().await.unwrap();
+        let second = preacquired.open_stream().await.unwrap();
+        let late_open = preacquired.open_stream();
+        tokio::pin!(late_open);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), &mut late_open)
+                .await
+                .is_err()
+        );
+
+        let (new_carrier, _new_peer) = tokio::io::duplex(1024);
+        let new = registry
+            .register(
+                "journal.test".into(),
+                new_carrier,
+                u64::MAX,
+                admission_deadline(),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            late_open.await,
+            Err(RegistryError::Retired | RegistryError::Dialer(DialerError::ConnectionClosed))
+        ));
+        assert!(new.open_stream().await.is_ok());
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), old.wait_until_gone())
+                .await
+                .unwrap(),
+            ConnectionState::Gone
+        );
+        let mut bytes = Vec::new();
+        tokio::time::timeout(Duration::from_secs(1), old_peer.read_to_end(&mut bytes))
+            .await
+            .unwrap()
+            .unwrap();
+        let mut decoder = FrameDecoder::new();
+        decoder.feed(&bytes);
+        while let Some(frame) = decoder.next_frame().unwrap() {
+            assert_eq!(frame.flags & FLAG_DATA, 0);
+        }
+        drop(first);
+        drop(second);
+    }
+
+    #[tokio::test]
+    async fn acceptance_criterion_9_timeout_drop_cleans_an_unpublished_candidate() {
+        let registry = Registry::default();
+        let entries = registry.inner.entries.write().await;
+        let pending_registry = registry.clone();
+        let (carrier, mut peer) = tokio::io::duplex(1024);
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(20),
+                pending_registry.register(
+                    "cancelled.test".into(),
+                    carrier,
+                    u64::MAX,
+                    admission_deadline(),
+                ),
+            )
+            .await
+            .is_err()
+        );
+        drop(entries);
+
+        assert!(registry.lookup("cancelled.test").await.is_none());
+        assert_peer_stops(&mut peer).await;
+        let (carrier, _peer) = tokio::io::duplex(1024);
+        assert!(
+            registry
+                .register(
+                    "cancelled.test".into(),
+                    carrier,
+                    u64::MAX,
+                    admission_deadline(),
+                )
+                .await
+                .is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn acceptance_criterion_10_abort_cleans_an_unpublished_candidate() {
+        let registry = Registry::default();
+        let entries = registry.inner.entries.write().await;
+        let pending_registry = registry.clone();
+        let (carrier, mut peer) = tokio::io::duplex(1024);
+        let pending = tokio::spawn(async move {
+            pending_registry
+                .register(
+                    "aborted.test".into(),
+                    carrier,
+                    u64::MAX,
+                    admission_deadline(),
+                )
+                .await
+        });
+        tokio::task::yield_now().await;
+        pending.abort();
+        assert!(pending.await.is_err());
+        assert_peer_stops(&mut peer).await;
+        drop(entries);
+
+        assert!(registry.lookup("aborted.test").await.is_none());
+        let (carrier, _peer) = tokio::io::duplex(1024);
+        assert!(
+            registry
+                .register(
+                    "aborted.test".into(),
+                    carrier,
+                    u64::MAX,
+                    admission_deadline(),
+                )
+                .await
+                .is_ok()
+        );
     }
 }

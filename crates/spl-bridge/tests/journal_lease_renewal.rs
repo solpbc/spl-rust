@@ -29,7 +29,7 @@ const HOSTNAME: &str = "aaaqeaye.solstone.me";
 const INSTANCE_ID: &str = "8488ae64-b592-80a3-97c6-490e995daa85";
 
 #[tokio::test]
-async fn acceptance_criterion_1_stream_one_reservation_precedes_public_stream_three() {
+async fn acceptance_criterion_renewal_1_stream_one_reservation_precedes_public_stream_three() {
     let issuer = SigningKey::from_bytes(&[7; 32]);
     let pop = SigningKey::from_bytes(&[19; 32]);
     let verifier = FixtureTokenVerifier::new(
@@ -90,7 +90,7 @@ async fn acceptance_criterion_1_stream_one_reservation_precedes_public_stream_th
 }
 
 #[tokio::test]
-async fn acceptance_criterion_2_successor_e2_keeps_route_past_e1_then_retires_it() {
+async fn acceptance_criterion_renewal_2_successor_e2_keeps_route_past_e1_then_retires_it() {
     let _subscriber = tracing::subscriber::set_default(
         tracing_subscriber::fmt()
             .with_test_writer()

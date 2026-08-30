@@ -7,6 +7,8 @@ use std::collections::{HashMap, VecDeque};
 use std::future::Future;
 use std::io;
 use std::pin::Pin;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::task::{Context, Poll};
 
 use spl_core::frame::{
@@ -17,6 +19,8 @@ use spl_core::frame::{
 use spl_core::mux::{INITIAL_WINDOW, MuxError, RecvWindow};
 use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
+#[cfg(test)]
+use tokio::sync::Notify;
 use tokio::sync::{mpsc, oneshot, watch};
 
 const MAX_SEND_CREDIT: usize = i32::MAX as usize;
@@ -29,6 +33,7 @@ const MAX_SEND_CREDIT: usize = i32::MAX as usize;
 pub struct FrameDialer {
     commands: mpsc::UnboundedSender<Command>,
     connection: watch::Receiver<ConnectionState>,
+    retired: Arc<AtomicBool>,
 }
 
 /// Whether the underlying carrier is still usable.
@@ -60,6 +65,9 @@ pub enum DialerError {
     /// The carrier coordinator is no longer running.
     #[error("dialer connection is closed")]
     ConnectionClosed,
+    /// The dialer connection was retired before this open could queue its frame.
+    #[error("dialer connection was retired")]
+    Retired,
     /// The requested logical stream is no longer live.
     #[error("dialer stream is closed")]
     StreamClosed,
@@ -103,9 +111,64 @@ type PendingWrite = Pin<Box<dyn Future<Output = Result<usize, DialerError>> + Se
 type PendingFlush = Pin<Box<dyn Future<Output = Result<(), DialerError>> + Send>>;
 type PendingShutdown = Pin<Box<dyn Future<Output = Result<(), DialerError>> + Send>>;
 
+struct ConnectionControl {
+    state: watch::Sender<ConnectionState>,
+    stop: watch::Sender<bool>,
+    retired: Arc<AtomicBool>,
+}
+
+#[cfg(test)]
+#[derive(Clone)]
+pub(crate) struct OpenPause {
+    reached: Arc<Notify>,
+    release: Arc<Notify>,
+}
+
+#[cfg(test)]
+impl OpenPause {
+    pub(crate) fn new() -> Self {
+        Self {
+            reached: Arc::new(Notify::new()),
+            release: Arc::new(Notify::new()),
+        }
+    }
+
+    pub(crate) async fn wait_until_open_is_paused(&self) {
+        self.reached.notified().await;
+    }
+
+    pub(crate) fn release(&self) {
+        self.release.notify_one();
+    }
+
+    async fn wait(&self) {
+        self.reached.notify_one();
+        self.release.notified().await;
+    }
+}
+
 impl FrameDialer {
     /// Spawn a dialer connection over `carrier`.
     pub fn new<T>(carrier: T) -> Self
+    where
+        T: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    {
+        Self::new_inner(
+            carrier,
+            #[cfg(test)]
+            None,
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_with_open_pause<T>(carrier: T, pause: OpenPause) -> Self
+    where
+        T: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    {
+        Self::new_inner(carrier, Some(pause))
+    }
+
+    fn new_inner<T>(carrier: T, #[cfg(test)] open_pause: Option<OpenPause>) -> Self
     where
         T: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
@@ -116,16 +179,30 @@ impl FrameDialer {
         let (open_tx, open_rx) = mpsc::unbounded_channel();
         let (state_tx, state_rx) = watch::channel(ConnectionState::Live);
         let (stop_tx, stop_rx) = watch::channel(false);
+        let retired = Arc::new(AtomicBool::new(false));
 
         tokio::spawn(read_carrier(reader, reader_tx, stop_rx));
         tokio::spawn(write_carrier(writer, writer_rx, state_tx.clone()));
+        let control = ConnectionControl {
+            state: state_tx,
+            stop: stop_tx,
+            retired: Arc::clone(&retired),
+        };
         tokio::spawn(run_connection(
-            command_rx, open_rx, open_tx, reader_rx, writer_tx, state_tx, stop_tx,
+            command_rx,
+            open_rx,
+            open_tx,
+            reader_rx,
+            writer_tx,
+            control,
+            #[cfg(test)]
+            open_pause,
         ));
 
         Self {
             commands,
             connection: state_rx,
+            retired,
         }
     }
 
@@ -194,6 +271,16 @@ impl FrameDialer {
     /// Used by registry cancellation-safety cleanup, which cannot `.await` inside `Drop`.
     pub(crate) fn signal_shutdown(&self) {
         let _ = self.commands.send(Command::Shutdown);
+    }
+
+    /// Mark this connection retired so a subsequent open is rejected before it queues a frame.
+    pub(crate) fn retire(&self) {
+        self.retired.store(true, Ordering::Release);
+    }
+
+    /// Return whether this connection has been retired.
+    pub(crate) fn is_retired(&self) -> bool {
+        self.retired.load(Ordering::Acquire)
     }
 }
 
@@ -577,15 +664,17 @@ struct Driver {
     decoder: FrameDecoder,
     streams: HashMap<u32, StreamState>,
     writer: mpsc::UnboundedSender<WriterCommand>,
+    retired: Arc<AtomicBool>,
 }
 
 impl Driver {
-    fn new(writer: mpsc::UnboundedSender<WriterCommand>) -> Self {
+    fn new(writer: mpsc::UnboundedSender<WriterCommand>, retired: Arc<AtomicBool>) -> Self {
         Self {
             ids: CoreFrameDialer::default(),
             decoder: FrameDecoder::new(),
             streams: HashMap::new(),
             writer,
+            retired,
         }
     }
 
@@ -597,6 +686,9 @@ impl Driver {
     }
 
     fn open(&mut self) -> Result<OpenedStream, DialerError> {
+        if self.retired.load(Ordering::Acquire) {
+            return Err(DialerError::Retired);
+        }
         let stream_id = self.ids.allocate();
         if stream_id == 0 || self.streams.contains_key(&stream_id) {
             return Err(DialerError::StreamIdExhausted);
@@ -870,16 +962,20 @@ async fn run_connection(
     open_tx: mpsc::UnboundedSender<OpenFlush>,
     mut reader_events: mpsc::UnboundedReceiver<ReaderEvent>,
     writer: mpsc::UnboundedSender<WriterCommand>,
-    state: watch::Sender<ConnectionState>,
-    stop: watch::Sender<bool>,
+    control: ConnectionControl,
+    #[cfg(test)] open_pause: Option<OpenPause>,
 ) {
-    let mut driver = Driver::new(writer.clone());
-    let mut connection = state.subscribe();
+    let mut driver = Driver::new(writer.clone(), Arc::clone(&control.retired));
+    let mut connection = control.state.subscribe();
     let mut running = true;
     while running {
         tokio::select! {
             command = commands.recv() => match command {
                 Some(Command::Open { reply }) => {
+                    #[cfg(test)]
+                    if let Some(open_pause) = &open_pause {
+                        open_pause.wait().await;
+                    }
                     match driver.open() {
                         Ok(opened) => {
                             let (flush_tx, flush_rx) = oneshot::channel();
@@ -887,7 +983,7 @@ async fn run_connection(
                                 running = false;
                                 let _ = reply.send(Err(DialerError::ConnectionClosed));
                             } else {
-                                let mut connection = state.subscribe();
+                                let mut connection = control.state.subscribe();
                                 let open_tx = open_tx.clone();
                                 tokio::spawn(async move {
                                     let flushed = tokio::select! {
@@ -962,9 +1058,9 @@ async fn run_connection(
             },
         }
     }
-    stop.send_replace(true);
+    control.stop.send_replace(true);
     driver.finish();
-    state.send_replace(ConnectionState::Gone);
+    control.state.send_replace(ConnectionState::Gone);
 }
 
 #[cfg(test)]
@@ -1025,6 +1121,27 @@ mod tests {
 
         drop(first);
         drop(second);
+    }
+
+    #[tokio::test]
+    async fn acceptance_criterion_8_retired_open_emits_zero_bytes() {
+        let (carrier, mut peer) = tokio::io::duplex(1024);
+        let pause = OpenPause::new();
+        let dialer = FrameDialer::new_with_open_pause(carrier, pause.clone());
+        let opening_dialer = dialer.clone();
+        let opening = tokio::spawn(async move { opening_dialer.open_stream().await });
+
+        pause.wait_until_open_is_paused().await;
+        dialer.retire();
+        pause.release();
+
+        assert!(matches!(opening.await.unwrap(), Err(DialerError::Retired)));
+        let mut byte = [0u8; 1];
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), peer.read(&mut byte))
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test]

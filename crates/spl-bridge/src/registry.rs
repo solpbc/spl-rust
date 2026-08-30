@@ -5,7 +5,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use thiserror::Error;
@@ -33,7 +33,6 @@ struct RegistryInner {
 pub struct RegisteredJournal {
     dialer: FrameDialer,
     generation: u64,
-    retired: AtomicBool,
 }
 
 /// Cleans up a candidate that was never made observable through the registry.
@@ -108,7 +107,6 @@ impl Registry {
         let registered = Arc::new(RegisteredJournal {
             dialer: FrameDialer::new(carrier),
             generation,
-            retired: AtomicBool::new(false),
         });
         let mut candidate = CandidateGuard::new(Arc::clone(&registered));
 
@@ -122,7 +120,7 @@ impl Registry {
             }
             let displaced = entries.get(&hostname).cloned();
             if let Some(displaced) = &displaced {
-                displaced.retired.store(true, Ordering::Release);
+                displaced.dialer.retire();
             }
             entries.insert(hostname.clone(), Arc::clone(&registered));
             displaced
@@ -191,7 +189,7 @@ impl RegisteredJournal {
     /// Returns an error when this registration was retired, the journal fails
     /// to open a stream, or its OPEN frame does not flush within three seconds.
     pub async fn open_stream(&self) -> Result<DialerStream, RegistryError> {
-        if self.retired.load(Ordering::Acquire) {
+        if self.dialer.is_retired() {
             return Err(RegistryError::Retired);
         }
         let stream = tokio::time::timeout(OPEN_STREAM_TIMEOUT, self.dialer.open_stream())
@@ -199,7 +197,7 @@ impl RegisteredJournal {
             .map_err(|_| RegistryError::OpenTimedOut)?
             .map_err(RegistryError::from)?;
         // Never hand out a stream opened by a registration retired mid-flight.
-        if self.retired.load(Ordering::Acquire) {
+        if self.dialer.is_retired() {
             drop(stream);
             return Err(RegistryError::Retired);
         }

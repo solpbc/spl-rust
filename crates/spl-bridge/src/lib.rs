@@ -131,6 +131,9 @@ pub(crate) enum BridgeLogEvent {
     JournalRegistrationAdmissionTimedOut,
     JournalLeaseRenewalRetryableAttemptFailed,
     JournalLeaseRenewalTerminalPoisoned,
+    JournalLeaseRenewalChallengeUndeliverable,
+    JournalLeaseRenewalChallengeWritten,
+    JournalLeaseRenewalResponseTimedOut,
     JournalLeaseRenewalNonceOutstandingCapacity,
     JournalLeaseRenewalNonceSpentCapacity,
     JournalLeaseRenewed,
@@ -192,6 +195,15 @@ impl BridgeLogEvent {
             }
             Self::JournalLeaseRenewalTerminalPoisoned => {
                 tracing::warn!("journal lease renewal stream poisoned");
+            }
+            Self::JournalLeaseRenewalChallengeUndeliverable => {
+                tracing::warn!("journal lease renewal failed: the challenge could not be written");
+            }
+            Self::JournalLeaseRenewalChallengeWritten => {
+                tracing::info!("journal lease renewal: challenge written to the control stream");
+            }
+            Self::JournalLeaseRenewalResponseTimedOut => {
+                tracing::warn!("journal lease renewal failed: no response before the attempt cap");
             }
             Self::JournalLeaseRenewalNonceOutstandingCapacity => {
                 tracing::warn!("journal lease renewal rejected: nonce outstanding capacity");
@@ -914,6 +926,9 @@ mod tests {
         }
 
         for event in [
+            BridgeLogEvent::JournalLeaseRenewalChallengeUndeliverable,
+            BridgeLogEvent::JournalLeaseRenewalChallengeWritten,
+            BridgeLogEvent::JournalLeaseRenewalResponseTimedOut,
             BridgeLogEvent::ClientRejectedJournalUnresponsive,
             BridgeLogEvent::JournalRetiredUnresponsive,
             BridgeLogEvent::JournalLeaseRenewalRetryableAttemptFailed,
@@ -938,6 +953,9 @@ mod tests {
 
         tracing::subscriber::with_default(subscriber, || {
             for event in [
+                BridgeLogEvent::JournalLeaseRenewalChallengeUndeliverable,
+                BridgeLogEvent::JournalLeaseRenewalChallengeWritten,
+                BridgeLogEvent::JournalLeaseRenewalResponseTimedOut,
                 BridgeLogEvent::ClientRejectedJournalUnresponsive,
                 BridgeLogEvent::JournalRetiredUnresponsive,
                 BridgeLogEvent::JournalLeaseRenewalRetryableAttemptFailed,

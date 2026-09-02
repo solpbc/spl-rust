@@ -230,6 +230,8 @@ pub(crate) struct RenewalResponse {
 pub(crate) enum RenewalError {
     /// The complete response was received but could not be accepted.
     Retryable(PopError),
+    /// The challenge could not be written to the journal's control stream.
+    ChallengeUndeliverable,
     /// Carrier byte synchronization was lost before a complete response arrived.
     Terminal,
 }
@@ -493,7 +495,10 @@ impl PopAuthenticator {
         };
         write_message(carrier, &challenge)
             .await
-            .map_err(|_| RenewalError::Terminal)?;
+            .map_err(|_| RenewalError::ChallengeUndeliverable)?;
+        // ⚠ The attempt cap races `renew()` as a whole, so a timeout cannot say
+        // whether the challenge was ever delivered. This marks the boundary.
+        crate::BridgeLogEvent::JournalLeaseRenewalChallengeWritten.emit();
 
         let body = read_renewal_body(carrier)
             .await

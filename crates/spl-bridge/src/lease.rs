@@ -199,10 +199,10 @@ async fn run_supervisor_with_clock(
                         BridgeLogEvent::JournalLeaseRenewed.emit();
                     }
                     AttemptResult::Retryable(error) => emit_retryable(&error),
-                    AttemptResult::Terminal => {
+                    terminal => {
                         control_stream.take();
                         poisoned = true;
-                        BridgeLogEvent::JournalLeaseRenewalTerminalPoisoned.emit();
+                        terminal_poison_event(&terminal).emit();
                     }
                 }
             }
@@ -213,6 +213,11 @@ async fn run_supervisor_with_clock(
 enum AttemptResult {
     Renewed(u64),
     Retryable(PopError),
+    /// The challenge never reached the journal's control stream.
+    ChallengeUndeliverable,
+    /// The journal produced no complete response before the attempt cap.
+    ResponseTimedOut,
+    /// The response stream lost byte synchronization.
     Terminal,
 }
 
@@ -239,6 +244,9 @@ async fn run_attempt(stream: &mut DialerStream, context: AttemptContext<'_>) -> 
             result = &mut attempt => match result {
                 Ok(successor_expiry) => return AttemptResult::Renewed(successor_expiry),
                 Err(RenewalError::Retryable(error)) => return AttemptResult::Retryable(error),
+                Err(RenewalError::ChallengeUndeliverable) => {
+                    return AttemptResult::ChallengeUndeliverable;
+                }
                 Err(RenewalError::Terminal) => return AttemptResult::Terminal,
             },
             () = tokio::time::sleep_until(*context.next_reconciliation) => {
@@ -251,7 +259,7 @@ async fn run_attempt(stream: &mut DialerStream, context: AttemptContext<'_>) -> 
                     return AttemptResult::Terminal;
                 }
             }
-            () = wait_until(effective_deadline) => return AttemptResult::Terminal,
+            () = wait_until(effective_deadline) => return AttemptResult::ResponseTimedOut,
         }
     }
 }
@@ -260,6 +268,23 @@ async fn retire_for_expiry(journal: &RegisteredJournal) {
     journal.retire();
     BridgeLogEvent::JournalLeaseExpiredWallClock.emit();
     journal.shutdown_bounded().await;
+}
+
+/// Name which terminal cause poisoned the lease.
+///
+/// ⚠ `ResponseTimedOut` is the attempt cap, which races the whole exchange, so
+/// it means "no complete response in time" and not "the challenge was
+/// delivered" — the challenge-written marker is what separates those two.
+fn terminal_poison_event(result: &AttemptResult) -> BridgeLogEvent {
+    match result {
+        AttemptResult::ChallengeUndeliverable => {
+            BridgeLogEvent::JournalLeaseRenewalChallengeUndeliverable
+        }
+        AttemptResult::ResponseTimedOut => BridgeLogEvent::JournalLeaseRenewalResponseTimedOut,
+        AttemptResult::Renewed(_) | AttemptResult::Retryable(_) | AttemptResult::Terminal => {
+            BridgeLogEvent::JournalLeaseRenewalTerminalPoisoned
+        }
+    }
 }
 
 fn emit_retryable(error: &PopError) {

@@ -27,8 +27,25 @@ struct Options {
     jwks_read_timeout: Duration,
 }
 
+/// Publish the bridge's fixed operational vocabulary to stderr.
+///
+/// Every event this crate emits is a fixed string literal with no fields,
+/// enforced mechanically by the source-policy scanner, so an operator gets
+/// routing and admission outcomes without any journal, client, or payload
+/// identifier. The level is compiled in rather than read from the
+/// environment: the bridge takes no state input from its process
+/// environment.
+fn install_operational_logging() {
+    let subscriber = tracing_subscriber::fmt()
+        .with_ansi(false)
+        .with_max_level(tracing::Level::INFO)
+        .finish();
+    let _ = tracing::subscriber::set_global_default(subscriber);
+}
+
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> ExitCode {
+    install_operational_logging();
     if let Ok(()) = run().await {
         ExitCode::SUCCESS
     } else {

@@ -12,6 +12,7 @@ use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::RwLock;
 
+use crate::BridgeLogEvent;
 use crate::frame_dialer::{ConnectionState, DialerError, DialerStream, FrameDialer};
 use crate::pop_auth::{PopAuthenticator, RenewalIdentity};
 
@@ -159,9 +160,41 @@ impl Registry {
         Ok(registered)
     }
 
+    /// Publish an already-constructed registration without an admission round.
+    ///
+    /// Test-only: the routing paths need a live entry whose peer behaviour the
+    /// test controls, which a real `PoP` admission cannot express.
+    #[cfg(test)]
+    pub(crate) async fn insert_for_test(&self, hostname: String, journal: Arc<RegisteredJournal>) {
+        self.inner.entries.write().await.insert(hostname, journal);
+    }
+
     /// Return the currently registered journal for `hostname`, if one is live.
     pub async fn lookup(&self, hostname: &str) -> Option<Arc<RegisteredJournal>> {
         self.inner.entries.read().await.get(hostname).cloned()
+    }
+
+    /// Retire a registration whose journal never answered a routed client.
+    ///
+    /// A journal host that slept or lost its network keeps its carrier socket
+    /// open, so carrier EOF never arrives and this entry would keep routing —
+    /// and hanging — every client until its lease expired. Retiring it is
+    /// ordinary in-memory runtime state: nothing is written anywhere, and the
+    /// journal's own forwarder re-registers when it comes back.
+    ///
+    /// A newer generation for the same hostname is left untouched.
+    pub(crate) async fn retire_unresponsive(
+        &self,
+        hostname: &str,
+        journal: &Arc<RegisteredJournal>,
+    ) {
+        journal.retire();
+        BridgeLogEvent::JournalRetiredUnresponsive.emit();
+        self.remove_if_current(hostname, journal.generation).await;
+        let journal = Arc::clone(journal);
+        tokio::spawn(async move {
+            journal.shutdown_bounded().await;
+        });
     }
 
     async fn remove_if_current(&self, hostname: &str, generation: u64) {

@@ -29,6 +29,7 @@ mod lease;
 pub mod pop_auth;
 pub mod proxy_protocol;
 pub mod registry;
+mod routed;
 pub mod sni;
 
 /// Errors returned while configuring or operating the public bridge listeners.
@@ -100,6 +101,18 @@ const MAX_SNI_ADMISSION_SLOTS: usize = 256;
 const CONTROL_SPLICE_CONNECT_DEADLINE: Duration = Duration::from_secs(3);
 const RESERVED_CONTROL_SNI: &str = "bridge.solstone.me";
 
+/// Absolute time a routed client waits for its journal's first response byte.
+///
+/// A registered journal whose host slept or lost its network leaves the
+/// carrier socket open, so `open_stream` succeeds against a locally buffered
+/// OPEN frame and the splice then waits forever. This bounds that wait: a
+/// journal that has not produced one byte by the deadline loses the client
+/// connection and its registration, which is ordinary in-memory runtime state.
+/// It is deliberately far above any healthy handshake (measured 0.25s
+/// end to end against the live endpoint, 2026-09-02) so a busy journal is
+/// never mistaken for an absent one.
+pub const ROUTED_FIRST_RESPONSE_DEADLINE: Duration = Duration::from_secs(10);
+
 #[derive(Clone, Copy)]
 pub(crate) enum BridgeLogEvent {
     ControlListenerStarted,
@@ -129,6 +142,8 @@ pub(crate) enum BridgeLogEvent {
     ClientRejectedJournalStreamOpen,
     ClientRejectedProxyHeaderBuild,
     ClientRejectedProxyHeaderWrite,
+    ClientRejectedJournalUnresponsive,
+    JournalRetiredUnresponsive,
     ClientRoutedToJournal,
     ClientSpliceClosed,
     ClientSpliceClosedWithIoError,
@@ -202,6 +217,12 @@ impl BridgeLogEvent {
             }
             Self::ClientRejectedProxyHeaderWrite => {
                 tracing::warn!("client rejected because PROXY header could not be written");
+            }
+            Self::ClientRejectedJournalUnresponsive => {
+                tracing::warn!("client rejected because the journal never answered");
+            }
+            Self::JournalRetiredUnresponsive => {
+                tracing::info!("journal retired: unresponsive to a routed client");
             }
             Self::ClientRoutedToJournal => tracing::info!("client routed to journal"),
             Self::ClientSpliceClosed => tracing::info!("client splice closed"),
@@ -447,7 +468,7 @@ async fn handle_client<C>(
         BridgeLogEvent::ClientRejectedWithoutJournalRegistration.emit();
         return;
     };
-    let Ok(mut stream) = journal.open_stream().await else {
+    let Ok(stream) = journal.open_stream().await else {
         BridgeLogEvent::ClientRejectedJournalStreamOpen.emit();
         return;
     };
@@ -461,16 +482,65 @@ async fn handle_client<C>(
         BridgeLogEvent::ClientRejectedProxyHeaderBuild.emit();
         return;
     };
+    let flag = routed::FirstByteFlag::default();
+    let mut stream = routed::FirstByteWitness::new(stream, flag.clone());
     if stream.write_all(&header).await.is_err() || stream.flush().await.is_err() {
         BridgeLogEvent::ClientRejectedProxyHeaderWrite.emit();
         return;
     }
 
     BridgeLogEvent::ClientRoutedToJournal.emit();
-    match tokio::io::copy_bidirectional(&mut client, &mut stream).await {
-        Ok(_) => BridgeLogEvent::ClientSpliceClosed.emit(),
-        Err(_) => {
-            BridgeLogEvent::ClientSpliceClosedWithIoError.emit();
+    splice_until_journal_answers_or_deadline(
+        &mut client,
+        &mut stream,
+        &flag,
+        &registry,
+        &hostname,
+        &journal,
+    )
+    .await;
+}
+
+/// Splice a routed client, closing it if the journal never answers.
+///
+/// The deadline is armed only until the journal's first byte, so an ordinary
+/// long-running tool call is unaffected once its TLS handshake has begun.
+async fn splice_until_journal_answers_or_deadline<S>(
+    client: &mut TcpStream,
+    stream: &mut S,
+    flag: &routed::FirstByteFlag,
+    registry: &registry::Registry,
+    hostname: &str,
+    journal: &Arc<registry::RegisteredJournal>,
+) where
+    S: tokio::io::AsyncRead + AsyncWriteExt + Unpin,
+{
+    let splice = tokio::io::copy_bidirectional(client, stream);
+    tokio::pin!(splice);
+    let mut armed = true;
+    loop {
+        if !armed {
+            match (&mut splice).await {
+                Ok(_) => BridgeLogEvent::ClientSpliceClosed.emit(),
+                Err(_) => BridgeLogEvent::ClientSpliceClosedWithIoError.emit(),
+            }
+            return;
+        }
+        match tokio::time::timeout(ROUTED_FIRST_RESPONSE_DEADLINE, &mut splice).await {
+            Ok(Ok(_)) => {
+                BridgeLogEvent::ClientSpliceClosed.emit();
+                return;
+            }
+            Ok(Err(_)) => {
+                BridgeLogEvent::ClientSpliceClosedWithIoError.emit();
+                return;
+            }
+            Err(_) if flag.observed() => armed = false,
+            Err(_) => {
+                BridgeLogEvent::ClientRejectedJournalUnresponsive.emit();
+                registry.retire_unresponsive(hostname, journal).await;
+                return;
+            }
         }
     }
 }
@@ -489,6 +559,7 @@ mod tests {
     use crate::frame_dialer::DialerError;
     use crate::pop_auth::PopError;
     use crate::registry::RegistryError;
+    use spl_core::frame::{FLAG_DATA, FLAG_OPEN, Frame, FrameDecoder};
     use tokio::io::AsyncReadExt;
     use tokio::sync::Notify;
 
@@ -530,7 +601,11 @@ mod tests {
     }
 
     fn reserved_client_hello() -> Vec<u8> {
-        let hostname = RESERVED_CONTROL_SNI.as_bytes();
+        client_hello_for(RESERVED_CONTROL_SNI)
+    }
+
+    fn client_hello_for(server_name: &str) -> Vec<u8> {
+        let hostname = server_name.as_bytes();
         let mut names = vec![0];
         names.extend_from_slice(&(u16::try_from(hostname.len()).unwrap_or(0)).to_be_bytes());
         names.extend_from_slice(hostname);
@@ -653,6 +728,120 @@ mod tests {
         Ok(())
     }
 
+    const UNRESPONSIVE_TEST_HOSTNAME: &str = "abcdefgh.solstone.me";
+
+    async fn registry_with_silent_journal() -> Result<
+        (
+            registry::Registry,
+            Arc<registry::RegisteredJournal>,
+            tokio::io::DuplexStream,
+            frame_dialer::DialerStream,
+        ),
+        io::Error,
+    > {
+        let (carrier, peer) = tokio::io::duplex(64 * 1024);
+        let signing = ed25519_dalek::SigningKey::from_bytes(&[23; 32]);
+        let identity = pop_auth::RenewalIdentity::new(
+            UNRESPONSIVE_TEST_HOSTNAME.to_owned(),
+            String::from("instance-unresponsive"),
+            signing.verifying_key(),
+        );
+        let (journal, control) =
+            registry::RegisteredJournal::new_for_lease_test(carrier, identity, u64::MAX)
+                .await
+                .map_err(io::Error::other)?;
+        let registry = registry::Registry::default();
+        registry
+            .insert_for_test(UNRESPONSIVE_TEST_HOSTNAME.to_owned(), Arc::clone(&journal))
+            .await;
+        Ok((registry, journal, peer, control))
+    }
+
+    fn unresponsive_client_task(
+        server: TcpStream,
+        registry: registry::Registry,
+    ) -> tokio::task::JoinHandle<()> {
+        tokio::spawn(handle_client(
+            server,
+            SocketAddr::from(([127, 0, 0, 1], 0)),
+            registry,
+            SocketAddr::from(([127, 0, 0, 1], 0)),
+            Duration::from_secs(1),
+            Arc::new(Semaphore::new(MAX_SNI_ADMISSION_SLOTS)),
+            NeverReadyControlConnector(Arc::new(Notify::new())),
+        ))
+    }
+
+    /// A registered journal whose host slept keeps its carrier socket open, so
+    /// carrier EOF never arrives. The routed client must still be closed, and
+    /// the stale registration must stop answering later clients.
+    #[tokio::test(start_paused = true)]
+    async fn a_silent_registered_journal_loses_the_client_and_its_registration()
+    -> Result<(), io::Error> {
+        let (registry, journal, _peer, _control) = registry_with_silent_journal().await?;
+        let (mut client, server) = tcp_pair().await?;
+        client
+            .write_all(&client_hello_for(UNRESPONSIVE_TEST_HOSTNAME))
+            .await?;
+        let task = unresponsive_client_task(server, registry.clone());
+        tokio::time::advance(ROUTED_FIRST_RESPONSE_DEADLINE + Duration::from_secs(1)).await;
+        task.await.map_err(io::Error::other)?;
+
+        let mut byte = [0_u8; 1];
+        assert!(matches!(client.read(&mut byte).await, Ok(0) | Err(_)));
+        assert!(registry.lookup(UNRESPONSIVE_TEST_HOSTNAME).await.is_none());
+        assert!(matches!(
+            journal.open_stream().await,
+            Err(registry::RegistryError::Retired)
+        ));
+        Ok(())
+    }
+
+    /// One answered byte disarms the deadline, so an ordinary long-running
+    /// tool call is never cut short once its handshake has begun.
+    #[tokio::test(start_paused = true)]
+    async fn an_answering_journal_keeps_a_client_past_the_deadline() -> Result<(), io::Error> {
+        let (registry, _journal, mut peer, _control) = registry_with_silent_journal().await?;
+        let (mut client, server) = tcp_pair().await?;
+        client
+            .write_all(&client_hello_for(UNRESPONSIVE_TEST_HOSTNAME))
+            .await?;
+        let task = unresponsive_client_task(server, registry.clone());
+
+        let mut carrier = Vec::new();
+        let stream_id = loop {
+            let mut chunk = [0_u8; 4096];
+            let read = peer.read(&mut chunk).await?;
+            carrier.extend_from_slice(&chunk[..read]);
+            let mut decoder = FrameDecoder::new();
+            decoder.feed(&carrier);
+            let mut opened = None;
+            while let Ok(Some(frame)) = decoder.next_frame() {
+                if frame.flags & FLAG_OPEN != 0 {
+                    opened = Some(frame.stream_id);
+                }
+            }
+            if let Some(stream_id) = opened {
+                break stream_id;
+            }
+        };
+        let answer = Frame {
+            stream_id,
+            flags: FLAG_DATA,
+            payload: vec![0x16],
+        };
+        peer.write_all(&answer.encode().map_err(io::Error::other)?)
+            .await?;
+        peer.flush().await?;
+        tokio::time::advance(ROUTED_FIRST_RESPONSE_DEADLINE * 4).await;
+        tokio::task::yield_now().await;
+
+        assert!(!task.is_finished());
+        assert!(registry.lookup(UNRESPONSIVE_TEST_HOSTNAME).await.is_some());
+        task.abort();
+        Ok(())
+    }
+
     #[test]
     fn acceptance_criterion_12_admission_events_are_fixed_and_exhaustive() {
         for error in [
@@ -725,6 +914,8 @@ mod tests {
         }
 
         for event in [
+            BridgeLogEvent::ClientRejectedJournalUnresponsive,
+            BridgeLogEvent::JournalRetiredUnresponsive,
             BridgeLogEvent::JournalLeaseRenewalRetryableAttemptFailed,
             BridgeLogEvent::JournalLeaseRenewalTerminalPoisoned,
             BridgeLogEvent::JournalLeaseRenewalNonceOutstandingCapacity,
@@ -747,6 +938,8 @@ mod tests {
 
         tracing::subscriber::with_default(subscriber, || {
             for event in [
+                BridgeLogEvent::ClientRejectedJournalUnresponsive,
+                BridgeLogEvent::JournalRetiredUnresponsive,
                 BridgeLogEvent::JournalLeaseRenewalRetryableAttemptFailed,
                 BridgeLogEvent::JournalLeaseRenewalTerminalPoisoned,
                 BridgeLogEvent::JournalLeaseRenewalNonceOutstandingCapacity,

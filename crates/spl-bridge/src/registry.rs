@@ -271,7 +271,15 @@ impl RegisteredJournal {
         dialer.wait_until_gone().await
     }
 
-    /// Open a logical client stream, rejecting a stalled journal after 3 seconds.
+    /// Open a logical client stream, rejecting a stalled local dialer after 3
+    /// seconds.
+    ///
+    /// ⚠ The three-second bound covers only this side of the carrier. The
+    /// dialer completes an open once its coordinator has *queued* the OPEN
+    /// frame, so a journal whose host has slept or lost its network — carrier
+    /// socket still open, no FIN — opens a stream here successfully. Bounding
+    /// that case is the caller's job, and
+    /// `ROUTED_FIRST_RESPONSE_DEADLINE` in the router is where it happens.
     ///
     /// A caller receiving [`RegistryError::OpenTimedOut`] must close the waiting
     /// client connection instead of leaving it open indefinitely.
@@ -279,7 +287,8 @@ impl RegisteredJournal {
     /// # Errors
     ///
     /// Returns an error when this registration was retired, the journal fails
-    /// to open a stream, or its OPEN frame does not flush within three seconds.
+    /// to open a stream, or the local dialer does not accept the open within
+    /// three seconds.
     pub async fn open_stream(&self) -> Result<DialerStream, RegistryError> {
         if self.dialer.is_retired() {
             return Err(RegistryError::Retired);

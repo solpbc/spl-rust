@@ -20,6 +20,7 @@ use rustls::ServerConfig;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use thiserror::Error;
 use tokio::io::AsyncWriteExt;
+use socket2::{SockRef, TcpKeepalive};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Semaphore;
 use tokio_rustls::TlsAcceptor;
@@ -113,6 +114,36 @@ const RESERVED_CONTROL_SNI: &str = "bridge.solstone.me";
 /// never mistaken for an absent one.
 pub const ROUTED_FIRST_RESPONSE_DEADLINE: Duration = Duration::from_secs(10);
 
+/// 🔴 A journal's carrier is idle between lease renewals, and a NAT or load
+/// balancer on the path drops an idle flow mapping **silently** — no RST, no
+/// ICMP. Without a keepalive the bridge then writes a renewal challenge into a
+/// black hole while both ends still report ESTABLISHED, and it learns nothing
+/// until the lease expires. Measured 2026-09-02 on the field-journal
+/// deployment: `backoff:9`, ten retransmissions, 605 seconds with no bytes
+/// received, against a peer process that was alive the whole time.
+///
+/// ⚠ The journal side carries the same keepalive and is the load-bearing one —
+/// only traffic originated from inside a NAT refreshes that NAT's mapping.
+/// This half is what lets the *bridge* notice a dead carrier and retire the
+/// journal, rather than waiting out the lease.
+const CLIENT_KEEPALIVE_IDLE: Duration = Duration::from_secs(30);
+const CLIENT_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(10);
+const CLIENT_KEEPALIVE_RETRIES: u32 = 3;
+
+/// Keep an accepted flow's mapping alive and make a dead peer observable.
+///
+/// Not fatal: a path with no idle timeout works without this, so a refusal
+/// degrades rather than fails closed.
+fn hold_accepted_flow_open(stream: &TcpStream) {
+    let keepalive = TcpKeepalive::new()
+        .with_time(CLIENT_KEEPALIVE_IDLE)
+        .with_interval(CLIENT_KEEPALIVE_INTERVAL)
+        .with_retries(CLIENT_KEEPALIVE_RETRIES);
+    if SockRef::from(stream).set_tcp_keepalive(&keepalive).is_err() {
+        BridgeLogEvent::ClientKeepaliveNotConfigured.emit();
+    }
+}
+
 #[derive(Clone, Copy)]
 pub(crate) enum BridgeLogEvent {
     ControlListenerStarted,
@@ -140,6 +171,7 @@ pub(crate) enum BridgeLogEvent {
     JournalLeaseExpiredWallClock,
     ClientListenerStarted,
     ClientListenerAcceptFailed,
+    ClientKeepaliveNotConfigured,
     ClientRejectedBeforeRouting,
     ClientRejectedWithoutJournalRegistration,
     ClientRejectedJournalStreamOpen,
@@ -217,6 +249,9 @@ impl BridgeLogEvent {
             }
             Self::ClientListenerStarted => tracing::info!("client listener started"),
             Self::ClientListenerAcceptFailed => tracing::warn!("client listener accept failed"),
+            Self::ClientKeepaliveNotConfigured => {
+                tracing::warn!("accepted connection could not be given a keepalive")
+            }
             Self::ClientRejectedBeforeRouting => tracing::warn!("client rejected before routing"),
             Self::ClientRejectedWithoutJournalRegistration => {
                 tracing::warn!("client rejected without journal registration");
@@ -409,6 +444,7 @@ async fn run_client_listener_with_connector<C>(
             BridgeLogEvent::ClientListenerAcceptFailed.emit();
             continue;
         };
+        hold_accepted_flow_open(&stream);
         let registry = registry.clone();
         let sni_admission = Arc::clone(&sni_admission);
         let connector = connector.clone();

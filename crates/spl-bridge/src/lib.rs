@@ -18,9 +18,9 @@ use std::time::Duration;
 
 use rustls::ServerConfig;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+use socket2::{SockRef, TcpKeepalive};
 use thiserror::Error;
 use tokio::io::AsyncWriteExt;
-use socket2::{SockRef, TcpKeepalive};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Semaphore;
 use tokio_rustls::TlsAcceptor;
@@ -250,7 +250,7 @@ impl BridgeLogEvent {
             Self::ClientListenerStarted => tracing::info!("client listener started"),
             Self::ClientListenerAcceptFailed => tracing::warn!("client listener accept failed"),
             Self::ClientKeepaliveNotConfigured => {
-                tracing::warn!("accepted connection could not be given a keepalive")
+                tracing::warn!("accepted connection could not be given a keepalive");
             }
             Self::ClientRejectedBeforeRouting => tracing::warn!("client rejected before routing"),
             Self::ClientRejectedWithoutJournalRegistration => {

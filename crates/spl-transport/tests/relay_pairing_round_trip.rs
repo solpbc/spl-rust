@@ -1010,3 +1010,47 @@ fn legacy_token(instance: &str) -> String {
         base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(payload.to_string())
     )
 }
+
+#[tokio::test]
+async fn refresh_checks_input_shape_but_preserves_expired_input_grace() {
+    let state = Arc::new(MockState::normal().with_same_tls_ca());
+    let origin = spawn_mock_relay(state.clone()).await;
+    let replacement = v2_token("home");
+    *state.control_response.lock().unwrap() = Some(json!({"protocol_version":2,
+        "device_token":replacement,"expires_at":"2100-01-01T00:00:00Z"}));
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    for source in [v2_token("home"), legacy_token("home")] {
+        let mut payload = spl_core::relay_access::unverified_payload(&source).unwrap();
+        payload["iat"] = json!(now - 100);
+        payload["exp"] = json!(now - 1);
+        let expired = format!(
+            "e30.{}.sig",
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(payload.to_string())
+        );
+        assert!(matches!(
+            Box::pin(refresh_device_token(&origin, &expired)).await,
+            RefreshOutcome::Refreshed { .. }
+        ));
+    }
+    assert_eq!(state.refresh_hits.load(Ordering::SeqCst), 2);
+    let mut unknown = spl_core::relay_access::unverified_payload(&replacement).unwrap();
+    unknown["ver"] = json!(3);
+    for payload in [unknown, json!({"instance_id":"home","iat":100,"exp":200})] {
+        let malformed = format!(
+            "e30.{}.sig",
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(payload.to_string())
+        );
+        assert_eq!(
+            Box::pin(refresh_device_token(&origin, &malformed)).await,
+            RefreshOutcome::TransientError
+        );
+    }
+    assert_eq!(
+        state.refresh_hits.load(Ordering::SeqCst),
+        2,
+        "invalid input makes no request"
+    );
+}

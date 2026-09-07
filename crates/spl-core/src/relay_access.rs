@@ -111,6 +111,32 @@ pub fn legacy_claims(token: &str, instance_id: &str, now: i64) -> Option<JwtClai
     Some(claims)
 }
 
+/// Inspect recognized renewal input without requiring unexpired access.
+/// The relay remains responsible for its refresh-grace authorization decision.
+pub fn renewal_identity(token: &str, now: i64) -> Option<(String, bool)> {
+    let payload = unverified_payload(token)?;
+    let instance = payload.get("instance_id")?.as_str()?;
+    let exp = payload.get("exp")?.as_i64()?;
+    if payload.get("iat")?.as_i64()? > now.saturating_add(60) {
+        return None;
+    }
+    // Validate the same shape while permitting expired input. Replacement
+    // validation always uses the actual current time instead.
+    let shape_time = now.min(exp.checked_sub(1)?);
+    let v2 = match payload.get("ver") {
+        Some(version) if version.as_u64() == Some(2) => {
+            instance_claims(token, instance, shape_time)?;
+            true
+        }
+        None => {
+            legacy_claims(token, instance, shape_time)?;
+            false
+        }
+        _ => return None,
+    };
+    Some((instance.to_owned(), v2))
+}
+
 /// Validate negotiated v2 access and matching RFC3339 expiration.
 /// The caller separately validates the relay origin using its transport policy.
 pub fn negotiated_claims(

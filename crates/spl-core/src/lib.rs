@@ -54,6 +54,7 @@ pub mod jwt;
 pub mod mux;
 pub mod pairlink;
 pub mod relay;
+pub mod relay_access;
 pub mod relay_window;
 
 /// Default TCP port for direct-network pairing endpoints.
@@ -84,7 +85,7 @@ pub struct PairRequest {
 /// Protocol: [`.proto-ref/pairing.md`, §7 “home returns cert + chain + home attestation”](../../../.proto-ref/pairing.md#7-home-returns-cert--chain--home-attestation).
 /// The §7 example body omits `fingerprint` and `local_endpoints`, while the client
 /// requires the former to verify that the returned certificate matches the response.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[derive(Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 pub struct PairResponse {
     /// PEM-encoded device certificate signed from the submitted CSR.
     pub client_cert: String,
@@ -102,6 +103,26 @@ pub struct PairResponse {
     /// Journal-advertised LAN endpoints, retained in their extensible JSON shape.
     #[serde(default)]
     pub local_endpoints: Option<serde_json::Value>,
+    /// Optional instance capability delivered inside the encrypted pair response.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "present_relay_access"
+    )]
+    pub relay_access: Option<serde_json::Value>,
+}
+
+impl std::fmt::Debug for PairResponse {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PairResponse").finish_non_exhaustive()
+    }
+}
+
+fn present_relay_access<'de, D>(deserializer: D) -> Result<Option<serde_json::Value>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    <serde_json::Value as serde::Deserialize>::deserialize(deserializer).map(Some)
 }
 
 #[cfg(test)]

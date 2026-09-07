@@ -31,6 +31,8 @@ pub enum RefreshOutcome {
 #[derive(Deserialize)]
 struct RefreshResponse {
     device_token: String,
+    protocol_version: Option<u8>,
+    expires_at: Option<String>,
 }
 
 /// Attempt one relay device-token refresh without exposing control-plane errors.
@@ -50,7 +52,8 @@ async fn refresh_device_token_inner(
     relay_origin: &str,
     current_token: &str,
 ) -> Result<RefreshOutcome, TransportError> {
-    let body = serde_json::to_vec(&json!({ "device_token": current_token }))?;
+    let body =
+        serde_json::to_vec(&json!({ "protocol_version": 2, "device_token": current_token }))?;
     #[expect(
         clippy::large_futures,
         reason = "the copied transport future keeps its established stack layout; this site goes red if a later refactor shrinks it"
@@ -59,8 +62,42 @@ async fn refresh_device_token_inner(
     if response.is_success() {
         let parsed: RefreshResponse = serde_json::from_slice(&response.body)
             .map_err(|_| TransportError::Pairing("relay refresh response malformed".into()))?;
-        let claims = spl_core::jwt::decode_unverified_claims(&parsed.device_token)
-            .ok_or_else(|| TransportError::Pairing("relay refresh response malformed".into()))?;
+        let current_payload = spl_core::relay_access::unverified_payload(current_token);
+        let replacement_payload = spl_core::relay_access::unverified_payload(&parsed.device_token);
+        let claims = match parsed.protocol_version {
+            Some(2) => current_payload
+                .as_ref()
+                .and_then(|payload| payload.get("instance_id")?.as_str())
+                .and_then(|instance_id| {
+                    spl_core::relay_access::negotiated_claims(
+                        2,
+                        &parsed.device_token,
+                        parsed.expires_at.as_deref()?,
+                        instance_id,
+                        crate::relay_pairing::unix_now(),
+                    )
+                }),
+            None if current_payload
+                .as_ref()
+                .is_some_and(|p| p.get("ver").is_none())
+                && replacement_payload
+                    .as_ref()
+                    .is_some_and(|p| p.get("ver").is_none()) =>
+            {
+                current_payload
+                    .as_ref()
+                    .and_then(|p| p.get("instance_id")?.as_str())
+                    .and_then(|instance| {
+                        spl_core::relay_access::legacy_claims(
+                            &parsed.device_token,
+                            instance,
+                            crate::relay_pairing::unix_now(),
+                        )
+                    })
+            }
+            _ => None,
+        }
+        .ok_or_else(|| TransportError::Pairing("relay refresh response malformed".into()))?;
         return Ok(RefreshOutcome::Refreshed {
             device_token: parsed.device_token,
             expires_at: claims.exp,

@@ -12,6 +12,7 @@ use std::io;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
+use base64::Engine as _;
 use futures_util::{SinkExt, StreamExt};
 use rcgen::{
     BasicConstraints, CertificateParams, CertificateSigningRequestParams, ExtendedKeyUsagePurpose,
@@ -39,9 +40,8 @@ const PAIR_SECRET_HEX: &str = "0123456789abcdef";
 // Exemplar request values from `.proto-ref/pairing.md` §5.
 const PAIR_EXAMPLE_NONCE: &str = "5f0d8c8b9f1e48b0a5f80b98f3d5e9b0";
 const PAIR_EXAMPLE_DEVICE_LABEL: &str = "Jer iPhone";
-const CURRENT_TOKEN: &str = "e30.eyJpYXQiOjEwMCwiZXhwIjoyMDB9.sig";
-const NEW_TOKEN: &str = "e30.eyJpYXQiOjMwMCwiZXhwIjo0MDB9.sig";
-const ENROLL_TOKEN: &str = "e30.eyJpYXQiOjEwMCwiZXhwIjo5OTk5OTk5OTk5fQ.sig";
+const CURRENT_TOKEN: &str = "e30.eyJpc3MiOiJyZWxheS50ZXN0Iiwic3ViIjoiZGV2aWNlOmxlZ2FjeSIsImF1ZCI6InNwbC1yZWxheSIsInNjb3BlIjoic2Vzc2lvbi5kaWFsIiwiaW5zdGFuY2VfaWQiOiJob21lIiwiZGV2aWNlX2ZwIjoic2hhMjU2OmFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWEiLCJpYXQiOjEwMCwiZXhwIjoyMDAsImp0aSI6ImxlZ2FjeSJ9.sig";
+const NEW_TOKEN: &str = "e30.eyJpc3MiOiJyZWxheS50ZXN0Iiwic3ViIjoiZGV2aWNlOmxlZ2FjeSIsImF1ZCI6InNwbC1yZWxheSIsInNjb3BlIjoic2Vzc2lvbi5kaWFsIiwiaW5zdGFuY2VfaWQiOiJob21lIiwiZGV2aWNlX2ZwIjoic2hhMjU2OmFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWEiLCJpYXQiOjEwMCwiZXhwIjo0MTAyNDQ0ODAwLCJqdGkiOiJsZWdhY3kifQ.sig";
 
 struct TestCa {
     cert: rcgen::Certificate,
@@ -115,6 +115,9 @@ struct MockState {
     dial_authorization: Mutex<Option<String>>,
     expected_pair_token: Mutex<String>,
     pair_request: Mutex<Option<PairRequest>>,
+    bootstrap: Mutex<Option<serde_json::Value>>,
+    control_response: Mutex<Option<serde_json::Value>>,
+    control_request: Mutex<Option<serde_json::Value>>,
 }
 
 impl MockState {
@@ -134,6 +137,9 @@ impl MockState {
             dial_authorization: Mutex::new(None),
             expected_pair_token: Mutex::new(PAIR_SECRET_HEX.to_owned()),
             pair_request: Mutex::new(None),
+            bootstrap: Mutex::new(None),
+            control_response: Mutex::new(None),
+            control_request: Mutex::new(None),
         }
     }
 
@@ -267,12 +273,26 @@ async fn handle_http(mut tcp: TcpStream, state: Arc<MockState>) -> io::Result<()
         .and_then(|line| line.split_whitespace().nth(1))
         .unwrap_or("/");
 
+    let payload = text
+        .split_once("\r\n\r\n")
+        .and_then(|(_, body)| serde_json::from_str(body).ok());
+    *state.control_request.lock().unwrap() = payload;
+    let replacement = state.control_response.lock().unwrap().clone();
     if path == "/enroll/device" {
         state.enroll_hits.fetch_add(1, Ordering::SeqCst);
         let status = *state.enroll_status.lock().unwrap();
         match status {
             Some(status) => write_json(&mut tcp, status, json!({"error":"rejected"})).await?,
-            None => write_json(&mut tcp, 200, json!({"device_token":ENROLL_TOKEN})).await?,
+            None => {
+                write_json(
+                    &mut tcp,
+                    200,
+                    replacement.unwrap_or_else(
+                        || json!({"device_token":legacy_token(&jid_for_ca(&state.json_ca))}),
+                    ),
+                )
+                .await?;
+            }
         }
     } else if path == "/token/refresh" {
         state.refresh_hits.fetch_add(1, Ordering::SeqCst);
@@ -280,7 +300,14 @@ async fn handle_http(mut tcp: TcpStream, state: Arc<MockState>) -> io::Result<()
         match status {
             Some(401) => write_json(&mut tcp, 401, json!({"reason":"expired"})).await?,
             Some(status) => write_json(&mut tcp, status, json!({"error":"rejected"})).await?,
-            None => write_json(&mut tcp, 200, json!({"device_token":NEW_TOKEN})).await?,
+            None => {
+                write_json(
+                    &mut tcp,
+                    200,
+                    replacement.unwrap_or_else(|| json!({"device_token":NEW_TOKEN})),
+                )
+                .await?;
+            }
         }
     } else {
         write_json(&mut tcp, 404, json!({"error":"not_found"})).await?;
@@ -393,6 +420,9 @@ async fn serve_home_pair(stream: DuplexStream, state: Arc<MockState>) -> io::Res
     if !matches!(state.home_mode, HomeMode::MissingHomeAttestation) {
         response["home_attestation"] = json!("attestation");
     }
+    if let Some(bootstrap) = state.bootstrap.lock().unwrap().clone() {
+        response["relay_access"] = bootstrap;
+    }
     write_pl_response(&mut tls, 200, response).await
 }
 
@@ -470,8 +500,11 @@ async fn relay_pairing_full_ceremony_populates_credential() {
 
     assert_eq!(credential.relay_origin.as_deref(), Some(origin.as_str()));
     assert_eq!(credential.instance_id, jid_for_ca(state.json_ca.as_ref()));
-    assert_eq!(credential.device_token.as_deref(), Some(ENROLL_TOKEN));
-    assert_eq!(credential.device_token_expires_at, Some(9_999_999_999));
+    assert_eq!(
+        credential.device_token.as_deref(),
+        Some(legacy_token(&jid_for_ca(&state.json_ca)).as_str())
+    );
+    assert_eq!(credential.device_token_expires_at, Some(4_102_444_800));
     assert!(credential.client_key_pem.contains("BEGIN PRIVATE KEY"));
     assert!(credential.client_cert_pem.contains("BEGIN CERTIFICATE"));
     assert_eq!(credential.ca_chain_pem.len(), 1);
@@ -858,4 +891,122 @@ async fn forced_refresh_reconnect_statuses() {
             RefreshOutcome::ReconnectNeeded
         );
     }
+}
+
+fn v2_token(instance: &str) -> String {
+    let payload = json!({"iss":"independent-issuer","sub":format!("instance:{instance}"),
+        "aud":"spl-relay","scope":"session.dial","ver":2,"instance_id":instance,
+        "iat":100,"exp":4_102_444_800_i64,"jti":"fresh"});
+    format!(
+        "e30.{}.sig",
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(payload.to_string())
+    )
+}
+
+#[tokio::test]
+async fn ready_bootstrap_completes_remote_pair_without_enrollment() {
+    let state = Arc::new(MockState::normal().with_same_tls_ca());
+    let origin = spawn_mock_relay(state.clone()).await;
+    let instance = jid_for_ca(&state.json_ca);
+    let token = v2_token(&instance);
+    *state.bootstrap.lock().unwrap() = Some(json!({"protocol_version":2,"status":"ready",
+        "relay_origin":origin,"instance_id":instance,"device_token":token,
+        "expires_at":"2100-01-01T00:00:00Z"}));
+    let link = relay_link(origin, state.json_ca.spki_pin());
+    let paired = Box::pin(pair_over_relay(&link, "device", &serde_json::Map::new()))
+        .await
+        .unwrap();
+    assert_eq!(paired.device_token.as_deref(), Some(token.as_str()));
+    assert_eq!(state.enroll_hits.load(Ordering::SeqCst), 0);
+    for invalid in [
+        serde_json::Value::Null,
+        json!({"status":"ready"}),
+        json!("private-bootstrap-sentinel"),
+    ] {
+        *state.bootstrap.lock().unwrap() = Some(invalid);
+        let error = Box::pin(pair_over_relay(&link, "device", &serde_json::Map::new()))
+            .await
+            .unwrap_err();
+        assert!(!format!("{error:?} {error}").contains("private-bootstrap-sentinel"));
+        assert_eq!(state.enroll_hits.load(Ordering::SeqCst), 0);
+    }
+    *state.bootstrap.lock().unwrap() = Some(json!({"protocol_version":2,"status":"ready",
+        "relay_origin":link.relay_origin,"instance_id":"other","device_token":token,
+        "expires_at":"2100-01-01T00:00:00Z"}));
+    assert!(
+        Box::pin(pair_over_relay(&link, "device", &serde_json::Map::new()))
+            .await
+            .is_err()
+    );
+    assert_eq!(state.enroll_hits.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn explicit_enrollment_and_refresh_upgrade_validate_v2_and_refuse_downgrade() {
+    let state = Arc::new(MockState::normal().with_same_tls_ca());
+    let origin = spawn_mock_relay(state.clone()).await;
+    let token = v2_token("home");
+    *state.control_response.lock().unwrap() = Some(json!({"protocol_version":2,
+        "device_token":token,"expires_at":"2100-01-01T00:00:00Z"}));
+    assert_eq!(
+        Box::pin(enroll_device(&origin, "home", "attestation"))
+            .await
+            .unwrap(),
+        token
+    );
+    assert_eq!(
+        state.control_request.lock().unwrap().as_ref().unwrap()["protocol_version"],
+        2
+    );
+    let legacy = legacy_token("home");
+    assert_eq!(
+        Box::pin(refresh_device_token(&origin, &legacy)).await,
+        RefreshOutcome::Refreshed {
+            device_token: token.clone(),
+            expires_at: 4_102_444_800
+        }
+    );
+    assert_eq!(
+        state.control_request.lock().unwrap().as_ref().unwrap()["protocol_version"],
+        2
+    );
+    let mut next_payload = spl_core::relay_access::unverified_payload(&token).unwrap();
+    next_payload["jti"] = json!("independently-renewed");
+    let next = format!(
+        "e30.{}.sig",
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(next_payload.to_string())
+    );
+    *state.control_response.lock().unwrap() =
+        Some(json!({"protocol_version":2,"device_token":next,"expires_at":"2100-01-01T00:00:00Z"}));
+    assert_eq!(
+        Box::pin(refresh_device_token(&origin, &token)).await,
+        RefreshOutcome::Refreshed {
+            device_token: next,
+            expires_at: 4_102_444_800
+        }
+    );
+    *state.control_response.lock().unwrap() = Some(json!({"device_token":NEW_TOKEN}));
+    assert_eq!(
+        Box::pin(refresh_device_token(&origin, &token)).await,
+        RefreshOutcome::TransientError
+    );
+    *state.control_response.lock().unwrap() = Some(json!({"device_token":token}));
+    assert!(
+        Box::pin(enroll_device(&origin, "home", "attestation"))
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        Box::pin(refresh_device_token(&origin, &legacy)).await,
+        RefreshOutcome::TransientError
+    );
+}
+
+fn legacy_token(instance: &str) -> String {
+    let mut payload = spl_core::relay_access::unverified_payload(NEW_TOKEN).unwrap();
+    payload["instance_id"] = json!(instance);
+    format!(
+        "e30.{}.sig",
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(payload.to_string())
+    )
 }

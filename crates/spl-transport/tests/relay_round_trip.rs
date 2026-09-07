@@ -217,7 +217,10 @@ fn base64url_no_pad(input: &[u8]) -> String {
 }
 
 fn mint_jwt(iat: i64, exp: i64) -> String {
-    let payload = format!(r#"{{"iat":{iat},"exp":{exp}}}"#);
+    let payload = serde_json::json!({"iss":"relay.test","sub":"device:legacy",
+        "aud":"spl-relay","scope":"session.dial","instance_id":INSTANCE_ID,
+        "device_fp":format!("sha256:{}", "a".repeat(64)),"jti":"legacy","iat":iat,"exp":exp})
+    .to_string();
     format!(
         "{}.{}.sig",
         base64url_no_pad(b"{}"),

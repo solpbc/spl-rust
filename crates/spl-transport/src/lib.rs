@@ -9,11 +9,9 @@
 //! connection, and the local loopback proxy that carries application HTTP into
 //! the tunnel.
 //!
-//! Trust is **CA-fingerprint pinning**, not a system trust store: a presented
-//! chain is accepted only if some certificate in it matches the pinned prefix
-//! carried by the pair-link, *and* the handshake signature verifies against the
-//! leaf the peer actually presented. The two together defeat a relay that echoes
-//! a real chain but terminates TLS with its own key.
+//! Trust uses a pinned home CA. The verifier checks the CA's self-signature,
+//! validates the peer leaf's signature against that CA, and verifies the TLS
+//! handshake signature against the leaf. Inner connections require TLS 1.3.
 //!
 //! `rustls` is cross-platform, so this crate is host-testable everywhere — a
 //! consumer's platform does not change the transport, only what it stores

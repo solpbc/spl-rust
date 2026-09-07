@@ -113,6 +113,11 @@ impl ChunkedDecoder {
         Self::default()
     }
 
+    /// Whether the terminal chunk and complete trailer terminator were received.
+    pub fn is_complete(&self) -> bool {
+        self.state == ChunkState::Done
+    }
+
     fn fail(&mut self, err: HttpError) -> HttpError {
         self.state = ChunkState::Failed;
         self.buf.clear();

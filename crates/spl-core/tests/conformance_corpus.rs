@@ -15,10 +15,10 @@ use std::ffi::OsStr;
 use std::fs;
 use std::path::{Component, Path, PathBuf};
 
-const AUTHORITY_COMMIT: &str = "8c802a5975d3c07afa9ef9fe5c74cc2d3cf55314";
+const AUTHORITY_COMMIT: &str = "d550bc4b7bc01a38a85cee48c6fe373971c5c7f7";
 const AUTHORITY_MANIFEST_SHA256: &str =
-    "d9dfb5a2ace5b804000874012454024874e290d9d16974bcac84d7367668e091";
-const BUNDLE_SEMVER: &str = "6.0.0";
+    "23c5b63cff5ebe653af35f59df0f2e2d5a9565ccc2434e7d408f80ecbc53adb5";
+const BUNDLE_SEMVER: &str = "7.0.0";
 const BUNDLE_SCHEMA_IDENTITY: &str = "spl.pair-link-definition-bundle.schema.v1";
 const ADOPTION_SCHEMA_VERSION: u32 = 1;
 const CONSUMER_IDENTIFIER: &str = "solpbc/spl-rust";

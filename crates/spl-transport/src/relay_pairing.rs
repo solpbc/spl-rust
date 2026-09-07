@@ -21,6 +21,8 @@ use crate::{RelayControlEndpoint, TransportError, relay, relay_http, spki_pin, t
 #[derive(Deserialize)]
 struct EnrollResponse {
     device_token: String,
+    protocol_version: Option<u8>,
+    expires_at: Option<String>,
 }
 
 /// Verified ceremony material retained until relay enrollment completes.
@@ -59,20 +61,34 @@ pub async fn pair_over_relay(
         }
     };
 
-    let home_attestation =
-        material.pair.home_attestation.as_deref().ok_or_else(|| {
+    let device_token = if let Some(raw) = &material.pair.relay_access {
+        let access: spl_core::relay_access::RelayAccess = serde_json::from_value(raw.clone())
+            .map_err(|_| TransportError::Pairing("relay bootstrap malformed".into()))?;
+        relay_http::validate_relay_origin(&access.relay_origin)?;
+        if !relay_http::same_relay_origin(&access.relay_origin, &link.relay_origin)?
+            || access
+                .claims(&material.pair.instance_id, unix_now())
+                .is_none()
+        {
+            return Err(TransportError::Pairing("relay bootstrap malformed".into()));
+        }
+        access.device_token.clone()
+    } else {
+        let home_attestation = material.pair.home_attestation.as_deref().ok_or_else(|| {
             TransportError::Pairing("relay response missing home attestation".into())
         })?;
-    #[expect(
-        clippy::large_futures,
-        reason = "the copied transport future keeps its established stack layout; this site goes red if a later refactor shrinks it"
-    )]
-    let device_token = enroll_device(
-        &link.relay_origin,
-        &material.pair.instance_id,
-        home_attestation,
-    )
-    .await?;
+        #[expect(
+            clippy::large_futures,
+            reason = "compatibility enrollment retains the established control-plane future"
+        )]
+        let token = enroll_device(
+            &link.relay_origin,
+            &material.pair.instance_id,
+            home_attestation,
+        )
+        .await?;
+        token
+    };
     let device_token_expires_at =
         spl_core::jwt::decode_unverified_claims(&device_token).map(|c| c.exp);
     let ca_fp_prefix = ca::sha256(material.pinned_ca.as_ref())[..16].to_vec();
@@ -137,7 +153,8 @@ where
         });
     }
 
-    let pair: PairResponse = serde_json::from_slice(&response.body)?;
+    let pair: PairResponse = serde_json::from_slice(&response.body)
+        .map_err(|_| TransportError::Pairing("pair response malformed".into()))?;
     let ca_chain_der = parse_ca_chain(&pair.ca_chain)?;
     let pinned_ca = ca_chain_der
         .iter()
@@ -204,6 +221,7 @@ pub async fn enroll_device(
     home_attestation: &str,
 ) -> Result<String, TransportError> {
     let body = serde_json::to_vec(&json!({
+        "protocol_version": 2,
         "instance_id": instance_id,
         "home_attestation": home_attestation,
     }))?;
@@ -220,7 +238,24 @@ pub async fn enroll_device(
     }
     let parsed: EnrollResponse = serde_json::from_slice(&response.body)
         .map_err(|_| TransportError::Pairing("relay enroll response malformed".into()))?;
-    if parsed.device_token.is_empty() {
+    let valid = match parsed.protocol_version {
+        Some(2) => parsed.expires_at.as_deref().is_some_and(|expires_at| {
+            spl_core::relay_access::negotiated_claims(
+                2,
+                &parsed.device_token,
+                expires_at,
+                instance_id,
+                unix_now(),
+            )
+            .is_some()
+        }),
+        None => {
+            spl_core::relay_access::legacy_claims(&parsed.device_token, instance_id, unix_now())
+                .is_some()
+        }
+        Some(_) => false,
+    };
+    if !valid {
         return Err(TransportError::Pairing(
             "relay enroll response malformed".into(),
         ));
@@ -252,4 +287,12 @@ fn parse_ca_chain(chain: &[String]) -> Result<Vec<CertificateDer<'static>>, Tran
     } else {
         Ok(out)
     }
+}
+
+pub(crate) fn unix_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .and_then(|duration| i64::try_from(duration.as_secs()).ok())
+        .unwrap_or(0)
 }

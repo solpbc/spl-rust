@@ -298,7 +298,8 @@ fn credential_from_direct_pair_response(
         });
     }
 
-    let pair: PairResponse = serde_json::from_slice(&response.body)?;
+    let pair: PairResponse = serde_json::from_slice(&response.body)
+        .map_err(|_| TransportError::Pairing("pair response malformed".into()))?;
     let cert_der = tls::parse_certs(&pair.client_cert)?
         .into_iter()
         .next()
@@ -312,6 +313,17 @@ fn credential_from_direct_pair_response(
     }
     verify_client_cert_key_binding(cert_der.as_ref(), &generated.public_key_spki_der)?;
 
+    let access = pair.relay_access.as_ref().and_then(|raw| {
+        let access: spl_core::relay_access::RelayAccess =
+            serde_json::from_value(raw.clone()).ok()?;
+        crate::relay_http::validate_relay_origin(&access.relay_origin).ok()?;
+        let claims = access.claims(&pair.instance_id, crate::relay_pairing::unix_now())?;
+        Some((
+            access.relay_origin.clone(),
+            access.device_token.clone(),
+            claims.exp,
+        ))
+    });
     Ok(Credential {
         client_key_pem: generated.key_pem,
         client_cert_pem: pair.client_cert,
@@ -322,9 +334,9 @@ fn credential_from_direct_pair_response(
         endpoints: all_endpoints.iter().map(EndpointAddr::from).collect(),
         home_attestation: pair.home_attestation,
         local_endpoints: pair.local_endpoints,
-        relay_origin: None,
-        device_token: None,
-        device_token_expires_at: None,
+        relay_origin: access.as_ref().map(|a| a.0.clone()),
+        device_token: access.as_ref().map(|a| a.1.clone()),
+        device_token_expires_at: access.map(|a| a.2),
     })
 }
 
@@ -462,6 +474,7 @@ mod tests {
             }
         };
         PairResponse {
+            relay_access: None,
             client_cert: client_cert.pem(),
             ca_chain: vec![ca_cert.pem()],
             instance_id: "test-instance".into(),
@@ -799,7 +812,9 @@ mod tests {
             (TransportError::Rejected { status, .. }, ExpectedFailure::Rejected(expected)) => {
                 assert_eq!(status, expected)
             }
-            (TransportError::Json(_), ExpectedFailure::Json) => {}
+            (TransportError::Pairing(actual), ExpectedFailure::Json) => {
+                assert_eq!(actual, "pair response malformed");
+            }
             (TransportError::Tls(actual), ExpectedFailure::TlsPrefix(expected)) => {
                 assert!(
                     actual.starts_with(expected),
@@ -916,5 +931,79 @@ mod tests {
             error,
             TransportError::Rejected { status: 403, .. }
         ));
+    }
+    #[tokio::test]
+    async fn direct_pairing_preserves_credentials_with_invalid_optional_access() {
+        for access in [
+            serde_json::Value::Null,
+            serde_json::json!("private-bootstrap-sentinel"),
+            serde_json::json!({"protocol_version":2}),
+            serde_json::json!({"protocol_version":3,"status":"ready"}),
+        ] {
+            let seam = FakeDirectPairingSeam::new(
+                vec![Ok(())],
+                Box::new(move |request_body| {
+                    let mut response =
+                        pair_response(request_body, TestCertificateMode::SubmittedCsr);
+                    response.relay_access = Some(access.clone());
+                    Ok(http_response(200, serde_json::to_vec(&response).unwrap()))
+                }),
+            );
+            let counters = seam.counters();
+            let credential = pair_with_seam(
+                &test_endpoints(),
+                "00112233445566778899aabbccddeeff",
+                &[0x22; 16],
+                "test-device",
+                seam,
+                &serde_json::Map::new(),
+            )
+            .await
+            .unwrap();
+            assert!(credential.client_cert_pem.contains("BEGIN CERTIFICATE"));
+            assert!(credential.device_token.is_none());
+            assert!(credential.relay_origin.is_none());
+            assert_eq!(counters.lock().unwrap().request_bodies.len(), 1);
+        }
+    }
+    #[tokio::test]
+    async fn direct_pairing_accepts_ready_access_without_an_enrollment_leg() {
+        use base64::Engine as _;
+        let claims = serde_json::json!({"iss":"independent-issuer","sub":"instance:test-instance",
+            "aud":"spl-relay","scope":"session.dial","ver":2,"instance_id":"test-instance",
+            "iat":100,"exp":4_102_444_800_i64,"jti":"fresh"});
+        let token = format!(
+            "e30.{}.sig",
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(claims.to_string())
+        );
+        let expected = token.clone();
+        let seam = FakeDirectPairingSeam::new(
+            vec![Ok(())],
+            Box::new(move |request_body| {
+                let mut response = pair_response(request_body, TestCertificateMode::SubmittedCsr);
+                response.relay_access = Some(
+                    serde_json::json!({"protocol_version":2,"status":"ready",
+                "relay_origin":"http://127.0.0.1:1","instance_id":"test-instance","device_token":token,
+                "expires_at":"2100-01-01T00:00:00Z"}),
+                );
+                Ok(http_response(200, serde_json::to_vec(&response).unwrap()))
+            }),
+        );
+        let credential = pair_with_seam(
+            &test_endpoints(),
+            "00112233445566778899aabbccddeeff",
+            &[0x22; 16],
+            "test-device",
+            seam,
+            &serde_json::Map::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(credential.device_token.as_deref(), Some(expected.as_str()));
+        assert_eq!(
+            credential.relay_origin.as_deref(),
+            Some("http://127.0.0.1:1")
+        );
+        assert_eq!(credential.endpoints.len(), 3);
     }
 }

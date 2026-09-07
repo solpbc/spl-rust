@@ -90,10 +90,19 @@ fn neutral_bridge_names() -> BridgeNames {
 }
 
 async fn raw_request(port: u16, target: &str, cookie: Option<&str>) -> Vec<u8> {
+    raw_method_request(port, "GET", target, cookie).await
+}
+
+async fn raw_method_request(
+    port: u16,
+    method: &str,
+    target: &str,
+    cookie: Option<&str>,
+) -> Vec<u8> {
     let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", port))
         .await
         .expect("connect to bridge");
-    let mut request = format!("GET {target} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n");
+    let mut request = format!("{method} {target} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n");
     if let Some(cookie) = cookie {
         request.push_str("Cookie: ");
         request.push_str(cookie);
@@ -305,4 +314,61 @@ async fn fixed_port_binds_only_ipv4_loopback() {
 
     drop(stream);
     handle.shutdown_and_wait().await;
+}
+
+#[tokio::test]
+async fn self_description_put_requires_bridge_capability_on_actual_listener() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let observed = calls.clone();
+    let handle = journal_bridge::start(JournalBridgeConfig {
+        opener: Arc::new(InertOpener),
+        bridge_names: neutral_bridge_names(),
+        endpoint_hosts: Vec::new(),
+        policy: BridgePolicy {
+            local_response: Arc::new(move |_, _| {
+                observed.fetch_add(1, Ordering::SeqCst);
+                Some(LocalResponse {
+                    status: 200,
+                    content_type: "text/plain".into(),
+                    body: Vec::new(),
+                })
+            }),
+            ..BridgePolicy::default()
+        },
+    })
+    .await
+    .unwrap();
+    let bootstrap = handle.bootstrap_url().unwrap();
+    let capability = bootstrap.split_once("cap=").unwrap().1;
+    let cookie = format!("test-journal-cap={capability}");
+    for path in [
+        "/app/network/api/clients/self",
+        "/app/link/api/clients/self",
+    ] {
+        for missing_or_wrong in [None, Some("test-journal-cap=wrong")] {
+            assert_eq!(
+                response_status(
+                    &raw_method_request(handle.port(), "PUT", path, missing_or_wrong).await
+                ),
+                403
+            );
+        }
+    }
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+    for path in [
+        "/app/network/api/clients/self",
+        "/app/link/api/clients/self",
+    ] {
+        assert_eq!(
+            response_status(&raw_method_request(handle.port(), "PUT", path, Some(&cookie)).await),
+            200
+        );
+    }
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+    assert_eq!(
+        response_status(&raw_method_request(handle.port(), "PUT", "/other", Some(&cookie)).await),
+        405
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+    handle.begin_shutdown();
 }

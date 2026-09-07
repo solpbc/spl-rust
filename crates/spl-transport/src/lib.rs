@@ -70,6 +70,7 @@ mod journal_bridge_carrier;
 pub mod pairing;
 pub mod relay;
 pub(crate) mod relay_http;
+pub use relay_http::{same_relay_origin, validate_relay_origin};
 pub mod relay_pairing;
 pub mod relay_token;
 pub(crate) mod spki_pin;

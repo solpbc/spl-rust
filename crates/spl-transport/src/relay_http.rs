@@ -124,11 +124,19 @@ async fn relay_https_post_json_inner(
     }
 }
 
-pub(crate) fn validate_relay_origin(origin: &str) -> Result<(), TransportError> {
+/// Validate a bare relay origin using the transport control-plane policy.
+///
+/// # Errors
+/// Returns a pair-link error for an unsupported scheme or malformed authority.
+pub fn validate_relay_origin(origin: &str) -> Result<(), TransportError> {
     parse_relay_origin(origin).map(|_| ())
 }
 
-pub(crate) fn same_relay_origin(left: &str, right: &str) -> Result<bool, TransportError> {
+/// Compare validated relay origins after normalizing authority and default ports.
+///
+/// # Errors
+/// Returns a pair-link error if either origin violates the transport policy.
+pub fn same_relay_origin(left: &str, right: &str) -> Result<bool, TransportError> {
     let left = parse_relay_origin(left)?;
     let right = parse_relay_origin(right)?;
     Ok(left.scheme == right.scheme

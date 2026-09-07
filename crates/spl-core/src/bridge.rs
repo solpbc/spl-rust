@@ -321,9 +321,14 @@ pub fn check_loopback_host(head: &RequestHead, port: u16) -> Result<(), RejectRe
 /// # Errors
 ///
 /// Returns [`RejectReason::BadMethod`] unless the method is `GET`, `HEAD`, or
-/// `POST`.
+/// `POST`, or `PUT` to the authenticated current-device description route.
 pub fn check_method(head: &RequestHead) -> Result<(), RejectReason> {
-    if !matches!(head.method.as_str(), "GET" | "HEAD" | "POST") {
+    let self_description_put = head.method == "PUT"
+        && matches!(
+            head.path(),
+            "/app/network/api/clients/self" | "/app/link/api/clients/self"
+        );
+    if !matches!(head.method.as_str(), "GET" | "HEAD" | "POST") && !self_description_put {
         return Err(RejectReason::BadMethod);
     }
     Ok(())
@@ -859,6 +864,46 @@ mod tests {
             authorize(&missing, b"secret", 49152, &names),
             Err(RejectReason::BadHost)
         );
+    }
+
+    #[test]
+    fn current_device_put_retains_capability_and_caller_auth_checks() {
+        let names = names();
+        for path in [
+            "/app/network/api/clients/self",
+            "/app/link/api/clients/self",
+        ] {
+            for (cookie, expected) in [
+                ("secret", Ok(())),
+                ("wrong", Err(RejectReason::BadCapability)),
+            ] {
+                let head = request(
+                    "PUT",
+                    path,
+                    Some("127.0.0.1:49152"),
+                    &[(
+                        "Cookie",
+                        &format!("{}={cookie}", names.capability_cookie_name),
+                    )],
+                );
+                assert_eq!(authorize(&head, b"secret", 49152, &names), expected);
+            }
+            let head = request("PUT", path, Some("127.0.0.1:49152"), &[]);
+            assert_eq!(
+                authorize(&head, b"secret", 49152, &names),
+                Err(RejectReason::BadCapability)
+            );
+            let head = request(
+                "PUT",
+                path,
+                Some("127.0.0.1:49152"),
+                &[("Authorization", "Bearer caller")],
+            );
+            assert_eq!(
+                authorize(&head, b"secret", 49152, &names),
+                Err(RejectReason::CallerAuth)
+            );
+        }
     }
 
     #[test]

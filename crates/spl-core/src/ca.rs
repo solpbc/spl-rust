@@ -3,14 +3,10 @@
 
 //! CA-fingerprint pinning logic.
 //!
-//! The pair-link carries the first 16 bytes of `SHA-256(CA cert DER)`. At the
-//! TLS handshake the client pins it: a presented certificate chain is trusted
-//! only if some cert in it has a SHA-256 whose leading bytes equal the pin
-//! ([`chain_matches_prefix`]). The journal performs the same prefix check. The
-//! signature-of-the-handshake check (that the peer actually holds the leaf key)
-//! is enforced separately by the consuming transport's TLS verifier;
-//! pinning the chain plus verifying the leaf signature together defeat a relay
-//! that echoes the real CA chain but terminates TLS with its own key.
+//! Fingerprint matching locates a candidate trust anchor; it does not validate
+//! a certificate chain. The consuming TLS verifier must also validate the peer
+//! leaf's certificate signature against that anchor and verify possession of
+//! the leaf's private key during the handshake.
 
 use sha2::{Digest, Sha256};
 use thiserror::Error;

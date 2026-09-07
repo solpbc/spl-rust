@@ -3,15 +3,10 @@
 
 //! rustls client configs for SPL's framed-mTLS transport.
 //!
-//! Trust is **CA-fingerprint pinning**, not a system trust store: a presented
-//! certificate chain is accepted only if some cert in it matches the pinned
-//! prefix from the pair-link (`spl_core::ca`), AND the TLS handshake
-//! signature verifies against the leaf the peer presented (delegated to the ring
-//! provider). The two together defeat a relay that echoes the real CA chain but
-//! terminates TLS with its own key — the same property the journal's
-//! leaf-signature check added. Hostname is intentionally not validated (we dial
-//! raw IPs from the pair-link and pin the CA), so a fixed `spl.local` server
-//! name is used.
+//! Trust is CA-fingerprint pinning, not a system trust store. The peer leaf
+//! must be signed by the pinned home CA, and TLS separately verifies possession
+//! of the leaf private key. Hostname validation is intentionally replaced by
+//! this private trust anchor because connections dial the home's raw addresses.
 
 use std::sync::Arc;
 
@@ -30,9 +25,9 @@ pub(crate) const PINNED_SERVER_NAME: &str = "spl.local";
 /// A rustls verifier that pins the journal CA fingerprint prefix and still
 /// verifies the handshake signature against the presented leaf.
 #[derive(Debug)]
-struct CaFpPinVerifier {
-    prefix: Vec<u8>,
-    provider: Arc<CryptoProvider>,
+pub(crate) struct CaFpPinVerifier {
+    pub(crate) prefix: Vec<u8>,
+    pub(crate) provider: Arc<CryptoProvider>,
 }
 
 #[derive(Debug)]
@@ -49,17 +44,16 @@ impl ServerCertVerifier for CaFpPinVerifier {
         _ocsp_response: &[u8],
         _now: UnixTime,
     ) -> Result<ServerCertVerified, RustlsError> {
-        let pinned = spl_core::ca::cert_matches_prefix(end_entity.as_ref(), &self.prefix)
-            || intermediates
-                .iter()
-                .any(|c| spl_core::ca::cert_matches_prefix(c.as_ref(), &self.prefix));
-        if pinned {
-            Ok(ServerCertVerified::assertion())
-        } else {
-            Err(RustlsError::General(
-                "journal CA fingerprint pin mismatch".to_string(),
-            ))
-        }
+        let pinned_ca = std::iter::once(end_entity)
+            .chain(intermediates.iter())
+            .find(|cert| spl_core::ca::cert_matches_prefix(cert.as_ref(), &self.prefix))
+            .ok_or_else(|| RustlsError::General("journal CA fingerprint pin mismatch".into()))?;
+        crate::spki_pin::verify_ca_self_signed(pinned_ca)
+            .and_then(|()| crate::spki_pin::verify_live_peer_binding(end_entity, pinned_ca))
+            .map_err(|_| {
+                RustlsError::General("journal certificate not signed by pinned CA".into())
+            })?;
+        Ok(ServerCertVerified::assertion())
     }
 
     fn verify_tls12_signature(
@@ -161,7 +155,7 @@ pub fn pairing_config(ca_fp_prefix: &[u8]) -> Result<ClientConfig, TransportErro
         provider: provider.clone(),
     });
     let config = ClientConfig::builder_with_provider(provider)
-        .with_safe_default_protocol_versions()
+        .with_protocol_versions(&[&rustls::version::TLS13])
         .map_err(|e| TransportError::Tls(e.to_string()))?
         .dangerous()
         .with_custom_certificate_verifier(verifier)
@@ -184,7 +178,7 @@ pub(crate) fn trust_all_pairing_config() -> Result<ClientConfig, TransportError>
         provider: provider.clone(),
     });
     let config = ClientConfig::builder_with_provider(provider)
-        .with_safe_default_protocol_versions()
+        .with_protocol_versions(&[&rustls::version::TLS13])
         .map_err(|e| TransportError::Tls(e.to_string()))?
         .dangerous()
         .with_custom_certificate_verifier(verifier)
@@ -210,7 +204,7 @@ pub fn mtls_config(
         provider: provider.clone(),
     });
     let config = ClientConfig::builder_with_provider(provider)
-        .with_safe_default_protocol_versions()
+        .with_protocol_versions(&[&rustls::version::TLS13])
         .map_err(|e| TransportError::Tls(e.to_string()))?
         .dangerous()
         .with_custom_certificate_verifier(verifier)

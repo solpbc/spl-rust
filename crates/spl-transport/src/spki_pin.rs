@@ -102,6 +102,45 @@ mod tests {
     }
 
     #[test]
+    fn tls_verifier_requires_a_valid_pinned_certificate_binding() {
+        use rustls::client::danger::ServerCertVerifier;
+        let home = ca();
+        let home_der = cert_der(&home);
+        let leaf = leaf_signed_by(&home);
+        let verifier = crate::tls::CaFpPinVerifier {
+            prefix: spl_core::ca::sha256(home_der.as_ref())[..16].to_vec(),
+            provider: std::sync::Arc::new(rustls::crypto::ring::default_provider()),
+        };
+        let name = rustls::pki_types::ServerName::try_from("spl.local").unwrap();
+        assert!(
+            verifier
+                .verify_server_cert(
+                    &leaf,
+                    std::slice::from_ref(&home_der),
+                    &name,
+                    &[],
+                    UnixTime::now()
+                )
+                .is_ok()
+        );
+        // A changed certificate signature must fail at the TLS verifier boundary.
+        let mut invalid = leaf.as_ref().to_vec();
+        let last = invalid.last_mut().unwrap();
+        *last ^= 1;
+        assert!(
+            verifier
+                .verify_server_cert(
+                    &CertificateDer::from(invalid),
+                    &[home_der],
+                    &name,
+                    &[],
+                    UnixTime::now()
+                )
+                .is_err()
+        );
+    }
+
+    #[test]
     fn non_self_signed_ca_rejects() {
         let issuer = ca();
         let not_self_signed = leaf_signed_by(&issuer);

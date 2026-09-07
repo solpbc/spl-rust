@@ -31,6 +31,7 @@ pub enum RefreshOutcome {
 #[derive(Deserialize)]
 struct RefreshResponse {
     device_token: String,
+    #[serde(default, deserialize_with = "negotiated_version")]
     protocol_version: Option<u8>,
     expires_at: Option<String>,
 }
@@ -106,4 +107,10 @@ fn expired_reason(body: &[u8]) -> bool {
                 .map(|reason| reason == "expired")
         })
         .unwrap_or(false)
+}
+
+fn negotiated_version<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<u8>, D::Error> {
+    u8::deserialize(deserializer).map(Some)
 }

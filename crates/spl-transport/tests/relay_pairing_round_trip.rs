@@ -831,48 +831,25 @@ async fn relay_pairing_rejects_client_certificate_for_unrelated_key() {
 }
 
 #[tokio::test]
-async fn relay_pairing_rejects_missing_home_attestation() {
-    let mut state = MockState::normal().with_same_tls_ca();
-    state.home_mode = HomeMode::MissingHomeAttestation;
-    let state = Arc::new(state);
-    let origin = spawn_mock_relay(state.clone()).await;
-    let link = relay_link(origin, state.json_ca.spki_pin());
-
-    #[expect(
-        clippy::large_futures,
-        reason = "the copied transport future keeps its established stack layout; this site goes red if a later refactor shrinks it"
-    )]
-    let err = pair_over_relay(&link, "win-test", &serde_json::Map::new())
-        .await
-        .unwrap_err();
-    assert!(matches!(err, TransportError::Pairing(_)));
-}
-
-#[tokio::test]
-async fn relay_pairing_enroll_statuses_are_control_rejections() {
-    for status in [409, 401, 403, 404] {
-        let state = Arc::new(MockState::normal().with_same_tls_ca());
-        *state.enroll_status.lock().unwrap() = Some(status);
+async fn older_home_pairing_survives_unavailable_optional_enrollment() {
+    for status in [None, Some(409), Some(401), Some(403), Some(404), Some(503)] {
+        let mut setup = MockState::normal().with_same_tls_ca();
+        if status.is_none() {
+            setup.home_mode = HomeMode::MissingHomeAttestation;
+        }
+        let state = Arc::new(setup);
+        *state.enroll_status.lock().unwrap() = status;
         let origin = spawn_mock_relay(state.clone()).await;
         let link = relay_link(origin, state.json_ca.spki_pin());
-
-        #[expect(
-            clippy::large_futures,
-            reason = "the copied transport future keeps its established stack layout; this site goes red if a later refactor shrinks it"
-        )]
-        let err = pair_over_relay(&link, "win-test", &serde_json::Map::new())
+        let credential = Box::pin(pair_over_relay(&link, "win-test", &serde_json::Map::new()))
             .await
-            .unwrap_err();
-        assert!(matches!(
-            err,
-            TransportError::RelayControlRejected {
-                endpoint: RelayControlEndpoint::EnrollDevice,
-                status: actual
-            } if actual == status
-        ));
-        let code = transport_error_code(&err);
-        assert_eq!(code, format!("relay_enroll_device_http_{status}"));
-        assert!(!code.contains("attestation"));
+            .unwrap();
+        assert!(credential.client_key_pem.contains("BEGIN PRIVATE KEY"));
+        assert!(credential.client_cert_pem.contains("BEGIN CERTIFICATE"));
+        assert!(!credential.endpoints.is_empty());
+        assert!(credential.relay_origin.is_none());
+        assert!(credential.device_token.is_none());
+        assert!(credential.device_token_expires_at.is_none());
     }
 }
 
@@ -1053,4 +1030,49 @@ async fn refresh_checks_input_shape_but_preserves_expired_input_grace() {
         2,
         "invalid input makes no request"
     );
+}
+
+#[tokio::test]
+async fn low_level_enrollment_retains_control_rejection_classification() {
+    for status in [409, 401, 403, 404] {
+        let state = Arc::new(MockState::normal().with_same_tls_ca());
+        *state.enroll_status.lock().unwrap() = Some(status);
+        let origin = spawn_mock_relay(state).await;
+        let error = Box::pin(enroll_device(&origin, "home", "attestation"))
+            .await
+            .unwrap_err();
+        assert!(matches!(error, TransportError::RelayControlRejected {
+            endpoint: RelayControlEndpoint::EnrollDevice, status: actual } if actual == status));
+    }
+}
+
+#[tokio::test]
+async fn explicit_null_control_version_is_not_legacy_omission() {
+    let state = Arc::new(MockState::normal().with_same_tls_ca());
+    let origin = spawn_mock_relay(state.clone()).await;
+    let legacy = legacy_token("home");
+    for version in [serde_json::Value::Null, json!("2"), json!(3)] {
+        *state.control_response.lock().unwrap() =
+            Some(json!({"protocol_version":version,"device_token":legacy}));
+        assert!(
+            Box::pin(enroll_device(&origin, "home", "attestation"))
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            Box::pin(refresh_device_token(&origin, &legacy)).await,
+            RefreshOutcome::TransientError
+        );
+    }
+    *state.control_response.lock().unwrap() = Some(json!({"device_token":legacy}));
+    assert_eq!(
+        Box::pin(enroll_device(&origin, "home", "attestation"))
+            .await
+            .unwrap(),
+        legacy
+    );
+    assert!(matches!(
+        Box::pin(refresh_device_token(&origin, &legacy)).await,
+        RefreshOutcome::Refreshed { .. }
+    ));
 }

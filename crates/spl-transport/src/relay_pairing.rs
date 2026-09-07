@@ -21,6 +21,7 @@ use crate::{RelayControlEndpoint, TransportError, relay, relay_http, spki_pin, t
 #[derive(Deserialize)]
 struct EnrollResponse {
     device_token: String,
+    #[serde(default, deserialize_with = "negotiated_version")]
     protocol_version: Option<u8>,
     expires_at: Option<String>,
 }
@@ -72,25 +73,30 @@ pub async fn pair_over_relay(
         {
             return Err(TransportError::Pairing("relay bootstrap malformed".into()));
         }
-        access.device_token.clone()
+        Some(access.device_token.clone())
     } else {
-        let home_attestation = material.pair.home_attestation.as_deref().ok_or_else(|| {
-            TransportError::Pairing("relay response missing home attestation".into())
-        })?;
-        #[expect(
-            clippy::large_futures,
-            reason = "compatibility enrollment retains the established control-plane future"
-        )]
-        let token = enroll_device(
-            &link.relay_origin,
-            &material.pair.instance_id,
-            home_attestation,
-        )
-        .await?;
-        token
+        match material.pair.home_attestation.as_deref() {
+            Some(home_attestation) => {
+                #[expect(
+                    clippy::large_futures,
+                    reason = "compatibility enrollment retains the established control-plane future"
+                )]
+                let token = enroll_device(
+                    &link.relay_origin,
+                    &material.pair.instance_id,
+                    home_attestation,
+                )
+                .await
+                .ok();
+                token
+            }
+            None => None,
+        }
     };
-    let device_token_expires_at =
-        spl_core::jwt::decode_unverified_claims(&device_token).map(|c| c.exp);
+    let device_token_expires_at = device_token
+        .as_deref()
+        .and_then(spl_core::jwt::decode_unverified_claims)
+        .map(|claims| claims.exp);
     let ca_fp_prefix = ca::sha256(material.pinned_ca.as_ref())[..16].to_vec();
     let endpoints = endpoint_addrs_from_local_endpoints(material.pair.local_endpoints.as_ref());
 
@@ -104,8 +110,8 @@ pub async fn pair_over_relay(
         endpoints,
         home_attestation: material.pair.home_attestation,
         local_endpoints: material.pair.local_endpoints,
-        relay_origin: Some(link.relay_origin.clone()),
-        device_token: Some(device_token),
+        relay_origin: device_token.as_ref().map(|_| link.relay_origin.clone()),
+        device_token,
         device_token_expires_at,
     })
 }
@@ -295,4 +301,10 @@ pub(crate) fn unix_now() -> i64 {
         .ok()
         .and_then(|duration| i64::try_from(duration.as_secs()).ok())
         .unwrap_or(0)
+}
+
+fn negotiated_version<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<u8>, D::Error> {
+    u8::deserialize(deserializer).map(Some)
 }

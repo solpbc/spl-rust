@@ -30,6 +30,6 @@ pub use connection::{HomeConnection, HomeStream};
 /// Error and refusal types returned by the home-side mux.
 pub use error::{ConfigError, HomeError, PairWindowRefusal, Refusal, RefusalClass};
 /// Pure listener-side frame dispatch and stream lifecycle types.
-pub use mux::{MuxAcceptor, MuxEvent, MuxOutput, ResetReason};
+pub use mux::{MuxAcceptor, MuxEvent, MuxOutput, RefusalCounts, ResetReason};
 /// Single-use anonymous pairing-window admission.
 pub use pair_window::{PairSecret, PairWindow, PairWindowConfig, RelayKeyHex};

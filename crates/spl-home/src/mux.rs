@@ -28,8 +28,46 @@ pub struct MuxAcceptor {
     discarded_payload_remaining: Option<usize>,
     peer_high_water: Option<u32>,
     streams: HashMap<u32, StreamState>,
+    refusals: RefusalCounts,
     #[cfg(test)]
     next_listener_id: Option<u32>,
+}
+
+/// Per-stream refusals one carrier has issued, by class.
+///
+/// A per-stream refusal resets the offending stream and deliberately leaves the
+/// carrier up, so nothing about it reaches either peer as an error. A peer that
+/// holds the concurrent-stream cap and is refused its next open therefore fails
+/// silently on both sides. This crate owns no logging; it counts, and a caller
+/// reports.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RefusalCounts {
+    /// Opens refused because the concurrent-stream cap was already reached.
+    pub stream_limit: u64,
+    /// Frames refused for exceeding advertised flow-control credit.
+    pub flow_control: u64,
+    /// Frames refused for a framing or stream-lifecycle violation.
+    pub protocol: u64,
+    /// Local stream accounting failures, independent of peer payload.
+    pub internal: u64,
+}
+
+impl RefusalCounts {
+    /// True when nothing has been refused.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        *self == Self::default()
+    }
+
+    fn record(&mut self, class: RefusalClass) {
+        let counter = match class {
+            RefusalClass::StreamLimit => &mut self.stream_limit,
+            RefusalClass::FlowControl => &mut self.flow_control,
+            RefusalClass::Protocol => &mut self.protocol,
+            RefusalClass::Internal => &mut self.internal,
+        };
+        *counter = counter.saturating_add(1);
+    }
 }
 
 /// Frames to write and application-visible events produced by one mux action.
@@ -194,6 +232,7 @@ impl MuxAcceptor {
             discarded_payload_remaining: None,
             peer_high_water: None,
             streams: HashMap::new(),
+            refusals: RefusalCounts::default(),
             #[cfg(test)]
             next_listener_id: Some(2),
         })
@@ -640,12 +679,24 @@ impl MuxAcceptor {
         self.refuse_violation(violation(frame), class, output);
     }
 
+    /// Per-stream refusals this acceptor has issued, by class.
+    ///
+    /// Carrier-fatal refusals are not counted here: `feed` returns those to the
+    /// caller as an error, so they are already visible. What this counts is the
+    /// class that is not — a per-stream refusal resets one stream, leaves the
+    /// carrier up, and is reported only in [`MuxOutput::refusals`], which the
+    /// driver had no way to surface.
+    pub(crate) fn refusals(&self) -> RefusalCounts {
+        self.refusals
+    }
+
     fn refuse_violation(
         &mut self,
         frame_violation: FrameViolation,
         class: RefusalClass,
         output: &mut MuxOutput,
     ) {
+        self.refusals.record(class);
         let refusal = Refusal {
             class,
             violation: Some(frame_violation),

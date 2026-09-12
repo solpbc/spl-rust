@@ -31,13 +31,13 @@ use spl_core::PairRequest;
 use spl_core::ca::sha256;
 use spl_core::frame::{
     FLAG_CLOSE, FLAG_DATA, FLAG_OPEN, FLAG_PONG, FLAG_WINDOW, Frame, FrameDecoder, FrameDialer,
-    RECOMMENDED_CHUNK, RESET_CANCEL,
+    RECOMMENDED_CHUNK, RESET_CANCEL, RESET_STREAM_LIMIT_EXCEEDED,
 };
 use spl_core::mux::INITIAL_WINDOW;
 use spl_core::pairlink::RelayPairLink;
 use spl_home::{
-    HomeConfig, HomeConnection, MuxLimits, PairSecret, PairWindow, PairWindowConfig,
-    PairWindowRefusal,
+    DEFAULT_DECODER_BUFFER_BYTES, HomeConfig, HomeConnection, MuxLimits, PairSecret, PairWindow,
+    PairWindowConfig, PairWindowRefusal,
 };
 use spl_transport::TransportError;
 use spl_transport::relay_pairing::pair_over_carrier;
@@ -531,6 +531,100 @@ async fn rejected_client_certificate_surfaces_access_denied_to_dialer() {
         Some(&Error::AlertReceived(AlertDescription::AccessDenied))
     );
     assert!(matches!(home.await.unwrap(), Err(spl_home::HomeError::Tls)));
+}
+
+#[tokio::test]
+async fn a_stream_limit_refusal_is_counted_where_nothing_else_records_it() {
+    // A per-stream refusal resets one stream and deliberately leaves the
+    // carrier up, so it reaches the peer as nothing but a closed stream and
+    // reached this side as nothing at all: the mux reported it in
+    // `MuxOutput::refusals` and the driver dropped it on the floor. A peer
+    // holding the concurrent-stream cap therefore failed silently on both ends.
+    let fixture = fixture();
+    let (dialer_io, home_io) = tokio::io::duplex(64 * 1024);
+    let mut home_config = config(&fixture, verifier(fixture.ca.clone()));
+    home_config.mux_limits = MuxLimits {
+        max_concurrent_streams: 2,
+        decoder_buffer_bytes: DEFAULT_DECODER_BUFFER_BYTES,
+    };
+    let home = tokio::spawn(HomeConnection::accept(home_io, home_config));
+    let connector = TlsConnector::from(Arc::new(client_config(&fixture)));
+    let mut dialer = tokio::time::timeout(
+        Duration::from_secs(5),
+        connector.connect(ServerName::try_from("spl.local").unwrap(), dialer_io),
+    )
+    .await
+    .expect("tls connect")
+    .unwrap();
+    let mut home = tokio::time::timeout(Duration::from_secs(5), home)
+        .await
+        .expect("home accept")
+        .unwrap()
+        .unwrap();
+
+    // Hold the accepted handles: dropping one resets its stream and gives the
+    // slot straight back, so a dropped handle would leave room for the third.
+    let mut held = Vec::new();
+    for id in [1u32, 3] {
+        dialer
+            .write_all(&wire(Frame::new(id, FLAG_OPEN, Vec::new())))
+            .await
+            .unwrap();
+        dialer.flush().await.unwrap();
+        held.push(
+            tokio::time::timeout(Duration::from_secs(5), home.accept_stream())
+                .await
+                .expect("an open inside the cap must be accepted")
+                .unwrap(),
+        );
+    }
+    assert!(
+        home.refusals().is_empty(),
+        "opens inside the cap are not refusals"
+    );
+
+    dialer
+        .write_all(&wire(Frame::new(5, FLAG_OPEN, Vec::new())))
+        .await
+        .unwrap();
+    dialer.flush().await.unwrap();
+
+    let mut decoder = FrameDecoder::new();
+    let mut received: Vec<Frame> = Vec::new();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        // The carrier also carries window grants for the accepted streams.
+        while !received.iter().any(|frame| frame.stream_id == 5) {
+            received.extend(read_frames(&mut dialer, &mut decoder).await);
+        }
+    })
+    .await
+    .expect("the refused stream must be answered on the wire");
+    let refused = received
+        .iter()
+        .find(|frame| frame.stream_id == 5)
+        .expect("refused frame");
+    assert_eq!(
+        refused.payload.first().copied(),
+        Some(RESET_STREAM_LIMIT_EXCEEDED)
+    );
+
+    // The driver publishes on its way back to waiting, so allow a turn.
+    let counts = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let counts = home.refusals();
+            if counts.stream_limit > 0 {
+                return counts;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("a refusal must reach the carrier tally");
+    assert_eq!(counts.stream_limit, 1);
+    assert_eq!(counts.flow_control, 0);
+    assert_eq!(counts.protocol, 0);
+    assert_eq!(counts.internal, 0);
+    drop(held);
 }
 
 #[tokio::test]

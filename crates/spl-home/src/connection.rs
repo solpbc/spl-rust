@@ -6,7 +6,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, Waker};
 
@@ -18,17 +18,47 @@ use tokio_rustls::TlsAcceptor;
 
 use crate::{
     HomeConfig, HomeError, MAX_STAGED_WRITE_BYTES_PER_STREAM, MuxAcceptor, MuxEvent, MuxLimits,
-    MuxOutput, ResetReason,
+    MuxOutput, RefusalCounts, ResetReason,
 };
 
 const STREAM_LIVE: u8 = 0;
 const STREAM_RESET: u8 = 1;
 const STREAM_GONE: u8 = 2;
 
+/// Publishes the driver's acceptor tally for a caller on the other side.
+#[derive(Debug, Default)]
+struct RefusalTally {
+    stream_limit: AtomicU64,
+    flow_control: AtomicU64,
+    protocol: AtomicU64,
+    internal: AtomicU64,
+}
+
+impl RefusalTally {
+    fn publish(&self, counts: RefusalCounts) {
+        self.stream_limit
+            .store(counts.stream_limit, Ordering::Relaxed);
+        self.flow_control
+            .store(counts.flow_control, Ordering::Relaxed);
+        self.protocol.store(counts.protocol, Ordering::Relaxed);
+        self.internal.store(counts.internal, Ordering::Relaxed);
+    }
+
+    fn snapshot(&self) -> RefusalCounts {
+        RefusalCounts {
+            stream_limit: self.stream_limit.load(Ordering::Relaxed),
+            flow_control: self.flow_control.load(Ordering::Relaxed),
+            protocol: self.protocol.load(Ordering::Relaxed),
+            internal: self.internal.load(Ordering::Relaxed),
+        }
+    }
+}
+
 /// One accepted TLS carrier and its listener-owned streams.
 pub struct HomeConnection {
     accepts: mpsc::UnboundedReceiver<HomeStream>,
     commands: mpsc::UnboundedSender<DriverCommand>,
+    refusals: Arc<RefusalTally>,
 }
 
 /// A byte-stream handle for one peer-opened SPL logical stream.
@@ -143,17 +173,31 @@ impl HomeConnection {
         let acceptor = MuxAcceptor::new(limits)?;
         let (accept_tx, accept_rx) = mpsc::unbounded_channel();
         let (command_tx, command_rx) = mpsc::unbounded_channel();
+        let refusals = Arc::new(RefusalTally::default());
         tokio::spawn(run_driver(
             tls,
             acceptor,
             accept_tx,
             command_tx.clone(),
             command_rx,
+            Arc::clone(&refusals),
         ));
         Ok(Self {
             accepts: accept_rx,
             commands: command_tx,
+            refusals,
         })
+    }
+
+    /// Streams this carrier has refused, by class.
+    ///
+    /// Read it when a carrier ends, or alongside a peer-reported failure: a
+    /// nonzero `stream_limit` is the one refusal a well-behaved peer can
+    /// provoke by holding too many concurrent streams, and it is otherwise
+    /// invisible on both sides of the link.
+    #[must_use]
+    pub fn refusals(&self) -> RefusalCounts {
+        self.refusals.snapshot()
     }
 
     /// Wait for the next peer-opened stream.
@@ -389,6 +433,7 @@ async fn run_driver<S>(
     accepts: mpsc::UnboundedSender<HomeStream>,
     command_tx: mpsc::UnboundedSender<DriverCommand>,
     mut commands: mpsc::UnboundedReceiver<DriverCommand>,
+    refusals: Arc<RefusalTally>,
 ) where
     S: AsyncRead + AsyncWrite + Unpin,
 {
@@ -400,6 +445,9 @@ async fn run_driver<S>(
     let mut buffer = [0u8; 8192];
 
     loop {
+        // Publish before parking on the next event, and once more after the
+        // loop, so a caller reading a finished carrier sees its final tally.
+        refusals.publish(acceptor.refusals());
         tokio::select! {
             biased;
             read = reader.read(&mut buffer) => {
@@ -488,6 +536,7 @@ async fn run_driver<S>(
             break;
         }
     }
+    refusals.publish(acceptor.refusals());
     for (_, stream) in streams {
         stream.state.state.store(STREAM_GONE, Ordering::Release);
         let _ = stream.tx.send(StreamSignal::Gone);

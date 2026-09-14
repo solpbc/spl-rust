@@ -9,7 +9,7 @@
 //! Relay pairing ceremony integration coverage over loopback TLS and WebSocket peers.
 
 use std::io;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use base64::Engine as _;
@@ -108,6 +108,11 @@ struct MockState {
     pair_instance_id: Mutex<Option<String>>,
     enroll_status: Mutex<Option<u16>>,
     enroll_hits: AtomicUsize,
+    enroll_hold: AtomicBool,
+    enroll_entered: Arc<tokio::sync::Notify>,
+    enroll_release: Arc<tokio::sync::Notify>,
+    pair_ws_dials: AtomicUsize,
+    inner_tls_accepts: AtomicUsize,
     refresh_status: Mutex<Option<u16>>,
     refresh_hits: AtomicUsize,
     session_dials: AtomicUsize,
@@ -131,6 +136,11 @@ impl MockState {
             pair_instance_id: Mutex::new(None),
             enroll_status: Mutex::new(None),
             enroll_hits: AtomicUsize::new(0),
+            enroll_hold: AtomicBool::new(false),
+            enroll_entered: Arc::new(tokio::sync::Notify::new()),
+            enroll_release: Arc::new(tokio::sync::Notify::new()),
+            pair_ws_dials: AtomicUsize::new(0),
+            inner_tls_accepts: AtomicUsize::new(0),
             refresh_status: Mutex::new(None),
             refresh_hits: AtomicUsize::new(0),
             session_dials: AtomicUsize::new(0),
@@ -217,6 +227,7 @@ async fn handle_ws(tcp: TcpStream, state: Arc<MockState>) -> io::Result<()> {
         *state.dial_authorization.lock().unwrap() = authorization;
         serve_home_carrier(home_side, state).await
     } else {
+        state.pair_ws_dials.fetch_add(1, Ordering::SeqCst);
         serve_home_pair(home_side, state).await
     }
 }
@@ -282,6 +293,10 @@ async fn handle_http(mut tcp: TcpStream, state: Arc<MockState>) -> io::Result<()
     let replacement = state.control_response.lock().unwrap().clone();
     if path == "/enroll/device" {
         state.enroll_hits.fetch_add(1, Ordering::SeqCst);
+        if state.enroll_hold.load(Ordering::SeqCst) {
+            state.enroll_entered.notify_one();
+            state.enroll_release.notified().await;
+        }
         let status = *state.enroll_status.lock().unwrap();
         match status {
             Some(status) => write_json(&mut tcp, status, json!({"error":"rejected"})).await?,
@@ -370,6 +385,7 @@ where
 async fn serve_home_pair(stream: DuplexStream, state: Arc<MockState>) -> io::Result<()> {
     let acceptor = TlsAcceptor::from(Arc::new(leaf_config(state.tls_signer.as_ref())));
     let mut tls = acceptor.accept(stream).await.map_err(io::Error::other)?;
+    state.inner_tls_accepts.fetch_add(1, Ordering::SeqCst);
     let request = read_pl_request(&mut tls).await?;
 
     if let HomeMode::Reject { status, body } = &state.home_mode {
@@ -1106,11 +1122,411 @@ async fn pair_over_relay_observed_records_path_attempts_and_events() {
     .unwrap();
 
     assert_eq!(credential.relay_origin.as_deref(), Some(origin.as_str()));
-    assert_eq!(obs.dial_attempts(), 2);
+    assert_eq!(state.pair_ws_dials.load(Ordering::SeqCst), 1);
+    assert_eq!(state.inner_tls_accepts.load(Ordering::SeqCst), 1);
+    assert_eq!(state.enroll_hits.load(Ordering::SeqCst), 1);
+    assert_eq!(obs.dial_attempts(), 3);
+    assert_eq!(obs.direct_successes(), 0);
+    assert_eq!(obs.relay_successes(), 2);
     assert_eq!(obs.enrollment_events(), 1);
+    assert!(obs.legacy_enrollment_possible());
     assert_eq!(
         obs.selected_path(),
         Some(spl_transport::SelectedPath::Relay)
     );
     assert_eq!(obs.request_bytes_sent(), 0);
+    assert!(!obs.close_completed());
+    assert_eq!(
+        obs.snapshot(),
+        spl_transport::OperationSnapshot {
+            dial_attempts: 3,
+            direct_successes: 0,
+            relay_successes: 2,
+            request_bytes_sent: 0,
+            close_completed: false,
+            selected_path: Some(spl_transport::SelectedPath::Relay),
+            enrollment_events: 1,
+            legacy_enrollment_possible: true,
+        }
+    );
+}
+
+#[tokio::test]
+#[expect(
+    clippy::large_futures,
+    reason = "the copied transport future keeps its established stack layout; this site goes red if a later refactor shrinks it"
+)]
+async fn pair_over_relay_observed_v2_enrollment_clears_legacy_possible() {
+    let state = Arc::new(MockState::normal().with_same_tls_ca());
+    let origin = spawn_mock_relay(state.clone()).await;
+    let instance = jid_for_ca(&state.json_ca);
+    let token = v2_token(&instance);
+    *state.control_response.lock().unwrap() = Some(json!({
+        "protocol_version": 2,
+        "device_token": token,
+        "expires_at": "2100-01-01T00:00:00Z",
+    }));
+    let link = relay_link(origin.clone(), state.json_ca.spki_pin());
+
+    let obs = spl_transport::OperationObserver::new();
+    let credential = spl_transport::pair_over_relay_observed(
+        &link,
+        "win-test-v2",
+        &serde_json::Map::new(),
+        Some(&obs),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(credential.relay_origin.as_deref(), Some(origin.as_str()));
+    assert_eq!(state.pair_ws_dials.load(Ordering::SeqCst), 1);
+    assert_eq!(state.inner_tls_accepts.load(Ordering::SeqCst), 1);
+    assert_eq!(state.enroll_hits.load(Ordering::SeqCst), 1);
+    assert_eq!(obs.dial_attempts(), 3);
+    assert_eq!(obs.direct_successes(), 0);
+    assert_eq!(obs.relay_successes(), 2);
+    assert_eq!(obs.enrollment_events(), 1);
+    assert!(!obs.legacy_enrollment_possible());
+    assert_eq!(
+        obs.selected_path(),
+        Some(spl_transport::SelectedPath::Relay)
+    );
+}
+
+#[tokio::test]
+#[expect(
+    clippy::large_futures,
+    reason = "the copied transport future keeps its established stack layout; this site goes red if a later refactor shrinks it"
+)]
+async fn pair_over_relay_observed_bootstrap_records_no_enrollment_and_no_legacy_flag() {
+    let state = Arc::new(MockState::normal().with_same_tls_ca());
+    let origin = spawn_mock_relay(state.clone()).await;
+    let instance = jid_for_ca(&state.json_ca);
+    let token = v2_token(&instance);
+    *state.bootstrap.lock().unwrap() = Some(json!({
+        "protocol_version": 2,
+        "status": "ready",
+        "relay_origin": origin,
+        "instance_id": instance,
+        "device_token": token,
+        "expires_at": "2100-01-01T00:00:00Z",
+    }));
+    let link = relay_link(origin.clone(), state.json_ca.spki_pin());
+
+    let obs = spl_transport::OperationObserver::new();
+    let credential = spl_transport::pair_over_relay_observed(
+        &link,
+        "win-test-boot",
+        &serde_json::Map::new(),
+        Some(&obs),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(credential.relay_origin.as_deref(), Some(origin.as_str()));
+    assert_eq!(state.pair_ws_dials.load(Ordering::SeqCst), 1);
+    assert_eq!(state.inner_tls_accepts.load(Ordering::SeqCst), 1);
+    assert_eq!(state.enroll_hits.load(Ordering::SeqCst), 0);
+    assert_eq!(obs.dial_attempts(), 2);
+    assert_eq!(obs.direct_successes(), 0);
+    assert_eq!(obs.relay_successes(), 1);
+    assert_eq!(obs.enrollment_events(), 0);
+    assert!(!obs.legacy_enrollment_possible());
+    assert_eq!(
+        obs.selected_path(),
+        Some(spl_transport::SelectedPath::Relay)
+    );
+}
+
+#[tokio::test]
+#[expect(
+    clippy::large_futures,
+    reason = "the copied transport future keeps its established stack layout; this site goes red if a later refactor shrinks it"
+)]
+async fn pair_over_relay_observed_non_2xx_sets_success_not_path() {
+    let mut state = MockState::normal().with_same_tls_ca();
+    state.home_mode = HomeMode::Reject {
+        status: 500,
+        body: b"internal error",
+    };
+    let state = Arc::new(state);
+    let origin = spawn_mock_relay(state.clone()).await;
+    let link = relay_link(origin.clone(), state.json_ca.spki_pin());
+
+    let obs = spl_transport::OperationObserver::new();
+    let result = spl_transport::pair_over_relay_observed(
+        &link,
+        "win-test-fail",
+        &serde_json::Map::new(),
+        Some(&obs),
+    )
+    .await;
+
+    assert!(result.is_err());
+    assert_eq!(state.pair_ws_dials.load(Ordering::SeqCst), 1);
+    assert_eq!(state.inner_tls_accepts.load(Ordering::SeqCst), 1);
+    assert_eq!(state.enroll_hits.load(Ordering::SeqCst), 0);
+    assert_eq!(obs.dial_attempts(), 2);
+    assert_eq!(obs.direct_successes(), 0);
+    assert_eq!(obs.relay_successes(), 1);
+    assert_eq!(obs.enrollment_events(), 0);
+    assert!(!obs.legacy_enrollment_possible());
+    assert_eq!(obs.selected_path(), None);
+}
+
+#[tokio::test]
+#[expect(
+    clippy::large_futures,
+    reason = "the copied transport future keeps its established stack layout; this site goes red if a later refactor shrinks it"
+)]
+async fn pair_over_relay_observed_broken_carrier_sets_no_success_and_path_none() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let origin = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move {
+        while let Ok((tcp, _)) = listener.accept().await {
+            // Accept WS but immediately drop without piping or serving TLS
+            if let Ok(ws) = accept_async(tcp).await {
+                drop(ws);
+            }
+        }
+    });
+
+    let ca = TestCa::new();
+    let link = relay_link(origin, ca.spki_pin());
+    let obs = spl_transport::OperationObserver::new();
+    let result = spl_transport::pair_over_relay_observed(
+        &link,
+        "win-test-broken",
+        &serde_json::Map::new(),
+        Some(&obs),
+    )
+    .await;
+
+    assert!(result.is_err());
+    assert_eq!(obs.dial_attempts(), 2);
+    assert_eq!(obs.direct_successes(), 0);
+    assert_eq!(obs.relay_successes(), 0);
+    assert_eq!(obs.selected_path(), None);
+}
+
+#[tokio::test]
+#[expect(
+    clippy::large_futures,
+    reason = "the copied transport future keeps its established stack layout; this site goes red if a later refactor shrinks it"
+)]
+async fn pair_over_relay_observed_missing_attestation_skips_enroll() {
+    let mut state = MockState::normal().with_same_tls_ca();
+    state.home_mode = HomeMode::MissingHomeAttestation;
+    let state = Arc::new(state);
+    let origin = spawn_mock_relay(state.clone()).await;
+    let link = relay_link(origin.clone(), state.json_ca.spki_pin());
+
+    let obs = spl_transport::OperationObserver::new();
+    let credential = spl_transport::pair_over_relay_observed(
+        &link,
+        "win-no-attest",
+        &serde_json::Map::new(),
+        Some(&obs),
+    )
+    .await
+    .unwrap();
+
+    assert!(credential.relay_origin.is_none());
+    assert!(credential.device_token.is_none());
+    assert_eq!(state.pair_ws_dials.load(Ordering::SeqCst), 1);
+    assert_eq!(state.inner_tls_accepts.load(Ordering::SeqCst), 1);
+    assert_eq!(state.enroll_hits.load(Ordering::SeqCst), 0);
+    assert_eq!(obs.dial_attempts(), 2);
+    assert_eq!(obs.direct_successes(), 0);
+    assert_eq!(obs.relay_successes(), 1);
+    assert_eq!(obs.enrollment_events(), 0);
+    assert!(!obs.legacy_enrollment_possible());
+    assert_eq!(
+        obs.selected_path(),
+        Some(spl_transport::SelectedPath::Relay)
+    );
+}
+
+#[tokio::test]
+#[expect(
+    clippy::large_futures,
+    reason = "the copied transport future keeps its established stack layout; this site goes red if a later refactor shrinks it"
+)]
+async fn pair_over_relay_observed_inner_malformed_sets_success_not_path() {
+    let mut state = MockState::normal().with_same_tls_ca();
+    state.home_mode = HomeMode::Reject {
+        status: 200,
+        body: b"not-json",
+    };
+    let state = Arc::new(state);
+    let origin = spawn_mock_relay(state.clone()).await;
+    let link = relay_link(origin.clone(), state.json_ca.spki_pin());
+
+    let obs = spl_transport::OperationObserver::new();
+    let result = spl_transport::pair_over_relay_observed(
+        &link,
+        "win-malformed",
+        &serde_json::Map::new(),
+        Some(&obs),
+    )
+    .await;
+
+    assert!(result.is_err());
+    assert_eq!(state.pair_ws_dials.load(Ordering::SeqCst), 1);
+    assert_eq!(state.inner_tls_accepts.load(Ordering::SeqCst), 1);
+    assert_eq!(state.enroll_hits.load(Ordering::SeqCst), 0);
+    assert_eq!(obs.dial_attempts(), 2);
+    assert_eq!(obs.direct_successes(), 0);
+    assert_eq!(obs.relay_successes(), 1);
+    assert_eq!(obs.selected_path(), None);
+}
+
+#[tokio::test]
+#[expect(
+    clippy::large_futures,
+    reason = "the copied transport future keeps its established stack layout; this site goes red if a later refactor shrinks it"
+)]
+async fn pair_over_relay_observed_unrelated_key_sets_success_not_path() {
+    let mut state = MockState::normal().with_same_tls_ca();
+    state.home_mode = HomeMode::UnrelatedClientKey;
+    let state = Arc::new(state);
+    let origin = spawn_mock_relay(state.clone()).await;
+    let link = relay_link(origin.clone(), state.json_ca.spki_pin());
+
+    let obs = spl_transport::OperationObserver::new();
+    let result = spl_transport::pair_over_relay_observed(
+        &link,
+        "win-unrelated",
+        &serde_json::Map::new(),
+        Some(&obs),
+    )
+    .await;
+
+    assert!(result.is_err());
+    assert_eq!(state.pair_ws_dials.load(Ordering::SeqCst), 1);
+    assert_eq!(state.inner_tls_accepts.load(Ordering::SeqCst), 1);
+    assert_eq!(state.enroll_hits.load(Ordering::SeqCst), 0);
+    assert_eq!(obs.dial_attempts(), 2);
+    assert_eq!(obs.direct_successes(), 0);
+    assert_eq!(obs.relay_successes(), 1);
+    assert_eq!(obs.selected_path(), None);
+}
+
+#[tokio::test]
+#[expect(
+    clippy::large_futures,
+    reason = "the copied transport future keeps its established stack layout; this site goes red if a later refactor shrinks it"
+)]
+async fn pair_over_relay_observed_enroll_rejected_keeps_residue_and_path() {
+    let state = Arc::new(MockState::normal().with_same_tls_ca());
+    *state.enroll_status.lock().unwrap() = Some(409);
+    let origin = spawn_mock_relay(state.clone()).await;
+    let link = relay_link(origin.clone(), state.json_ca.spki_pin());
+
+    let obs = spl_transport::OperationObserver::new();
+    let credential = spl_transport::pair_over_relay_observed(
+        &link,
+        "win-enroll-reject",
+        &serde_json::Map::new(),
+        Some(&obs),
+    )
+    .await
+    .unwrap();
+
+    assert!(credential.relay_origin.is_none());
+    assert!(credential.device_token.is_none());
+    assert_eq!(state.pair_ws_dials.load(Ordering::SeqCst), 1);
+    assert_eq!(state.inner_tls_accepts.load(Ordering::SeqCst), 1);
+    assert_eq!(state.enroll_hits.load(Ordering::SeqCst), 1);
+    assert_eq!(obs.dial_attempts(), 3);
+    assert_eq!(obs.direct_successes(), 0);
+    assert_eq!(obs.relay_successes(), 2);
+    assert_eq!(obs.enrollment_events(), 1);
+    assert!(obs.legacy_enrollment_possible());
+    assert_eq!(
+        obs.selected_path(),
+        Some(spl_transport::SelectedPath::Relay)
+    );
+}
+
+#[tokio::test]
+#[expect(
+    clippy::large_futures,
+    reason = "the copied transport future keeps its established stack layout; this site goes red if a later refactor shrinks it"
+)]
+async fn pair_over_relay_observed_enroll_malformed_keeps_residue_and_path() {
+    let state = Arc::new(MockState::normal().with_same_tls_ca());
+    *state.control_response.lock().unwrap() = Some(json!({"invalid": true}));
+    let origin = spawn_mock_relay(state.clone()).await;
+    let link = relay_link(origin.clone(), state.json_ca.spki_pin());
+
+    let obs = spl_transport::OperationObserver::new();
+    let credential = spl_transport::pair_over_relay_observed(
+        &link,
+        "win-enroll-malformed",
+        &serde_json::Map::new(),
+        Some(&obs),
+    )
+    .await
+    .unwrap();
+
+    assert!(credential.relay_origin.is_none());
+    assert!(credential.device_token.is_none());
+    assert_eq!(state.pair_ws_dials.load(Ordering::SeqCst), 1);
+    assert_eq!(state.inner_tls_accepts.load(Ordering::SeqCst), 1);
+    assert_eq!(state.enroll_hits.load(Ordering::SeqCst), 1);
+    assert_eq!(obs.dial_attempts(), 3);
+    assert_eq!(obs.direct_successes(), 0);
+    assert_eq!(obs.relay_successes(), 2);
+    assert_eq!(obs.enrollment_events(), 1);
+    assert!(obs.legacy_enrollment_possible());
+    assert_eq!(
+        obs.selected_path(),
+        Some(spl_transport::SelectedPath::Relay)
+    );
+}
+
+#[tokio::test]
+#[expect(
+    clippy::large_futures,
+    reason = "the copied transport future keeps its established stack layout; this site goes red if a later refactor shrinks it"
+)]
+async fn pair_over_relay_observed_cancel_during_enroll_leaves_path_unset() {
+    let state = Arc::new(MockState::normal().with_same_tls_ca());
+    state.enroll_hold.store(true, Ordering::SeqCst);
+    let origin = spawn_mock_relay(state.clone()).await;
+    let link = relay_link(origin.clone(), state.json_ca.spki_pin());
+
+    let obs = Arc::new(spl_transport::OperationObserver::new());
+    let obs_clone = obs.clone();
+    let task = tokio::spawn(async move {
+        spl_transport::pair_over_relay_observed(
+            &link,
+            "win-cancel",
+            &serde_json::Map::new(),
+            Some(&obs_clone),
+        )
+        .await
+    });
+
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        state.enroll_entered.notified(),
+    )
+    .await
+    .unwrap();
+
+    task.abort();
+    let result = task.await;
+    assert!(result.unwrap_err().is_cancelled());
+
+    assert_eq!(state.pair_ws_dials.load(Ordering::SeqCst), 1);
+    assert_eq!(state.inner_tls_accepts.load(Ordering::SeqCst), 1);
+    assert_eq!(state.enroll_hits.load(Ordering::SeqCst), 1);
+    assert_eq!(obs.dial_attempts(), 3);
+    assert_eq!(obs.direct_successes(), 0);
+    assert_eq!(obs.relay_successes(), 1);
+    assert_eq!(obs.enrollment_events(), 1);
+    assert!(obs.legacy_enrollment_possible());
+    assert_eq!(obs.selected_path(), None);
 }

@@ -904,6 +904,7 @@ fn assert_relay_error<T>(result: Result<T, TransportError>, expected: RelayError
 #[derive(Clone)]
 enum CombinedWsMode {
     AcceptAny,
+    ServeStatus(&'static str, &'static [u8]),
     FreshOnly,
     AlwaysUnauthorized,
     Close(u16),
@@ -1054,6 +1055,7 @@ async fn handle_combined_ws(tcp: TcpStream, state: Arc<CombinedRelayState>) -> i
     };
     match &mode {
         CombinedWsMode::AcceptAny
+        | CombinedWsMode::ServeStatus(_, _)
         | CombinedWsMode::InnerAlert(_)
         | CombinedWsMode::DropAfterInnerRead
         | CombinedWsMode::DropOnceAfterInnerRead(_) => {}
@@ -1126,13 +1128,12 @@ async fn handle_combined_ws(tcp: TcpStream, state: Arc<CombinedRelayState>) -> i
         let _ = tls.shutdown().await;
         return Ok(());
     }
-    let request = serve_stream_response(
-        server_side,
-        state.acceptor.clone(),
-        "200 OK",
-        b"{\"status\":\"ok\"}",
-    )
-    .await;
+    let (status_line, resp_body): (&str, &[u8]) = match &mode {
+        CombinedWsMode::ServeStatus(status, body) => (*status, *body),
+        _ => ("200 OK", b"{\"status\":\"ok\"}"),
+    };
+    let request =
+        serve_stream_response(server_side, state.acceptor.clone(), status_line, resp_body).await;
     state.inner_requests.lock().unwrap().push(request);
     Ok(())
 }
@@ -2387,11 +2388,29 @@ async fn relay_request_with_observer_records_path_attempts_and_bytes() {
     assert_eq!(outcome.path, spl_transport::SelectedPath::Relay);
     assert_eq!(outcome.attempts, 1);
     assert_eq!(obs.dial_attempts(), 1);
+    assert_eq!(obs.direct_successes(), 0);
+    assert_eq!(obs.relay_successes(), 1);
     assert_eq!(
         obs.selected_path(),
         Some(spl_transport::SelectedPath::Relay)
     );
     assert!(obs.request_bytes_sent() > 0);
+    assert!(obs.close_completed());
+    assert!(!obs.legacy_enrollment_possible());
+    assert_eq!(obs.enrollment_events(), 0);
+    assert_eq!(
+        obs.snapshot(),
+        spl_transport::OperationSnapshot {
+            dial_attempts: 1,
+            direct_successes: 0,
+            relay_successes: 1,
+            request_bytes_sent: obs.request_bytes_sent(),
+            close_completed: true,
+            selected_path: Some(spl_transport::SelectedPath::Relay),
+            enrollment_events: 0,
+            legacy_enrollment_possible: false,
+        }
+    );
 
     relay.abort();
 }
@@ -2795,7 +2814,82 @@ async fn relay_request_replay_unsafe_after_partial_write() {
     assert!(matches!(err, spl_transport::RequestError::ReplayUnsafe(_)));
     assert_eq!(relay.state.ws_dials.load(Ordering::SeqCst), 1);
     assert_eq!(obs.dial_attempts(), 1);
+    assert_eq!(obs.direct_successes(), 0);
+    assert_eq!(obs.relay_successes(), 0);
+    assert_eq!(obs.selected_path(), None);
     relay.abort();
+}
+
+#[tokio::test]
+#[expect(
+    clippy::large_futures,
+    reason = "the copied transport future keeps its established stack layout; this site goes red if a later refactor shrinks it"
+)]
+async fn relay_request_observed_http_404_and_500_select_path() {
+    let (pin, acceptor) = tls_pair_with_pin();
+    let now = epoch_secs();
+    let token = mint_jwt(now, now + 10_000);
+    let relay = spawn_combined_relay(
+        acceptor.clone(),
+        CombinedWsMode::ServeStatus("404 Not Found", b"{\"error\":\"not_found\"}"),
+        token.clone(),
+    )
+    .await;
+    let cred = relay_only_credential(pin.clone(), relay.origin.clone(), token.clone());
+    let client = TransportClient::new_relay_only(cred, None).unwrap();
+    let obs = spl_transport::OperationObserver::new();
+    let options = spl_transport::RequestOptions {
+        response_cap: 1024 * 1024,
+        replay: spl_transport::ReplayPolicy::ForbidAfterWrite,
+        observer: Some(&obs),
+    };
+
+    let outcome = client
+        .request("GET", "/test-404", &[], b"", options)
+        .await
+        .unwrap();
+
+    assert_eq!(outcome.response.status, 404);
+    assert_eq!(outcome.path, spl_transport::SelectedPath::Relay);
+    assert_eq!(obs.dial_attempts(), 1);
+    assert_eq!(obs.direct_successes(), 0);
+    assert_eq!(obs.relay_successes(), 1);
+    assert_eq!(
+        obs.selected_path(),
+        Some(spl_transport::SelectedPath::Relay)
+    );
+    relay.abort();
+
+    let relay500 = spawn_combined_relay(
+        acceptor,
+        CombinedWsMode::ServeStatus("500 Internal Server Error", b"{\"error\":\"server_error\"}"),
+        token.clone(),
+    )
+    .await;
+    let cred500 = relay_only_credential(pin, relay500.origin.clone(), token);
+    let client500 = TransportClient::new_relay_only(cred500, None).unwrap();
+    let obs500 = spl_transport::OperationObserver::new();
+    let options500 = spl_transport::RequestOptions {
+        response_cap: 1024 * 1024,
+        replay: spl_transport::ReplayPolicy::ForbidAfterWrite,
+        observer: Some(&obs500),
+    };
+
+    let outcome500 = client500
+        .request("GET", "/test-500", &[], b"", options500)
+        .await
+        .unwrap();
+
+    assert_eq!(outcome500.response.status, 500);
+    assert_eq!(outcome500.path, spl_transport::SelectedPath::Relay);
+    assert_eq!(obs500.dial_attempts(), 1);
+    assert_eq!(obs500.direct_successes(), 0);
+    assert_eq!(obs500.relay_successes(), 1);
+    assert_eq!(
+        obs500.selected_path(),
+        Some(spl_transport::SelectedPath::Relay)
+    );
+    relay500.abort();
 }
 
 #[tokio::test]
@@ -3913,12 +4007,80 @@ async fn open_carrier_canonical_mixed_six_attempts_with_observer() {
 
     // 5 LAN retries + 1 relay dial = 6
     assert_eq!(obs.dial_attempts(), 6);
+    assert_eq!(obs.direct_successes(), 0);
+    assert_eq!(obs.relay_successes(), 1);
     assert_eq!(
         obs.selected_path(),
         Some(spl_transport::SelectedPath::Relay)
     );
     assert_eq!(relay.state.refreshes.load(Ordering::SeqCst), 1);
     assert_eq!(relay.state.ws_dials.load(Ordering::SeqCst), 1);
+
+    relay.abort();
+}
+
+#[tokio::test]
+#[expect(
+    clippy::large_futures,
+    reason = "the copied transport future keeps its established stack layout; this site goes red if a later refactor shrinks it"
+)]
+async fn open_carrier_observer_mixed_direct_then_relay_accumulates() {
+    let (pin, acceptor) = tls_pair_with_pin();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let lan_accepts = Arc::new(AtomicUsize::new(0));
+    let lan_accepts_clone = lan_accepts.clone();
+    let acceptor_clone = acceptor.clone();
+    tokio::spawn(async move {
+        while let Ok((tcp, _)) = listener.accept().await {
+            lan_accepts_clone.fetch_add(1, Ordering::SeqCst);
+            let acceptor = acceptor_clone.clone();
+            tokio::spawn(async move {
+                if let Ok(mut tls) = acceptor.accept(tcp).await {
+                    let mut buf = [0u8; 1024];
+                    let _ = tls.read(&mut buf).await;
+                }
+            });
+        }
+    });
+
+    let mut cred_direct =
+        relay_credential(pin.clone(), port, "http://unused".into(), String::new());
+    cred_direct.relay_origin = None;
+    cred_direct.device_token = None;
+    let client_direct = TransportClient::new(cred_direct, None).unwrap();
+    let obs = spl_transport::OperationObserver::new();
+
+    let carrier1 = client_direct.open_carrier(Some(&obs)).await.unwrap();
+    drop(carrier1);
+
+    assert_eq!(lan_accepts.load(Ordering::SeqCst), 1);
+    assert_eq!(obs.dial_attempts(), 1);
+    assert_eq!(obs.direct_successes(), 1);
+    assert_eq!(obs.relay_successes(), 0);
+    assert_eq!(
+        obs.selected_path(),
+        Some(spl_transport::SelectedPath::Direct)
+    );
+
+    let now = epoch_secs();
+    let token = mint_jwt(now, now + 10_000);
+    let relay = spawn_combined_relay(acceptor, CombinedWsMode::AcceptAny, token.clone()).await;
+    let cred_relay = relay_only_credential(pin, relay.origin.clone(), token);
+    let client_relay = TransportClient::new_relay_only(cred_relay, None).unwrap();
+
+    let carrier2 = client_relay.open_carrier(Some(&obs)).await.unwrap();
+    drop(carrier2);
+
+    assert_eq!(lan_accepts.load(Ordering::SeqCst), 1);
+    assert_eq!(relay.state.ws_dials.load(Ordering::SeqCst), 1);
+    assert_eq!(obs.dial_attempts(), 2);
+    assert_eq!(obs.direct_successes(), 1);
+    assert_eq!(obs.relay_successes(), 1);
+    assert_eq!(
+        obs.selected_path(),
+        Some(spl_transport::SelectedPath::Relay)
+    );
 
     relay.abort();
 }
@@ -3945,6 +4107,8 @@ async fn open_carrier_observer_counts_match_ws_dials_not_tcp_accepts() {
     assert_eq!(relay.state.tcp_accepts.load(Ordering::SeqCst), 2);
     assert_eq!(relay.state.ws_dials.load(Ordering::SeqCst), 1);
     assert_eq!(obs.dial_attempts(), 1);
+    assert_eq!(obs.direct_successes(), 0);
+    assert_eq!(obs.relay_successes(), 1);
     assert_eq!(
         obs.selected_path(),
         Some(spl_transport::SelectedPath::Relay)
@@ -3983,6 +4147,8 @@ async fn open_carrier_failed_and_denied_dials_leave_selected_path_unset() {
     let _ = client.open_carrier(Some(&obs1)).await;
     assert_eq!(obs1.selected_path(), None);
     assert_eq!(obs1.dial_attempts(), 5);
+    assert_eq!(obs1.direct_successes(), 0);
+    assert_eq!(obs1.relay_successes(), 0);
 
     // 2. Fence denial
     let cred2 = relay_only_credential(
@@ -4007,6 +4173,8 @@ async fn open_carrier_failed_and_denied_dials_leave_selected_path_unset() {
     let _ = client2.open_carrier(Some(&obs2)).await;
     assert_eq!(obs2.selected_path(), None);
     assert_eq!(obs2.dial_attempts(), 0);
+    assert_eq!(obs2.direct_successes(), 0);
+    assert_eq!(obs2.relay_successes(), 0);
 
     // 3. Terminal relay error
     let (_pin3, acceptor3) = tls_pair_with_pin();
@@ -4017,6 +4185,8 @@ async fn open_carrier_failed_and_denied_dials_leave_selected_path_unset() {
     let _ = client3.open_carrier(Some(&obs3)).await;
     assert_eq!(obs3.selected_path(), None);
     assert_eq!(obs3.dial_attempts(), 1);
+    assert_eq!(obs3.direct_successes(), 0);
+    assert_eq!(obs3.relay_successes(), 0);
     relay.abort();
 }
 

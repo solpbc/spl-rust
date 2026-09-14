@@ -314,14 +314,18 @@ fn pair_response_body(
     .unwrap()
 }
 
-async fn serve_one_pair_response(
+async fn serve_one_pair_response_counted(
     listener: TcpListener,
     acceptor: TlsAcceptor,
     signing_cert: rcgen::Certificate,
     signing_key: KeyPair,
     mode: PairCertificateMode,
+    accepts: Option<Arc<AtomicUsize>>,
 ) -> Vec<u8> {
     let (tcp, _) = listener.accept().await.unwrap();
+    if let Some(ref c) = accepts {
+        c.fetch_add(1, Ordering::SeqCst);
+    }
     let mut tls = acceptor.accept(tcp).await.unwrap();
     let (stream_id, request) = read_framed_request(&mut tls).await;
     let pair_request: spl_core::PairRequest =
@@ -329,6 +333,41 @@ async fn serve_one_pair_response(
     let response_body = pair_response_body(&pair_request, &signing_cert, &signing_key, mode);
     let response = format!(
         "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+        response_body.len(),
+        String::from_utf8_lossy(&response_body)
+    );
+    let frame = Frame::new(stream_id, FLAG_DATA | FLAG_CLOSE, response.into_bytes());
+    tls.write_all(&frame.encode().unwrap()).await.unwrap();
+    tls.flush().await.unwrap();
+    let _ = tls.shutdown().await;
+    request
+}
+
+async fn serve_one_pair_response(
+    listener: TcpListener,
+    acceptor: TlsAcceptor,
+    signing_cert: rcgen::Certificate,
+    signing_key: KeyPair,
+    mode: PairCertificateMode,
+) -> Vec<u8> {
+    serve_one_pair_response_counted(listener, acceptor, signing_cert, signing_key, mode, None).await
+}
+
+async fn serve_one_custom_pair_response_counted(
+    listener: TcpListener,
+    acceptor: TlsAcceptor,
+    status: &str,
+    response_body: Vec<u8>,
+    accepts: Option<Arc<AtomicUsize>>,
+) -> Vec<u8> {
+    let (tcp, _) = listener.accept().await.unwrap();
+    if let Some(ref c) = accepts {
+        c.fetch_add(1, Ordering::SeqCst);
+    }
+    let mut tls = acceptor.accept(tcp).await.unwrap();
+    let (stream_id, request) = read_framed_request(&mut tls).await;
+    let response = format!(
+        "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
         response_body.len(),
         String::from_utf8_lossy(&response_body)
     );
@@ -3585,12 +3624,29 @@ async fn transport_client_request_direct_with_observer() {
     assert_eq!(outcome.path, spl_transport::SelectedPath::Direct);
     assert_eq!(outcome.attempts, 1);
     assert_eq!(obs.dial_attempts(), 1);
+    assert_eq!(obs.direct_successes(), 1);
+    assert_eq!(obs.relay_successes(), 0);
     assert_eq!(
         obs.selected_path(),
         Some(spl_transport::SelectedPath::Direct)
     );
     assert!(obs.request_bytes_sent() > 0);
     assert!(obs.close_completed());
+    assert!(!obs.legacy_enrollment_possible());
+    assert_eq!(obs.enrollment_events(), 0);
+    assert_eq!(
+        obs.snapshot(),
+        spl_transport::OperationSnapshot {
+            dial_attempts: 1,
+            direct_successes: 1,
+            relay_successes: 0,
+            request_bytes_sent: obs.request_bytes_sent(),
+            close_completed: true,
+            selected_path: Some(spl_transport::SelectedPath::Direct),
+            enrollment_events: 0,
+            legacy_enrollment_possible: false,
+        }
+    );
 
     server.await.unwrap();
 }
@@ -3906,6 +3962,7 @@ async fn transport_client_request_early_413_path_selected_and_close_not_complete
 
     assert_eq!(outcome.response.status, 413);
     assert_eq!(outcome.path, spl_transport::SelectedPath::Direct);
+    assert_eq!(obs.direct_successes(), 1);
     assert_eq!(
         obs.selected_path(),
         Some(spl_transport::SelectedPath::Direct)
@@ -3946,6 +4003,7 @@ async fn transport_client_request_http_404_and_500_select_path() {
         .unwrap();
     assert_eq!(outcome_404.response.status, 404);
     assert_eq!(outcome_404.path, spl_transport::SelectedPath::Direct);
+    assert_eq!(obs_404.direct_successes(), 1);
     assert_eq!(
         obs_404.selected_path(),
         Some(spl_transport::SelectedPath::Direct)
@@ -3978,6 +4036,7 @@ async fn transport_client_request_http_404_and_500_select_path() {
         .unwrap();
     assert_eq!(outcome_500.response.status, 500);
     assert_eq!(outcome_500.path, spl_transport::SelectedPath::Direct);
+    assert_eq!(obs_500.direct_successes(), 1);
     assert_eq!(
         obs_500.selected_path(),
         Some(spl_transport::SelectedPath::Direct)
@@ -4006,12 +4065,15 @@ async fn direct_pair_observed_multiple_candidates_records_attempts_and_path() {
     // Second candidate is valid
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let valid_port = listener.local_addr().unwrap().port();
-    let server = tokio::spawn(serve_one_pair_response(
+    let accepts = Arc::new(AtomicUsize::new(0));
+    let accepts_clone = accepts.clone();
+    let server = tokio::spawn(serve_one_pair_response_counted(
         listener,
         acceptor,
         signing_cert,
         signing_key,
         PairCertificateMode::SubmittedCsr,
+        Some(accepts_clone),
     ));
 
     let nonce = PAIR_EXAMPLE_NONCE;
@@ -4040,12 +4102,220 @@ async fn direct_pair_observed_multiple_candidates_records_attempts_and_path() {
     .unwrap();
 
     assert_eq!(credential.instance_id, PAIR_EXAMPLE_INSTANCE_ID);
+    assert_eq!(accepts.load(Ordering::SeqCst), 1);
     assert_eq!(obs.dial_attempts(), 2);
+    assert_eq!(obs.direct_successes(), 1);
+    assert_eq!(obs.relay_successes(), 0);
     assert_eq!(
         obs.selected_path(),
         Some(spl_transport::SelectedPath::Direct)
     );
     assert_eq!(obs.request_bytes_sent(), 0);
+    assert!(!obs.legacy_enrollment_possible());
+    assert_eq!(
+        obs.snapshot(),
+        spl_transport::OperationSnapshot {
+            dial_attempts: 2,
+            direct_successes: 1,
+            relay_successes: 0,
+            request_bytes_sent: 0,
+            close_completed: false,
+            selected_path: Some(spl_transport::SelectedPath::Direct),
+            enrollment_events: 0,
+            legacy_enrollment_possible: false,
+        }
+    );
+
+    server.await.unwrap();
+}
+
+#[tokio::test]
+async fn direct_pair_observed_non_2xx_sets_success_not_path() {
+    let (server_cert, server_key) = self_signed();
+    let server_pin = spl_core::ca::sha256(server_cert.as_ref())[..16].to_vec();
+    let acceptor = TlsAcceptor::from(Arc::new(server_config(server_cert, server_key)));
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+
+    let accepts = Arc::new(AtomicUsize::new(0));
+    let accepts_clone = accepts.clone();
+    let server = tokio::spawn(serve_one_custom_pair_response_counted(
+        listener,
+        acceptor,
+        "403 Forbidden",
+        b"{\"error\":\"forbidden\"}".to_vec(),
+        Some(accepts_clone),
+    ));
+
+    let nonce = PAIR_EXAMPLE_NONCE;
+    let label = PAIR_EXAMPLE_DEVICE_LABEL;
+    let endpoints = [spl_core::pairlink::Endpoint {
+        host: "127.0.0.1".to_owned(),
+        port,
+    }];
+
+    let obs = spl_transport::OperationObserver::new();
+    let result = spl_transport::pairing::pair_observed(
+        &endpoints,
+        nonce,
+        &server_pin,
+        label,
+        &serde_json::Map::new(),
+        Some(&obs),
+    )
+    .await;
+
+    assert!(result.is_err());
+    assert_eq!(accepts.load(Ordering::SeqCst), 1);
+    assert_eq!(obs.dial_attempts(), 1);
+    assert_eq!(obs.direct_successes(), 1);
+    assert_eq!(obs.relay_successes(), 0);
+    assert_eq!(obs.selected_path(), None);
+    assert!(!obs.legacy_enrollment_possible());
+
+    server.await.unwrap();
+}
+
+#[tokio::test]
+async fn direct_pair_observed_malformed_body_sets_success_not_path() {
+    let (server_cert, server_key) = self_signed();
+    let server_pin = spl_core::ca::sha256(server_cert.as_ref())[..16].to_vec();
+    let acceptor = TlsAcceptor::from(Arc::new(server_config(server_cert, server_key)));
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+
+    let accepts = Arc::new(AtomicUsize::new(0));
+    let accepts_clone = accepts.clone();
+    let server = tokio::spawn(serve_one_custom_pair_response_counted(
+        listener,
+        acceptor,
+        "200 OK",
+        b"not-json-content".to_vec(),
+        Some(accepts_clone),
+    ));
+
+    let nonce = PAIR_EXAMPLE_NONCE;
+    let label = PAIR_EXAMPLE_DEVICE_LABEL;
+    let endpoints = [spl_core::pairlink::Endpoint {
+        host: "127.0.0.1".to_owned(),
+        port,
+    }];
+
+    let obs = spl_transport::OperationObserver::new();
+    let result = spl_transport::pairing::pair_observed(
+        &endpoints,
+        nonce,
+        &server_pin,
+        label,
+        &serde_json::Map::new(),
+        Some(&obs),
+    )
+    .await;
+
+    assert!(result.is_err());
+    assert_eq!(accepts.load(Ordering::SeqCst), 1);
+    assert_eq!(obs.dial_attempts(), 1);
+    assert_eq!(obs.direct_successes(), 1);
+    assert_eq!(obs.relay_successes(), 0);
+    assert_eq!(obs.selected_path(), None);
+
+    server.await.unwrap();
+}
+
+#[tokio::test]
+async fn direct_pair_observed_unrelated_key_sets_success_not_path() {
+    let mut ca_params = CertificateParams::new(Vec::<String>::new()).unwrap();
+    ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+    ca_params.key_usages.push(KeyUsagePurpose::DigitalSignature);
+    ca_params.key_usages.push(KeyUsagePurpose::KeyCertSign);
+    let signing_key = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).unwrap();
+    let signing_cert = ca_params.self_signed(&signing_key).unwrap();
+
+    let (server_cert, server_key) = self_signed();
+    let server_pin = spl_core::ca::sha256(server_cert.as_ref())[..16].to_vec();
+    let acceptor = TlsAcceptor::from(Arc::new(server_config(server_cert, server_key)));
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+
+    let accepts = Arc::new(AtomicUsize::new(0));
+    let accepts_clone = accepts.clone();
+    let server = tokio::spawn(serve_one_pair_response_counted(
+        listener,
+        acceptor,
+        signing_cert,
+        signing_key,
+        PairCertificateMode::UnrelatedKey,
+        Some(accepts_clone),
+    ));
+
+    let nonce = PAIR_EXAMPLE_NONCE;
+    let label = PAIR_EXAMPLE_DEVICE_LABEL;
+    let endpoints = [spl_core::pairlink::Endpoint {
+        host: "127.0.0.1".to_owned(),
+        port,
+    }];
+
+    let obs = spl_transport::OperationObserver::new();
+    let result = spl_transport::pairing::pair_observed(
+        &endpoints,
+        nonce,
+        &server_pin,
+        label,
+        &serde_json::Map::new(),
+        Some(&obs),
+    )
+    .await;
+
+    assert!(result.is_err());
+    assert_eq!(accepts.load(Ordering::SeqCst), 1);
+    assert_eq!(obs.dial_attempts(), 1);
+    assert_eq!(obs.direct_successes(), 1);
+    assert_eq!(obs.relay_successes(), 0);
+    assert_eq!(obs.selected_path(), None);
+
+    server.await.unwrap();
+}
+
+#[tokio::test]
+#[expect(
+    clippy::large_futures,
+    reason = "the copied transport future keeps its established stack layout; this site goes red if a later refactor shrinks it"
+)]
+async fn transport_client_request_failure_after_tls_accept_sets_no_success_and_path_none() {
+    let (cert, key) = self_signed();
+    let pin = spl_core::ca::sha256(cert.as_ref())[..16].to_vec();
+    let acceptor = TlsAcceptor::from(Arc::new(server_config(cert, key)));
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+
+    let accepts = Arc::new(AtomicUsize::new(0));
+    let accepts_clone = accepts.clone();
+    let server = tokio::spawn(async move {
+        let (tcp, _) = listener.accept().await.unwrap();
+        accepts_clone.fetch_add(1, Ordering::SeqCst);
+        let mut tls = acceptor.accept(tcp).await.unwrap();
+        let mut buf = [0u8; 128];
+        let _ = tls.read(&mut buf).await;
+        // Drop and shutdown TLS without sending HTTP response frames
+        let _ = tls.shutdown().await;
+    });
+
+    let cred = transport_credential(pin, port);
+    let client = TransportClient::new(cred, None).unwrap();
+    let obs = spl_transport::OperationObserver::new();
+    let options = spl_transport::RequestOptions {
+        response_cap: 1024 * 1024,
+        replay: spl_transport::ReplayPolicy::ForbidAfterWrite,
+        observer: Some(&obs),
+    };
+
+    let result = client
+        .request("POST", "/test", &[], b"payload", options)
+        .await;
+    assert!(result.is_err());
+    assert_eq!(accepts.load(Ordering::SeqCst), 1);
+    assert_eq!(obs.direct_successes(), 0);
+    assert_eq!(obs.selected_path(), None);
 
     server.await.unwrap();
 }

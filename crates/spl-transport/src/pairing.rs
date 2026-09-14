@@ -224,14 +224,16 @@ pub async fn pair_with_seam_observed(
         crate::observe::note_dial_attempt(observer);
         match seam.prepare(config.clone(), endpoint).await {
             Ok(connection) => {
+                crate::observe::note_direct_success(observer);
                 let response = connection.send("POST", &path, &headers, &body).await?;
-                crate::observe::note_selected_path(observer, crate::request::SelectedPath::Direct);
-                return credential_from_direct_pair_response(
+                let cred = credential_from_direct_pair_response(
                     response,
                     generated,
                     ca_fp_prefix,
                     endpoints,
-                );
+                )?;
+                crate::observe::note_selected_path(observer, crate::request::SelectedPath::Direct);
+                return Ok(cred);
             }
             Err(e) => last_err = Some(e),
         }

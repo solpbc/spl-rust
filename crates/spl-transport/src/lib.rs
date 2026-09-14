@@ -99,7 +99,7 @@ pub use client::{
     CarrierOpenError, DialedCarrier, RelayFence, RelayPermit, TokenCommit, TokenCommitContext,
     TokenPersistHook, TokenPublication, TokenTransaction, TransportClient,
 };
-pub use observe::OperationObserver;
+pub use observe::{OperationObserver, OperationSnapshot};
 pub use pairing::{
     DirectPairPrepareFuture, DirectPairSendFuture, DirectPairingSeam, PreparedDirectPairConnection,
     pair, pair_from_link, pair_from_link_observed, pair_observed, pair_with_seam,

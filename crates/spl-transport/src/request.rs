@@ -14,7 +14,10 @@ use crate::client::{
     RefreshAction, RelayPermit, TransportClient, now_secs, relay_fault_is_transient_err,
 };
 use crate::connection::{dial_tls, run_request_over_stream_with_options};
-use crate::observe::{OperationObserver, note_dial_attempt, note_selected_path};
+use crate::observe::{
+    OperationObserver, note_dial_attempt, note_direct_success, note_relay_success,
+    note_selected_path,
+};
 use crate::relay::dial_relay_carrier;
 use crate::{RelayError, TransportError};
 
@@ -162,6 +165,7 @@ impl TransportClient {
                         .await
                         {
                             Ok(response) => {
+                                note_direct_success(options.observer);
                                 note_selected_path(options.observer, SelectedPath::Direct);
                                 return Ok(RequestOutcome {
                                     response,
@@ -280,6 +284,7 @@ impl TransportClient {
                     .await
                     {
                         Ok(response) => {
+                            note_relay_success(options.observer);
                             note_selected_path(options.observer, SelectedPath::Relay);
                             return Ok(RequestOutcome {
                                 response,

@@ -12,6 +12,9 @@ use tokio::io::{AsyncRead, AsyncWrite};
 
 use crate::connection::dial_tls;
 use crate::credential::Credential;
+use crate::observe::{
+    note_dial_attempt, note_direct_success, note_relay_success, note_selected_path,
+};
 use crate::relay::{RelayTerminationHandle, dial_relay_carrier};
 use crate::relay_token::{RefreshOutcome, refresh_device_token};
 use crate::{RelayError, TransportError, tls};
@@ -433,14 +436,11 @@ impl TransportClient {
         let mut last_err: Option<TransportError> = None;
         for attempt in 0..MAX_ATTEMPTS {
             for endpoint in &self.credential.endpoints {
-                if let Some(obs) = observer {
-                    obs.record_dial_attempt();
-                }
+                note_dial_attempt(observer);
                 match dial_tls(self.config.clone(), &endpoint.host, endpoint.port).await {
                     Ok(stream) => {
-                        if let Some(obs) = observer {
-                            obs.record_selected_path(crate::request::SelectedPath::Direct);
-                        }
+                        note_direct_success(observer);
+                        note_selected_path(observer, crate::request::SelectedPath::Direct);
                         return Ok(DialedCarrier {
                             stream: Box::new(stream),
                             kind: CarrierKind::Lan,
@@ -665,16 +665,13 @@ impl TransportClient {
                 relay_fence_permit(self.publication.as_ref()).map_err(map_fence_permit)?;
             }
 
-            if let Some(obs) = observer {
-                obs.record_dial_attempt();
-            }
+            note_dial_attempt(observer);
 
             let token = self.current_token().await;
             match dial_relay_carrier(self.config.clone(), origin, instance_id, &token).await {
                 Ok(carrier) => {
-                    if let Some(obs) = observer {
-                        obs.record_selected_path(crate::request::SelectedPath::Relay);
-                    }
+                    note_relay_success(observer);
+                    note_selected_path(observer, crate::request::SelectedPath::Relay);
                     return Ok(DialedCarrier {
                         stream: Box::new(carrier.stream),
                         kind: CarrierKind::Relay {

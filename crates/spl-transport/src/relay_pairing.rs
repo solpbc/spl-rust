@@ -73,15 +73,18 @@ pub async fn pair_over_relay_observed(
     let ws = relay::dial_pair_relay_ws(&url, &hex_lower(&rk), relay::outer_config()).await?;
     let (duplex, termination) = relay::WsByteDuplex::new(ws);
     crate::observe::note_dial_attempt(observer);
-    let material = match pair_over_carrier(duplex, link, device_label, additional_fields).await {
-        Ok(material) => material,
-        Err(error) => {
-            if let Some(relay_error) = termination.current_error() {
-                return Err(TransportError::Relay(relay_error));
+    let material =
+        match pair_over_carrier_observed(duplex, link, device_label, additional_fields, observer)
+            .await
+        {
+            Ok(material) => material,
+            Err(error) => {
+                if let Some(relay_error) = termination.current_error() {
+                    return Err(TransportError::Relay(relay_error));
+                }
+                return Err(error);
             }
-            return Err(error);
-        }
-    };
+        };
 
     let device_token = if let Some(raw) = &material.pair.relay_access {
         let access: spl_core::relay_access::RelayAccess = serde_json::from_value(raw.clone())
@@ -103,10 +106,11 @@ pub async fn pair_over_relay_observed(
                     clippy::large_futures,
                     reason = "compatibility enrollment retains the established control-plane future"
                 )]
-                let token = enroll_device(
+                let token = enroll_device_observed(
                     &link.relay_origin,
                     &material.pair.instance_id,
                     home_attestation,
+                    observer,
                 )
                 .await
                 .ok();
@@ -158,6 +162,19 @@ pub async fn pair_over_carrier<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
+    pair_over_carrier_observed(io, link, device_label, additional_fields, None).await
+}
+
+pub(crate) async fn pair_over_carrier_observed<S>(
+    io: S,
+    link: &RelayPairLink,
+    device_label: &str,
+    additional_fields: &serde_json::Map<String, serde_json::Value>,
+    observer: Option<&crate::observe::OperationObserver>,
+) -> Result<PairingMaterial, TransportError>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
     let generated = generate_csr(device_label)?;
     let request = build_pair_request(generated.csr_pem, device_label, additional_fields)?;
     let body = serde_json::to_vec(&request)?;
@@ -174,6 +191,7 @@ where
         &body,
     )
     .await?;
+    crate::observe::note_relay_success(observer);
     let peer_leaf =
         peer_leaf.ok_or_else(|| TransportError::Pairing("relay missing peer leaf".into()))?;
     if !response.is_success() {
@@ -245,21 +263,37 @@ where
 /// [`RelayControlEndpoint::EnrollDevice`] when the relay rejects a stale or
 /// otherwise invalid attestation. Returns an I/O, TLS, JSON, or pairing error
 /// when the request fails or a successful response is malformed.
+#[expect(
+    clippy::large_futures,
+    reason = "the copied transport future keeps its established stack layout; this site goes red if a later refactor shrinks it"
+)]
 pub async fn enroll_device(
     relay_origin: &str,
     instance_id: &str,
     home_attestation: &str,
+) -> Result<String, TransportError> {
+    enroll_device_observed(relay_origin, instance_id, home_attestation, None).await
+}
+
+#[expect(
+    clippy::large_futures,
+    reason = "the copied transport future keeps its established stack layout; this site goes red if a later refactor shrinks it"
+)]
+pub(crate) async fn enroll_device_observed(
+    relay_origin: &str,
+    instance_id: &str,
+    home_attestation: &str,
+    observer: Option<&crate::observe::OperationObserver>,
 ) -> Result<String, TransportError> {
     let body = serde_json::to_vec(&json!({
         "protocol_version": 2,
         "instance_id": instance_id,
         "home_attestation": home_attestation,
     }))?;
-    #[expect(
-        clippy::large_futures,
-        reason = "the copied transport future keeps its established stack layout; this site goes red if a later refactor shrinks it"
-    )]
+    crate::observe::note_dial_attempt(observer);
+    crate::observe::note_legacy_enrollment_possible(observer);
     let response = relay_http::relay_https_post_json(relay_origin, "/enroll/device", &body).await?;
+    crate::observe::note_relay_success(observer);
     if !response.is_success() {
         return Err(TransportError::RelayControlRejected {
             endpoint: RelayControlEndpoint::EnrollDevice,
@@ -289,6 +323,9 @@ pub async fn enroll_device(
         return Err(TransportError::Pairing(
             "relay enroll response malformed".into(),
         ));
+    }
+    if parsed.protocol_version == Some(2) {
+        crate::observe::note_clear_legacy_enrollment_possible(observer);
     }
     Ok(parsed.device_token)
 }

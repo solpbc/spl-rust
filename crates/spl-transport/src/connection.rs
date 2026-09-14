@@ -128,11 +128,46 @@ where
 }
 
 pub(crate) async fn run_request_over_stream<S>(
+    stream: S,
+    method: &str,
+    path: &str,
+    headers: &[(String, String)],
+    body: &[u8],
+) -> Result<HttpResponse, TransportError>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let write_initiated = std::sync::atomic::AtomicBool::new(false);
+    run_request_over_stream_with_options(
+        stream,
+        method,
+        path,
+        headers,
+        body,
+        spl_core::mux::MAX_ASSEMBLED_BYTES,
+        None,
+        &write_initiated,
+    )
+    .await
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "run_request_over_stream_with_options needs method, path, headers, body, cap, observer, and write_initiated"
+)]
+#[expect(
+    clippy::too_many_lines,
+    reason = "request streaming and response assembly over framed connection is handled in one state machine"
+)]
+pub(crate) async fn run_request_over_stream_with_options<S>(
     mut stream: S,
     method: &str,
     path: &str,
     headers: &[(String, String)],
     body: &[u8],
+    response_cap: usize,
+    observer: Option<&crate::observe::OperationObserver>,
+    write_initiated: &std::sync::atomic::AtomicBool,
 ) -> Result<HttpResponse, TransportError>
 where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -142,7 +177,8 @@ where
     let request_head = http::build_request_head(method, path, headers, body.len());
     let mut upload = WindowedUpload::new(stream_id, &request_head, body.len());
     let mut body_offset = 0;
-    let mut assembler = ResponseAssembler::new(stream_id);
+    let mut assembler = ResponseAssembler::with_cap(stream_id, response_cap);
+    let mut sent_data_payload_bytes: u64 = 0;
 
     let mut buf = vec![0u8; READ_BUF];
     loop {
@@ -166,12 +202,24 @@ where
                 else {
                     break;
                 };
+                let payload_len = if frame.len() > spl_core::frame::HEADER_LEN
+                    && (frame[4] & spl_core::frame::FLAG_DATA != 0)
+                {
+                    frame.len() - spl_core::frame::HEADER_LEN
+                } else {
+                    0
+                };
+                write_initiated.store(true, std::sync::atomic::Ordering::Release);
                 write_all_with_timeout(
                     &mut stream,
                     &frame,
                     "PL write timed out sending request frame",
                 )
                 .await?;
+                if payload_len > 0 {
+                    sent_data_payload_bytes += payload_len as u64;
+                    crate::observe::note_request_bytes(observer, sent_data_payload_bytes);
+                }
                 wrote = true;
             }
             if wrote {
@@ -241,7 +289,11 @@ where
     // Best-effort clean close.
     let _ = stream.shutdown().await;
 
-    Ok(assembler.into_response()?)
+    let response = assembler.into_response()?;
+    if upload.is_done() {
+        crate::observe::note_close_completed(observer);
+    }
+    Ok(response)
 }
 
 async fn write_all_with_timeout<S>(
@@ -546,5 +598,79 @@ mod tests {
         .unwrap_err();
         assert!(matches!(error, TransportError::Mux(MuxError::FlowControl)));
         fake_peer.await.unwrap();
+    }
+
+    struct PrefixWriteErrorStream {
+        write_count: usize,
+    }
+
+    impl AsyncWrite for PrefixWriteErrorStream {
+        fn poll_write(
+            mut self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            buf: &[u8],
+        ) -> std::task::Poll<io::Result<usize>> {
+            if self.write_count == 0 {
+                self.write_count += 1;
+                // Honest prefix write: return Ok(n) with 0 < n < len
+                let partial = (buf.len() / 2)
+                    .max(1)
+                    .min(buf.len().saturating_sub(1))
+                    .max(1);
+                std::task::Poll::Ready(Ok(partial))
+            } else {
+                std::task::Poll::Ready(Err(io::Error::new(
+                    io::ErrorKind::ConnectionReset,
+                    "simulated write abort",
+                )))
+            }
+        }
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+        fn poll_shutdown(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    impl AsyncRead for PrefixWriteErrorStream {
+        fn poll_read(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            _buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<io::Result<()>> {
+            std::task::Poll::Pending
+        }
+    }
+
+    #[tokio::test]
+    async fn one_shot_prefix_write_sets_latch_and_excludes_failed_frame_from_bytes_sent() {
+        let stream = PrefixWriteErrorStream { write_count: 0 };
+        let write_initiated = std::sync::atomic::AtomicBool::new(false);
+        let obs = crate::OperationObserver::new();
+
+        let err = run_request_over_stream_with_options(
+            stream,
+            "POST",
+            "/prefix-test",
+            &[],
+            b"test-payload",
+            1024 * 1024,
+            Some(&obs),
+            &write_initiated,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(matches!(err, TransportError::Io(_)));
+        assert!(write_initiated.load(std::sync::atomic::Ordering::SeqCst));
+        assert_eq!(obs.request_bytes_sent(), 0);
+        assert!(!obs.close_completed());
     }
 }

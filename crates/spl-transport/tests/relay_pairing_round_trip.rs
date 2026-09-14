@@ -115,6 +115,7 @@ struct MockState {
     dial_authorization: Mutex<Option<String>>,
     expected_pair_token: Mutex<String>,
     pair_request: Mutex<Option<PairRequest>>,
+    pair_request_raw_json: Mutex<Option<serde_json::Value>>,
     bootstrap: Mutex<Option<serde_json::Value>>,
     control_response: Mutex<Option<serde_json::Value>>,
     control_request: Mutex<Option<serde_json::Value>>,
@@ -137,6 +138,7 @@ impl MockState {
             dial_authorization: Mutex::new(None),
             expected_pair_token: Mutex::new(PAIR_SECRET_HEX.to_owned()),
             pair_request: Mutex::new(None),
+            pair_request_raw_json: Mutex::new(None),
             bootstrap: Mutex::new(None),
             control_response: Mutex::new(None),
             control_request: Mutex::new(None),
@@ -385,7 +387,9 @@ async fn serve_home_pair(stream: DuplexStream, state: Arc<MockState>) -> io::Res
         .position(|w| w == b"\r\n\r\n")
         .map(|split| &request[split + 4..])
         .unwrap();
-    let pair_request: PairRequest = serde_json::from_slice(body).unwrap();
+    let raw_json: serde_json::Value = serde_json::from_slice(body).unwrap();
+    *state.pair_request_raw_json.lock().unwrap() = Some(raw_json.clone());
+    let pair_request: PairRequest = serde_json::from_value(raw_json).unwrap();
     *state.pair_request.lock().unwrap() = Some(pair_request.clone());
     let client_cert = if matches!(state.home_mode, HomeMode::UnrelatedClientKey) {
         let unrelated_key = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).unwrap();
@@ -610,6 +614,10 @@ async fn observer_contract_authority_relay_pairing_uses_real_ceremony() {
     let captured = state.pair_request.lock().unwrap().clone().unwrap();
     assert_eq!(captured.device_label, device_label);
     assert!(captured.csr.contains("BEGIN CERTIFICATE REQUEST"));
+    let raw = state.pair_request_raw_json.lock().unwrap().clone().unwrap();
+    let mut keys: Vec<String> = raw.as_object().unwrap().keys().cloned().collect();
+    keys.sort();
+    assert_eq!(keys, vec!["csr".to_string(), "device_label".to_string()]);
     assert!(credential.client_cert_pem.contains("BEGIN CERTIFICATE"));
     assert_eq!(credential.home_label, "Home");
 }
@@ -1075,4 +1083,34 @@ async fn explicit_null_control_version_is_not_legacy_omission() {
         Box::pin(refresh_device_token(&origin, &legacy)).await,
         RefreshOutcome::Refreshed { .. }
     ));
+}
+
+#[tokio::test]
+#[expect(
+    clippy::large_futures,
+    reason = "the copied transport future keeps its established stack layout; this site goes red if a later refactor shrinks it"
+)]
+async fn pair_over_relay_observed_records_path_attempts_and_events() {
+    let state = Arc::new(MockState::normal().with_same_tls_ca());
+    let origin = spawn_mock_relay(state.clone()).await;
+    let link = relay_link(origin.clone(), state.json_ca.spki_pin());
+
+    let obs = spl_transport::OperationObserver::new();
+    let credential = spl_transport::pair_over_relay_observed(
+        &link,
+        "win-test",
+        &serde_json::Map::new(),
+        Some(&obs),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(credential.relay_origin.as_deref(), Some(origin.as_str()));
+    assert_eq!(obs.dial_attempts(), 2);
+    assert_eq!(obs.enrollment_events(), 1);
+    assert_eq!(
+        obs.selected_path(),
+        Some(spl_transport::SelectedPath::Relay)
+    );
+    assert_eq!(obs.request_bytes_sent(), 0);
 }

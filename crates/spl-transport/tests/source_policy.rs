@@ -35,6 +35,49 @@ fn library_sources_exclude_consumer_crates() -> Result<(), Box<dyn Error>> {
 }
 
 #[test]
+fn sources_and_tests_exclude_consumer_dependencies() -> Result<(), Box<dyn Error>> {
+    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let consumer_crates = [
+        "observer_pl",
+        "pl_transport_win",
+        "observer_model",
+        "platform_win",
+        "solstone_windows",
+    ];
+    for dir in ["src", "tests"] {
+        let root = manifest_dir.join(dir);
+        if !root.exists() {
+            continue;
+        }
+        for path in rust_sources(&root)? {
+            if path.ends_with("source_policy.rs") {
+                continue;
+            }
+            let source = fs::read_to_string(&path)?;
+            for c in consumer_crates {
+                let use_pattern = format!("use {c}");
+                let path_pattern = format!("{c}::");
+                let extern_pattern = format!("extern crate {c}");
+                assert!(
+                    !source.contains(&use_pattern)
+                        && !source.contains(&path_pattern)
+                        && !source.contains(&extern_pattern),
+                    "forbidden consumer dependency import/path {c:?} in {}",
+                    path.display()
+                );
+            }
+        }
+    }
+    let manifest_path = manifest_dir.join("Cargo.toml");
+    let manifest = fs::read_to_string(manifest_path)?;
+    assert!(
+        !manifest.contains("solstone-windows"),
+        "forbidden dependency solstone-windows in Cargo.toml"
+    );
+    Ok(())
+}
+
+#[test]
 fn tcp_listener_binds_use_literal_ipv4_loopback() -> Result<(), Box<dyn Error>> {
     let source_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
     let needle = "TcpListener::bind(";

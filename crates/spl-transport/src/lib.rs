@@ -29,8 +29,23 @@
 //! [`client::TransportClient`] owns direct-or-relay carrier establishment,
 //! including explicit relay-only construction, and accepts an optional
 //! [`client::TokenPersistHook`] for consumer-owned, best-effort relay-token
-//! persistence. [`relay_pairing::enroll_device`] exposes relay enrollment when
-//! the consumer has a fresh pairing-window attestation.
+//! persistence. Transactional consumers configure [`client::TokenPublication`]
+//! via [`client::TransportClient::new_with_publication`] or
+//! [`client::TransportClient::new_relay_only_with_publication`], executing
+//! durable commits before live assignment inside an owned background task.
+//! [`client::RelayFence`] gates relay communication locally against consumer
+//! lifecycle (`Disabled`/`Retired`), distinctly from remote `RelayError::Unauthorized`.
+//! Note that [`client::TransportClient::dial_carrier`] remains frozen and does
+//! not enforce the local fence or attach an observer.
+//!
+//! [`client::TransportClient::request`] provides one-request execution over direct
+//! LAN or relay fallback with write-initiated replay protection ([`request::ReplayPolicy`]),
+//! response byte limits ([`request::RequestOptions`]), operation observation
+//! ([`observe::OperationObserver`]), and classified outcomes ([`request::RequestOutcome`]
+//! or [`request::RequestError`]).
+//!
+//! [`relay_pairing::enroll_device`] exposes relay enrollment when the consumer has
+//! a fresh pairing-window attestation.
 //! [`journal_bridge::CarrierOpener`] combines that transport with consumer
 //! authentication without exposing the carrier implementation.
 //! [`journal_bridge::BridgePolicy`] selects the loopback port, capability gate,
@@ -67,14 +82,31 @@ pub mod credential;
 pub mod home_relay;
 pub mod journal_bridge;
 mod journal_bridge_carrier;
+pub mod observe;
 pub mod pairing;
 pub mod relay;
 pub(crate) mod relay_http;
 pub use relay_http::{same_relay_origin, validate_relay_origin};
 pub mod relay_pairing;
 pub mod relay_token;
+pub mod request;
 pub(crate) mod spki_pin;
 pub mod tls;
+
+pub use client::{
+    DialedCarrier, RelayFence, RelayPermit, TokenCommit, TokenCommitContext, TokenPersistHook,
+    TokenPublication, TokenTransaction, TransportClient,
+};
+pub use observe::OperationObserver;
+pub use pairing::{
+    DirectPairPrepareFuture, DirectPairSendFuture, DirectPairingSeam, PreparedDirectPairConnection,
+    pair, pair_from_link, pair_from_link_observed, pair_observed, pair_with_seam,
+    pair_with_seam_observed,
+};
+pub use relay_pairing::{
+    PairingMaterial, pair_over_carrier, pair_over_relay, pair_over_relay_observed,
+};
+pub use request::{ReplayPolicy, RequestError, RequestOptions, RequestOutcome, SelectedPath};
 
 use std::fmt;
 use std::io;

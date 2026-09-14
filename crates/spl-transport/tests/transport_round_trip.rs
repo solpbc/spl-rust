@@ -1271,6 +1271,10 @@ async fn observer_contract_authority_direct_pairing_uses_real_crypto_and_request
     );
     let request = server.await.unwrap();
     assert!(pair_capture_matches(&request, nonce, label));
+    let body_json = request_body(&request);
+    let mut keys: Vec<String> = body_json.as_object().unwrap().keys().cloned().collect();
+    keys.sort();
+    assert_eq!(keys, vec!["csr".to_string(), "device_label".to_string()]);
     let mutated = String::from_utf8(request.clone()).unwrap().replacen(
         &format!("token={nonce}"),
         "token=wrong",
@@ -3547,4 +3551,501 @@ async fn wrong_pin_fails_the_handshake() {
     let config = Arc::new(pairing_config(&wrong_pin).unwrap());
     let result = request_once(config, "127.0.0.1", port, "GET", "/healthz", &[], b"").await;
     assert!(result.is_err(), "a wrong CA-fp pin must fail the handshake");
+}
+
+#[tokio::test]
+#[expect(
+    clippy::large_futures,
+    reason = "the copied transport future keeps its established stack layout; this site goes red if a later refactor shrinks it"
+)]
+async fn transport_client_request_direct_with_observer() {
+    let (cert, key) = self_signed();
+    let pin = spl_core::ca::sha256(cert.as_ref())[..16].to_vec();
+    let acceptor = TlsAcceptor::from(Arc::new(server_config(cert, key)));
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+
+    let server = tokio::spawn(async move { serve_one(listener, acceptor).await });
+
+    let cred = transport_credential(pin, port);
+    let client = TransportClient::new(cred, None).unwrap();
+    let obs = spl_transport::OperationObserver::new();
+    let options = spl_transport::RequestOptions {
+        response_cap: 1024 * 1024,
+        replay: spl_transport::ReplayPolicy::ForbidAfterWrite,
+        observer: Some(&obs),
+    };
+
+    let outcome = client
+        .request("GET", "/healthz", &[], b"", options)
+        .await
+        .unwrap();
+
+    assert_eq!(outcome.response.status, 200);
+    assert_eq!(outcome.path, spl_transport::SelectedPath::Direct);
+    assert_eq!(outcome.attempts, 1);
+    assert_eq!(obs.dial_attempts(), 1);
+    assert_eq!(
+        obs.selected_path(),
+        Some(spl_transport::SelectedPath::Direct)
+    );
+    assert!(obs.request_bytes_sent() > 0);
+    assert!(obs.close_completed());
+
+    server.await.unwrap();
+}
+
+#[tokio::test]
+#[expect(
+    clippy::large_futures,
+    reason = "the copied transport future keeps its established stack layout; this site goes red if a later refactor shrinks it"
+)]
+async fn transport_client_request_response_cap_enforced() {
+    let (cert, key) = self_signed();
+    let pin = spl_core::ca::sha256(cert.as_ref())[..16].to_vec();
+    let acceptor = TlsAcceptor::from(Arc::new(server_config(cert, key)));
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+
+    let server = tokio::spawn(async move {
+        serve_one_response(listener, acceptor, "200 OK", b"01234567890123456789").await
+    });
+
+    let cred = transport_credential(pin, port);
+    let client = TransportClient::new(cred, None).unwrap();
+    let options = spl_transport::RequestOptions {
+        response_cap: 80,
+        replay: spl_transport::ReplayPolicy::ForbidAfterWrite,
+        observer: None,
+    };
+
+    let err = client
+        .request("GET", "/healthz", &[], b"", options)
+        .await
+        .unwrap_err();
+
+    assert!(matches!(
+        err,
+        spl_transport::RequestError::Transport(TransportError::Mux(
+            spl_core::mux::MuxError::CapExceeded,
+        ))
+    ));
+
+    server.await.unwrap();
+}
+
+#[tokio::test]
+#[expect(
+    clippy::large_futures,
+    reason = "the copied transport future keeps its established stack layout; this site goes red if a later refactor shrinks it"
+)]
+async fn transport_client_request_replay_unsafe_after_partial_write() {
+    let (cert, key) = self_signed();
+    let pin = spl_core::ca::sha256(cert.as_ref())[..16].to_vec();
+    let acceptor = TlsAcceptor::from(Arc::new(server_config(cert, key)));
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+
+    let server = tokio::spawn(async move {
+        let (tcp, _) = listener.accept().await.unwrap();
+        let mut tls = acceptor.accept(tcp).await.unwrap();
+        let mut buf = [0u8; 1024];
+        let _ = tls.read(&mut buf).await.unwrap();
+        // Drop TLS stream abruptly after reading request
+        drop(tls);
+    });
+
+    let cred = transport_credential(pin, port);
+    let client = TransportClient::new(cred, None).unwrap();
+    let options = spl_transport::RequestOptions {
+        response_cap: 1024 * 1024,
+        replay: spl_transport::ReplayPolicy::ForbidAfterWrite,
+        observer: None,
+    };
+
+    let err = client
+        .request("POST", "/test", &[], b"hello world", options)
+        .await
+        .unwrap_err();
+
+    assert!(matches!(err, spl_transport::RequestError::ReplayUnsafe(_)));
+
+    server.await.unwrap();
+}
+
+#[tokio::test]
+#[expect(
+    clippy::large_futures,
+    reason = "the copied transport future keeps its established stack layout; this site goes red if a later refactor shrinks it"
+)]
+async fn transport_client_request_terminal_tls_alert_access_denied_returns_immediately() {
+    let (cert, _) = self_signed();
+    let pin = spl_core::ca::sha256(cert.as_ref())[..16].to_vec();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut header = [0u8; 5];
+        stream.read_exact(&mut header).await.unwrap();
+        let mut hello = vec![0u8; u16::from_be_bytes([header[3], header[4]]) as usize];
+        stream.read_exact(&mut hello).await.unwrap();
+        stream
+            .write_all(&[0x15, 0x03, 0x03, 0x00, 0x02, 0x02, 49])
+            .await
+            .unwrap();
+        stream.flush().await.unwrap();
+    });
+
+    let obs = spl_transport::OperationObserver::new();
+    let cred = transport_credential(pin, port);
+    let client = TransportClient::new(cred, None).unwrap();
+    let options = spl_transport::RequestOptions {
+        response_cap: 1024 * 1024,
+        replay: spl_transport::ReplayPolicy::ForbidAfterWrite,
+        observer: Some(&obs),
+    };
+
+    let err = client
+        .request("GET", "/healthz", &[], b"", options)
+        .await
+        .unwrap_err();
+
+    assert!(matches!(
+        err,
+        spl_transport::RequestError::Transport(TransportError::TlsAccessDenied)
+    ));
+    assert_eq!(obs.dial_attempts(), 1);
+
+    server.await.unwrap();
+}
+
+#[tokio::test]
+#[expect(
+    clippy::large_futures,
+    reason = "the copied transport future keeps its established stack layout; this site goes red if a later refactor shrinks it"
+)]
+async fn transport_client_request_terminal_tls_alert_cert_unknown_returns_immediately() {
+    let (cert, _) = self_signed();
+    let pin = spl_core::ca::sha256(cert.as_ref())[..16].to_vec();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut header = [0u8; 5];
+        stream.read_exact(&mut header).await.unwrap();
+        let mut hello = vec![0u8; u16::from_be_bytes([header[3], header[4]]) as usize];
+        stream.read_exact(&mut hello).await.unwrap();
+        stream
+            .write_all(&[0x15, 0x03, 0x03, 0x00, 0x02, 0x02, 46])
+            .await
+            .unwrap();
+        stream.flush().await.unwrap();
+    });
+
+    let obs = spl_transport::OperationObserver::new();
+    let cred = transport_credential(pin, port);
+    let client = TransportClient::new(cred, None).unwrap();
+    let options = spl_transport::RequestOptions {
+        response_cap: 1024 * 1024,
+        replay: spl_transport::ReplayPolicy::ForbidAfterWrite,
+        observer: Some(&obs),
+    };
+
+    let err = client
+        .request("GET", "/healthz", &[], b"", options)
+        .await
+        .unwrap_err();
+
+    assert!(matches!(
+        err,
+        spl_transport::RequestError::Transport(TransportError::TlsCertificateUnknown)
+    ));
+    assert_eq!(obs.dial_attempts(), 1);
+
+    server.await.unwrap();
+}
+
+#[tokio::test]
+#[expect(
+    clippy::large_futures,
+    reason = "the copied transport future keeps its established stack layout; this site goes red if a later refactor shrinks it"
+)]
+async fn transport_client_request_replay_safe_retries_on_backup_endpoint() {
+    let (cert, key) = self_signed();
+    let pin = spl_core::ca::sha256(cert.as_ref())[..16].to_vec();
+    let acceptor = TlsAcceptor::from(Arc::new(server_config(cert, key)));
+
+    // First listener accepts, reads partial request, then drops stream
+    let listener1 = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port1 = listener1.local_addr().unwrap().port();
+    let acceptor1 = acceptor.clone();
+    let server1 = tokio::spawn(async move {
+        let (tcp, _) = listener1.accept().await.unwrap();
+        let mut tls = acceptor1.accept(tcp).await.unwrap();
+        let mut buf = [0u8; 1024];
+        let _ = tls.read(&mut buf).await.unwrap();
+        drop(tls);
+    });
+
+    // Second listener serves valid response
+    let listener2 = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port2 = listener2.local_addr().unwrap().port();
+    let server2 = tokio::spawn(async move {
+        serve_one(listener2, acceptor).await;
+    });
+
+    let mut cred = transport_credential(pin, port1);
+    cred.endpoints = vec![
+        EndpointAddr {
+            host: "127.0.0.1".into(),
+            port: port1,
+        },
+        EndpointAddr {
+            host: "127.0.0.1".into(),
+            port: port2,
+        },
+    ];
+
+    let client = TransportClient::new(cred, None).unwrap();
+    let obs = spl_transport::OperationObserver::new();
+    let options = spl_transport::RequestOptions {
+        response_cap: 1024 * 1024,
+        replay: spl_transport::ReplayPolicy::ReplaySafe,
+        observer: Some(&obs),
+    };
+
+    let outcome = client
+        .request("POST", "/test", &[], b"hello", options)
+        .await
+        .unwrap();
+
+    assert_eq!(outcome.response.status, 200);
+    assert_eq!(outcome.path, spl_transport::SelectedPath::Direct);
+    assert_eq!(outcome.attempts, 2);
+    assert_eq!(obs.dial_attempts(), 2);
+
+    server1.await.unwrap();
+    server2.await.unwrap();
+}
+
+#[tokio::test]
+#[expect(
+    clippy::large_futures,
+    reason = "the copied transport future keeps its established stack layout; this site goes red if a later refactor shrinks it"
+)]
+async fn transport_client_request_exact_response_cap_succeeds() {
+    let (cert, key) = self_signed();
+    let pin = spl_core::ca::sha256(cert.as_ref())[..16].to_vec();
+    let acceptor = TlsAcceptor::from(Arc::new(server_config(cert, key)));
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+
+    let server = tokio::spawn(async move {
+        serve_one_response(listener, acceptor, "200 OK", b"0123456789").await
+    });
+
+    let cred = transport_credential(pin, port);
+    let client = TransportClient::new(cred, None).unwrap();
+    let options = spl_transport::RequestOptions {
+        response_cap: 81,
+        replay: spl_transport::ReplayPolicy::ForbidAfterWrite,
+        observer: None,
+    };
+
+    let outcome = client
+        .request("GET", "/healthz", &[], b"", options)
+        .await
+        .unwrap();
+
+    assert_eq!(outcome.response.status, 200);
+    assert_eq!(outcome.response.body, b"0123456789");
+    server.await.unwrap();
+}
+
+#[tokio::test]
+#[expect(
+    clippy::large_futures,
+    reason = "the copied transport future keeps its established stack layout; this site goes red if a later refactor shrinks it"
+)]
+async fn transport_client_request_early_413_path_selected_and_close_not_completed() {
+    let (cert, key) = self_signed();
+    let pin = spl_core::ca::sha256(cert.as_ref())[..16].to_vec();
+    let acceptor = TlsAcceptor::from(Arc::new(server_config(cert, key)));
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+
+    let server = tokio::spawn(async move {
+        let (tcp, _) = listener.accept().await.unwrap();
+        let mut tls = acceptor.accept(tcp).await.unwrap();
+        let mut buf = [0u8; 1024];
+        let n = tls.read(&mut buf).await.unwrap();
+        assert!(n > 9);
+        let resp = b"HTTP/1.1 413 Payload Too Large\r\nContent-Length: 0\r\n\r\n";
+        let frame = Frame::new(1, FLAG_DATA | FLAG_CLOSE, resp.to_vec());
+        tls.write_all(&frame.encode().unwrap()).await.unwrap();
+        tls.flush().await.unwrap();
+        let _ = tls.shutdown().await;
+    });
+
+    let cred = transport_credential(pin, port);
+    let client = TransportClient::new(cred, None).unwrap();
+    let obs = spl_transport::OperationObserver::new();
+    let options = spl_transport::RequestOptions {
+        response_cap: 1024 * 1024,
+        replay: spl_transport::ReplayPolicy::ForbidAfterWrite,
+        observer: Some(&obs),
+    };
+
+    let big_body = vec![b'a'; 2 * 1024 * 1024];
+    let outcome = client
+        .request("POST", "/upload", &[], &big_body, options)
+        .await
+        .unwrap();
+
+    assert_eq!(outcome.response.status, 413);
+    assert_eq!(outcome.path, spl_transport::SelectedPath::Direct);
+    assert_eq!(
+        obs.selected_path(),
+        Some(spl_transport::SelectedPath::Direct)
+    );
+    assert!(!obs.close_completed());
+
+    server.await.unwrap();
+}
+
+#[tokio::test]
+#[expect(
+    clippy::large_futures,
+    reason = "the copied transport future keeps its established stack layout; this site goes red if a later refactor shrinks it"
+)]
+async fn transport_client_request_http_404_and_500_select_path() {
+    let (cert, key) = self_signed();
+    let pin = spl_core::ca::sha256(cert.as_ref())[..16].to_vec();
+    let acceptor = TlsAcceptor::from(Arc::new(server_config(cert, key)));
+
+    let listener_404 = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port_404 = listener_404.local_addr().unwrap().port();
+    let acceptor_404 = acceptor.clone();
+    let server_404 = tokio::spawn(async move {
+        serve_one_response(listener_404, acceptor_404, "404 Not Found", b"not found").await;
+    });
+
+    let cred_404 = transport_credential(pin.clone(), port_404);
+    let client_404 = TransportClient::new(cred_404, None).unwrap();
+    let obs_404 = spl_transport::OperationObserver::new();
+    let options_404 = spl_transport::RequestOptions {
+        response_cap: 1024 * 1024,
+        replay: spl_transport::ReplayPolicy::ForbidAfterWrite,
+        observer: Some(&obs_404),
+    };
+    let outcome_404 = client_404
+        .request("GET", "/missing", &[], b"", options_404)
+        .await
+        .unwrap();
+    assert_eq!(outcome_404.response.status, 404);
+    assert_eq!(outcome_404.path, spl_transport::SelectedPath::Direct);
+    assert_eq!(
+        obs_404.selected_path(),
+        Some(spl_transport::SelectedPath::Direct)
+    );
+    server_404.await.unwrap();
+
+    let listener_500 = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port_500 = listener_500.local_addr().unwrap().port();
+    let server_500 = tokio::spawn(async move {
+        serve_one_response(
+            listener_500,
+            acceptor,
+            "500 Internal Server Error",
+            b"server error",
+        )
+        .await;
+    });
+
+    let cred_500 = transport_credential(pin, port_500);
+    let client_500 = TransportClient::new(cred_500, None).unwrap();
+    let obs_500 = spl_transport::OperationObserver::new();
+    let options_500 = spl_transport::RequestOptions {
+        response_cap: 1024 * 1024,
+        replay: spl_transport::ReplayPolicy::ForbidAfterWrite,
+        observer: Some(&obs_500),
+    };
+    let outcome_500 = client_500
+        .request("GET", "/error", &[], b"", options_500)
+        .await
+        .unwrap();
+    assert_eq!(outcome_500.response.status, 500);
+    assert_eq!(outcome_500.path, spl_transport::SelectedPath::Direct);
+    assert_eq!(
+        obs_500.selected_path(),
+        Some(spl_transport::SelectedPath::Direct)
+    );
+    server_500.await.unwrap();
+}
+
+#[tokio::test]
+async fn direct_pair_observed_multiple_candidates_records_attempts_and_path() {
+    let mut ca_params = CertificateParams::new(Vec::<String>::new()).unwrap();
+    ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+    ca_params.key_usages.push(KeyUsagePurpose::DigitalSignature);
+    ca_params.key_usages.push(KeyUsagePurpose::KeyCertSign);
+    let signing_key = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).unwrap();
+    let signing_cert = ca_params.self_signed(&signing_key).unwrap();
+
+    let (server_cert, server_key) = self_signed();
+    let server_pin = spl_core::ca::sha256(server_cert.as_ref())[..16].to_vec();
+    let acceptor = TlsAcceptor::from(Arc::new(server_config(server_cert, server_key)));
+
+    // Closed port for first candidate
+    let unused_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let closed_port = unused_listener.local_addr().unwrap().port();
+    drop(unused_listener);
+
+    // Second candidate is valid
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let valid_port = listener.local_addr().unwrap().port();
+    let server = tokio::spawn(serve_one_pair_response(
+        listener,
+        acceptor,
+        signing_cert,
+        signing_key,
+        PairCertificateMode::SubmittedCsr,
+    ));
+
+    let nonce = PAIR_EXAMPLE_NONCE;
+    let label = PAIR_EXAMPLE_DEVICE_LABEL;
+    let endpoints = [
+        spl_core::pairlink::Endpoint {
+            host: "127.0.0.1".to_owned(),
+            port: closed_port,
+        },
+        spl_core::pairlink::Endpoint {
+            host: "127.0.0.1".to_owned(),
+            port: valid_port,
+        },
+    ];
+
+    let obs = spl_transport::OperationObserver::new();
+    let credential = spl_transport::pairing::pair_observed(
+        &endpoints,
+        nonce,
+        &server_pin,
+        label,
+        &serde_json::Map::new(),
+        Some(&obs),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(credential.instance_id, PAIR_EXAMPLE_INSTANCE_ID);
+    assert_eq!(obs.dial_attempts(), 2);
+    assert_eq!(
+        obs.selected_path(),
+        Some(spl_transport::SelectedPath::Direct)
+    );
+    assert_eq!(obs.request_bytes_sent(), 0);
+
+    server.await.unwrap();
 }

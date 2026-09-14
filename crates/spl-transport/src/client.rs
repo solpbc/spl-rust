@@ -4,6 +4,7 @@
 //! Direct-or-relay carrier dialing for a paired SPL credential.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use rustls::ClientConfig;
@@ -18,10 +19,89 @@ use crate::{RelayError, TransportError, tls};
 /// Relay transient retry count. Mirrors the LAN connection/handshake retry bound.
 const RELAY_MAX_TRANSIENT_ATTEMPTS: usize = 5;
 
-enum RefreshAction {
+/// Relay permission returned by a [`RelayFence`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RelayPermit {
+    /// Relay communication is currently permitted.
+    Allow,
+    /// Relay communication is temporarily or administratively disabled.
+    Disabled,
+    /// The incarnation is retired or obsolete; relay communication is permanently disallowed for this client.
+    Retired,
+}
+
+/// Object-safe gate synchronizing relay access and durable token commit against consumer lifecycle.
+///
+/// Consumers serialize revoke/disable/retire operations against [`with_publication`](RelayFence::with_publication),
+/// ensuring the library's permit check, transactional durable commit, and live mutex assignment execute as a
+/// single atomic critical section.
+pub trait RelayFence: Send + Sync + 'static {
+    /// Evaluate whether relay communication is permitted for `incarnation`.
+    fn permit(&self, incarnation: u64) -> RelayPermit;
+    /// Consumer serializes revoke/disable/retire against this section.
+    fn with_publication(&self, body: &mut dyn FnMut());
+}
+
+/// Outcome of a durable consumer token transaction commit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TokenCommit {
+    /// Token was durably committed at the specified generation sequence.
+    Committed {
+        /// The monotonically increasing generation number assigned by the transaction.
+        generation: u64,
+    },
+    /// Token update was rejected or unchanged; existing state remains valid.
+    Unchanged,
+    /// Token commit outcome is unknown/indeterminate; live token must not update and relay becomes ineligible.
+    Indeterminate,
+}
+
+/// Context provided to [`TokenTransaction::commit`].
+#[derive(Debug)]
+pub struct TokenCommitContext<'a> {
+    /// The newly acquired token to commit.
+    pub token: &'a str,
+    /// Unix timestamp (seconds) when the token expires.
+    pub expires_at: i64,
+    /// The token being replaced.
+    pub previous_token: &'a str,
+    /// The incarnation sequence number of the client.
+    pub incarnation: u64,
+}
+
+/// Consumer-provided transaction interface for durable token storage.
+pub trait TokenTransaction: Send + Sync + 'static {
+    /// Commit a newly refreshed token.
+    ///
+    /// The transaction must return one of three honest outcomes:
+    /// - [`TokenCommit::Committed`]: The token was written to durable storage; the client will subsequently update its in-memory live token and proceed.
+    /// - [`TokenCommit::Unchanged`]: The update was rejected or considered stale by durable storage; the previous token remains in place and refresh reports publication rejection.
+    /// - [`TokenCommit::Indeterminate`]: Storage state could not be confirmed (e.g. timeout or storage fault); the client leaves its live token unchanged and marks itself relay-ineligible to prevent unauthenticated network loops.
+    fn commit(&self, ctx: TokenCommitContext<'_>) -> TokenCommit;
+}
+
+/// Token publication and lifecycle configuration for [`TransportClient`].
+///
+/// Dispatches durable token commits through an owned background task that survives
+/// cancellation or dropping of calling request futures.
+#[derive(Clone)]
+pub struct TokenPublication {
+    /// The transactional commit implementation.
+    pub transaction: Arc<dyn TokenTransaction>,
+    /// Optional fence synchronizing relay access against consumer lifecycle.
+    pub fence: Option<Arc<dyn RelayFence>>,
+    /// Monotonic incarnation number for the client instance.
+    pub incarnation: u64,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum RefreshAction {
     Redial,
     Terminal,
     Transient,
+    Rejected,
+    Indeterminate,
+    FenceDenied(RelayPermit),
 }
 
 pub(crate) trait CarrierIo: AsyncRead + AsyncWrite + Send + Unpin {}
@@ -63,11 +143,14 @@ pub type TokenPersistHook = Arc<dyn Fn(&str, i64) + Send + Sync + 'static>;
 
 /// SPL transport client for direct and relay carrier establishment.
 pub struct TransportClient {
-    credential: Credential,
-    config: Arc<ClientConfig>,
-    /// Live relay device token; the mutex is the refresh single-flight gate.
-    device_token: Option<tokio::sync::Mutex<String>>,
-    token_persist: Option<TokenPersistHook>,
+    pub(crate) credential: Credential,
+    pub(crate) config: Arc<ClientConfig>,
+    /// Live relay device token.
+    pub(crate) device_token: Option<Arc<tokio::sync::Mutex<String>>>,
+    pub(crate) refresh_lock: Arc<tokio::sync::Mutex<()>>,
+    pub(crate) token_persist: Option<TokenPersistHook>,
+    pub(crate) publication: Option<TokenPublication>,
+    pub(crate) relay_ineligible: Arc<AtomicBool>,
 }
 
 impl TransportClient {
@@ -86,7 +169,7 @@ impl TransportClient {
                 "relay credential has no LAN endpoints".into(),
             ));
         }
-        Self::build(credential, token_persist)
+        Self::build(credential, token_persist, None)
     }
 
     /// Build a transport client for a credential that deliberately has only a
@@ -128,14 +211,101 @@ impl TransportClient {
                 "relay-only credential has no device token".into(),
             ));
         }
-        Self::build(credential, token_persist)
+        Self::build(credential, token_persist, None)
+    }
+
+    /// Build a transport client with a transactional publication interface and optional fence.
+    ///
+    /// # Sequencing and Cancellation
+    ///
+    /// Token refreshes execute durable commits before live in-memory assignment.
+    /// Publication is dispatched to an owned `spawn_blocking` task that runs to completion
+    /// even if the calling request future is cancelled or dropped.
+    ///
+    /// # Failure Outcomes
+    ///
+    /// - [`TokenCommit::Committed`]: Durable storage accepted the token; in-memory state is updated and redial proceeds.
+    /// - [`TokenCommit::Unchanged`]: Durable storage rejected the update; live state is kept and [`crate::request::RequestError::PublicationRejected`] is returned.
+    /// - [`TokenCommit::Indeterminate`]: Commit state is unknown; live state is kept and this client is latched as relay-ineligible, returning [`crate::request::RequestError::PublicationIndeterminate`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TransportError::Pairing`] when a relay credential has no LAN
+    /// endpoints, or a TLS/crypto error when certificate material is invalid.
+    pub fn new_with_publication(
+        credential: Credential,
+        publication: TokenPublication,
+    ) -> Result<Self, TransportError> {
+        if credential.relay_origin.is_some() && credential.endpoints.is_empty() {
+            return Err(TransportError::Pairing(
+                "relay credential has no LAN endpoints".into(),
+            ));
+        }
+        Self::build(credential, None, Some(publication))
+    }
+
+    /// Build a relay-only transport client with a transactional publication interface and optional fence.
+    ///
+    /// # Sequencing and Cancellation
+    ///
+    /// Token refreshes execute durable commits before live in-memory assignment.
+    /// Publication is dispatched to an owned `spawn_blocking` task that runs to completion
+    /// even if the calling request future is cancelled or dropped.
+    ///
+    /// # Failure Outcomes
+    ///
+    /// - [`TokenCommit::Committed`]: Durable storage accepted the token; in-memory state is updated and redial proceeds.
+    /// - [`TokenCommit::Unchanged`]: Durable storage rejected the update; live state is kept and [`crate::request::RequestError::PublicationRejected`] is returned.
+    /// - [`TokenCommit::Indeterminate`]: Commit state is unknown; live state is kept and this client is latched as relay-ineligible, returning [`crate::request::RequestError::PublicationIndeterminate`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TransportError::Pairing`] when the credential carries LAN
+    /// endpoints or lacks a relay origin or device token. Returns a TLS or crypto
+    /// error when the certificate, private key, or fingerprint pin is invalid.
+    pub fn new_relay_only_with_publication(
+        credential: Credential,
+        publication: TokenPublication,
+    ) -> Result<Self, TransportError> {
+        if !credential.endpoints.is_empty() {
+            return Err(TransportError::Pairing(
+                "relay-only credential has LAN endpoints; use TransportClient::new for a credential with LAN endpoints"
+                    .into(),
+            ));
+        }
+        if !matches!(
+            credential.relay_origin.as_deref(),
+            Some(origin) if !origin.is_empty()
+        ) {
+            return Err(TransportError::Pairing(
+                "relay-only credential has no relay origin".into(),
+            ));
+        }
+        if !matches!(
+            credential.device_token.as_deref(),
+            Some(token) if !token.is_empty()
+        ) {
+            return Err(TransportError::Pairing(
+                "relay-only credential has no device token".into(),
+            ));
+        }
+        Self::build(credential, None, Some(publication))
+    }
+
+    #[doc(hidden)]
+    pub fn live_token_mutex_for_test(&self) -> Option<Arc<tokio::sync::Mutex<String>>> {
+        self.device_token.clone()
     }
 
     fn build(
         credential: Credential,
         token_persist: Option<TokenPersistHook>,
+        publication: Option<TokenPublication>,
     ) -> Result<Self, TransportError> {
-        let device_token = credential.device_token.clone().map(tokio::sync::Mutex::new);
+        let device_token = credential
+            .device_token
+            .clone()
+            .map(|t| Arc::new(tokio::sync::Mutex::new(t)));
         let chain = tls::parse_certs(&credential.client_cert_pem)?;
         let key = tls::parse_private_key(&credential.client_key_pem)?;
         let config = Arc::new(tls::mtls_config(&credential.ca_fp_prefix, chain, key)?);
@@ -143,12 +313,18 @@ impl TransportClient {
             credential,
             config,
             device_token,
+            refresh_lock: Arc::new(tokio::sync::Mutex::new(())),
             token_persist,
+            publication,
+            relay_ineligible: Arc::new(AtomicBool::new(false)),
         })
     }
 
     /// Establish a persistent carrier, preferring direct LAN endpoints and
     /// falling back to the relay only after transient direct failures.
+    ///
+    /// Note: `dial_carrier` does not consult the local [`RelayFence`]; use
+    /// [`TransportClient::request`] for fence-coordinated access.
     ///
     /// A newly paired fingerprint can take a moment to reach every journal
     /// worker because the listener fans out across `SO_REUSEPORT` processes.
@@ -206,15 +382,17 @@ impl TransportClient {
         Err(lan_err)
     }
 
-    fn relay_eligible(&self) -> bool {
-        self.credential.relay_origin.is_some() && self.device_token.is_some()
+    pub(crate) fn relay_eligible(&self) -> bool {
+        self.credential.relay_origin.is_some()
+            && self.device_token.is_some()
+            && !self.relay_ineligible.load(Ordering::Acquire)
     }
 
     #[expect(
         clippy::expect_used,
         reason = "relay eligibility proves the live token mutex is present before this helper is called"
     )]
-    async fn current_token(&self) -> String {
+    pub(crate) async fn current_token(&self) -> String {
         self.device_token
             .as_ref()
             .expect("live device token present for relay dial")
@@ -229,13 +407,16 @@ impl TransportClient {
         }
     }
 
-    async fn refresh_if_current(&self, origin: &str, expected: &str) -> RefreshAction {
-        let Some(token) = &self.device_token else {
+    pub(crate) async fn refresh_if_current(&self, origin: &str, expected: &str) -> RefreshAction {
+        let Some(token_mutex) = &self.device_token else {
             return RefreshAction::Terminal;
         };
-        let mut guard = token.lock().await;
-        if guard.as_str() != expected {
-            return RefreshAction::Redial;
+        let refresh_guard = self.refresh_lock.clone().lock_owned().await;
+        {
+            let guard = token_mutex.lock().await;
+            if guard.as_str() != expected {
+                return RefreshAction::Redial;
+            }
         }
         #[expect(
             clippy::large_futures,
@@ -247,16 +428,68 @@ impl TransportClient {
                 device_token,
                 expires_at,
             } => {
-                #[expect(
-                    clippy::assigning_clones,
-                    reason = "the refreshed token must remain available for the persistence callback after replacing the live token"
-                )]
-                {
-                    *guard = device_token.clone();
+                if let Some(pub_cfg) = &self.publication {
+                    let pub_cfg = pub_cfg.clone();
+                    let old_token = expected.to_string();
+                    let new_token = device_token.clone();
+                    let mutex_clone = token_mutex.clone();
+                    let ineligible_flag = self.relay_ineligible.clone();
+                    let blocking_task = tokio::task::spawn_blocking(move || {
+                        let _guard = refresh_guard;
+                        let mut action = RefreshAction::Terminal;
+                        let fence = pub_cfg.fence.as_deref();
+                        let mut publish = || {
+                            if let Some(f) = fence {
+                                let permit = f.permit(pub_cfg.incarnation);
+                                if permit != RelayPermit::Allow {
+                                    action = RefreshAction::FenceDenied(permit);
+                                    return;
+                                }
+                            }
+                            let ctx = TokenCommitContext {
+                                token: &new_token,
+                                expires_at,
+                                previous_token: &old_token,
+                                incarnation: pub_cfg.incarnation,
+                            };
+                            let commit = pub_cfg.transaction.commit(ctx);
+                            match commit {
+                                TokenCommit::Unchanged => {
+                                    action = RefreshAction::Rejected;
+                                }
+                                TokenCommit::Indeterminate => {
+                                    ineligible_flag.store(true, Ordering::Release);
+                                    action = RefreshAction::Indeterminate;
+                                }
+                                TokenCommit::Committed { .. } => {
+                                    let mut g = mutex_clone.blocking_lock();
+                                    (*g).clone_from(&new_token);
+                                    action = RefreshAction::Redial;
+                                }
+                            }
+                        };
+                        if let Some(f) = fence {
+                            f.with_publication(&mut publish);
+                        } else {
+                            publish();
+                        }
+                        action
+                    });
+                    blocking_task.await.unwrap_or(RefreshAction::Indeterminate)
+                } else {
+                    let mut guard = token_mutex.lock().await;
+                    #[expect(
+                        clippy::assigning_clones,
+                        reason = "the refreshed token must remain available for the persistence callback after replacing the live token"
+                    )]
+                    {
+                        *guard = device_token.clone();
+                    }
+                    drop(guard);
+                    self.persist_token(&device_token, expires_at);
+                    drop(refresh_guard);
+                    RefreshAction::Redial
                 }
-                drop(guard);
-                self.persist_token(&device_token, expires_at);
-                RefreshAction::Redial
             }
             RefreshOutcome::ReconnectNeeded => RefreshAction::Terminal,
             RefreshOutcome::TransientError => RefreshAction::Transient,
@@ -314,7 +547,11 @@ impl TransportClient {
                             reason = "the explicit redial branch documents that refreshed credentials restart the relay dial loop"
                         )]
                         RefreshAction::Redial => continue,
-                        RefreshAction::Terminal | RefreshAction::Transient => {
+                        RefreshAction::Terminal
+                        | RefreshAction::Transient
+                        | RefreshAction::Rejected
+                        | RefreshAction::Indeterminate
+                        | RefreshAction::FenceDenied(_) => {
                             return Err(TransportError::Relay(RelayError::Unauthorized));
                         }
                     }
@@ -342,7 +579,7 @@ fn token_should_refresh(token: &str, now_secs: i64) -> bool {
         .unwrap_or(false)
 }
 
-fn now_secs() -> i64 {
+pub(crate) fn now_secs() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |duration| {
@@ -366,7 +603,7 @@ fn relay_fault_is_transient(error: &RelayError) -> bool {
     )
 }
 
-fn relay_fault_is_transient_err(error: &TransportError) -> bool {
+pub(crate) fn relay_fault_is_transient_err(error: &TransportError) -> bool {
     matches!(error, TransportError::Relay(relay) if relay_fault_is_transient(relay))
 }
 
@@ -417,8 +654,11 @@ mod tests {
                 device_token_expires_at: None,
             },
             config: Arc::new(tls::trust_all_pairing_config().unwrap()),
-            device_token: token.map(tokio::sync::Mutex::new),
+            device_token: token.map(|t| Arc::new(tokio::sync::Mutex::new(t))),
+            refresh_lock: Arc::new(tokio::sync::Mutex::new(())),
             token_persist: None,
+            publication: None,
+            relay_ineligible: Arc::new(AtomicBool::new(false)),
         }
     }
 

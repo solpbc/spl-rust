@@ -60,6 +60,9 @@ pub mod relay_window;
 /// Default TCP port for direct-network pairing endpoints.
 pub const DEFAULT_DIRECT_PORT: u16 = 7657;
 
+pub use http::DEFAULT_HTTP_HOST;
+pub use mux::MAX_ASSEMBLED_BYTES;
+
 /// HTTP path for the nonce-authorized direct pairing request.
 ///
 /// Protocol: [`.proto-ref/pairing.md`, “mobile posts the CSR to the pair URL”](../../../.proto-ref/pairing.md#5-mobile-posts-the-csr-to-the-pair-url).

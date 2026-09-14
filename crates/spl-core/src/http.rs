@@ -203,18 +203,23 @@ impl ChunkedDecoder {
     }
 }
 
+/// The default pinned TLS server name, and the `host` every journal-facing
+/// request carries unless explicitly overridden.
+pub const DEFAULT_HTTP_HOST: &str = "spl.local";
+
 fn is_framing_owned(name: &str) -> bool {
     name.eq_ignore_ascii_case("host")
         || name.eq_ignore_ascii_case("content-length")
         || name.eq_ignore_ascii_case("accept")
 }
 
-/// Build the HTTP/1.1 request head for a single PL stream. `headers` are the
-/// caller's extra headers (e.g. auth, content-type); `host`, `content-length`,
-/// and a default `accept` are added by the transport, `accept` overridable.
-pub fn build_request_head(
+/// Build the HTTP/1.1 request head for a single PL stream with an explicit `host`.
+/// `headers` are the caller's extra headers (e.g. auth, content-type); `host`,
+/// `content-length`, and a default `accept` are added by the transport, `accept` overridable.
+pub fn build_request_head_with_host(
     method: &str,
     path: &str,
+    host: &str,
     headers: &[(String, String)],
     content_length: usize,
 ) -> Vec<u8> {
@@ -223,7 +228,9 @@ pub fn build_request_head(
     head.push(' ');
     head.push_str(path);
     head.push_str(" HTTP/1.1\r\n");
-    head.push_str("host: spl.local\r\n");
+    head.push_str("host: ");
+    head.push_str(host);
+    head.push_str("\r\n");
 
     match headers
         .iter()
@@ -254,6 +261,29 @@ pub fn build_request_head(
     head.into_bytes()
 }
 
+/// Build the HTTP/1.1 request head for a single PL stream with the default `spl.local` host.
+pub fn build_request_head(
+    method: &str,
+    path: &str,
+    headers: &[(String, String)],
+    content_length: usize,
+) -> Vec<u8> {
+    build_request_head_with_host(method, path, DEFAULT_HTTP_HOST, headers, content_length)
+}
+
+/// Build the complete HTTP/1.1 request bytes for a single PL stream with an explicit `host`.
+pub fn build_request_with_host(
+    method: &str,
+    path: &str,
+    host: &str,
+    headers: &[(String, String)],
+    body: &[u8],
+) -> Vec<u8> {
+    let mut out = build_request_head_with_host(method, path, host, headers, body.len());
+    out.extend_from_slice(body);
+    out
+}
+
 /// Build the complete HTTP/1.1 request bytes for a single PL stream.
 ///
 /// This is the complete-body convenience wrapper around
@@ -264,9 +294,7 @@ pub fn build_request(
     headers: &[(String, String)],
     body: &[u8],
 ) -> Vec<u8> {
-    let mut out = build_request_head(method, path, headers, body.len());
-    out.extend_from_slice(body);
-    out
+    build_request_with_host(method, path, DEFAULT_HTTP_HOST, headers, body)
 }
 
 pub(crate) fn find_subsequence(haystack: &[u8], needle: &[u8]) -> Option<usize> {
@@ -391,6 +419,35 @@ mod tests {
     use super::*;
 
     #[test]
+    fn build_request_default_host_byte_identical() {
+        let headers = vec![("X-Custom".to_string(), "val".to_string())];
+        let bytes_default = build_request("GET", "/test", &headers, b"");
+        let expected = b"GET /test HTTP/1.1\r\nhost: spl.local\r\naccept: application/json\r\nX-Custom: val\r\ncontent-length: 0\r\n\r\n";
+        assert_eq!(bytes_default, expected);
+    }
+
+    #[test]
+    fn build_request_with_host_emits_explicit_host_once() {
+        let headers = vec![
+            ("Host".to_string(), "spoofed.host".to_string()),
+            ("HOST".to_string(), "another.host".to_string()),
+            ("host".to_string(), "lowercase.host".to_string()),
+        ];
+        let bytes = build_request_with_host("GET", "/test", "127.0.0.1:8080", &headers, b"");
+        let text = String::from_utf8(bytes).unwrap();
+        assert!(text.contains("host: 127.0.0.1:8080\r\n"));
+        assert!(!text.contains("spoofed.host"));
+        assert!(!text.contains("another.host"));
+        assert!(!text.contains("lowercase.host"));
+        assert_eq!(
+            text.matches("host:").count()
+                + text.matches("Host:").count()
+                + text.matches("HOST:").count(),
+            1
+        );
+    }
+
+    #[test]
     fn build_request_owns_host_accept_and_content_length() {
         let headers = vec![
             ("Content-Type".to_string(), "application/json".to_string()),
@@ -411,6 +468,32 @@ mod tests {
         assert!(!text.contains("host: evil"));
         assert!(!text.contains("content-length: 999"));
         assert!(text.ends_with("\r\n\r\npayload"));
+    }
+
+    #[test]
+    fn build_request_with_host_matches_default() {
+        let headers = vec![("Content-Type".to_string(), "application/json".to_string())];
+        let req1 = build_request("POST", "/test", &headers, b"payload");
+        let req2 =
+            build_request_with_host("POST", "/test", DEFAULT_HTTP_HOST, &headers, b"payload");
+        assert_eq!(req1, req2);
+
+        let head1 = build_request_head("POST", "/test", &headers, 7);
+        let head2 = build_request_head_with_host("POST", "/test", DEFAULT_HTTP_HOST, &headers, 7);
+        assert_eq!(head1, head2);
+    }
+
+    #[test]
+    fn build_request_with_custom_host_overrides_host_header() {
+        let headers = vec![
+            ("Host".to_string(), "caller-host".to_string()),
+            ("Content-Type".to_string(), "application/json".to_string()),
+        ];
+        let bytes = build_request_with_host("GET", "/status", "custom.relay.net", &headers, b"");
+        let text = String::from_utf8(bytes).unwrap();
+        assert!(text.contains("host: custom.relay.net\r\n"));
+        assert!(!text.contains("caller-host"));
+        assert_eq!(text.matches("host:").count(), 1);
     }
 
     #[test]

@@ -39,7 +39,7 @@ pub const UPLOAD_BODY_STAGE_CAPACITY: usize = 256 * 1024;
 const RECEIVE_GRANT_THRESHOLD: u64 = (INITIAL_WINDOW / 2) as u64;
 /// Robustness cap for assembled response bytes. Only the pinned journal can send
 /// these bytes, but a bad peer must not grow memory without bound.
-const MAX_ASSEMBLED_BYTES: usize = 4 * 1024 * 1024;
+pub const MAX_ASSEMBLED_BYTES: usize = 4 * 1024 * 1024;
 
 /// Errors produced by mux state machines and response assembly.
 #[derive(Debug, Error, PartialEq, Eq)]
@@ -427,6 +427,7 @@ pub struct DemuxOutput {
 /// Re-assembles response frames for one dialer stream into the HTTP body.
 pub struct ResponseAssembler {
     stream_id: u32,
+    cap: usize,
     decoder: FrameDecoder,
     body: Vec<u8>,
     recv_window: RecvWindow,
@@ -436,10 +437,16 @@ pub struct ResponseAssembler {
 }
 
 impl ResponseAssembler {
-    /// Construct a one-shot response assembler for `stream_id`.
+    /// Construct a one-shot response assembler for `stream_id` with the default 4 MiB cap.
     pub fn new(stream_id: u32) -> Self {
+        Self::with_cap(stream_id, MAX_ASSEMBLED_BYTES)
+    }
+
+    /// Construct a one-shot response assembler for `stream_id` with a custom body cap.
+    pub fn with_cap(stream_id: u32, cap: usize) -> Self {
         Self {
             stream_id,
+            cap,
             decoder: FrameDecoder::new(),
             body: Vec::new(),
             recv_window: RecvWindow::new(),
@@ -487,7 +494,7 @@ impl ResponseAssembler {
                     .len()
                     .checked_add(frame.payload.len())
                     .ok_or(MuxError::CapExceeded)?;
-                if assembled_len > MAX_ASSEMBLED_BYTES {
+                if assembled_len > self.cap {
                     return Err(MuxError::CapExceeded);
                 }
                 if self.recv_window.debit(frame.payload.len()).is_err() {
@@ -1334,6 +1341,19 @@ mod tests {
     }
 
     #[test]
+    fn response_assembler_honors_custom_cap_before_append() {
+        let mut asm = ResponseAssembler::with_cap(1, 3);
+        let frame_abc = Frame::new(1, FLAG_DATA, b"abc".to_vec());
+        asm.feed(&frame_abc.encode().unwrap()).unwrap();
+
+        let frame_d = Frame::new(1, FLAG_DATA, b"d".to_vec());
+        assert_eq!(
+            asm.feed(&frame_d.encode().unwrap()).unwrap_err(),
+            MuxError::CapExceeded
+        );
+    }
+
+    #[test]
     fn response_assembler_grants_exact_wire_bytes_at_half_window() {
         let mut asm = ResponseAssembler::new(1);
         let first = Frame::new(1, FLAG_DATA, vec![b'x'; 524_247]);
@@ -2065,5 +2085,22 @@ mod tests {
         )
         .unwrap();
         assert_eq!(asm.into_response().unwrap_err(), MuxError::Incomplete);
+    }
+
+    #[test]
+    fn response_assembler_with_cap_enforces_exact_limit() {
+        let mut asm = ResponseAssembler::with_cap(1, 3);
+        let frame1 = Frame::new(1, FLAG_DATA, b"abc".to_vec()).encode().unwrap();
+        assert!(asm.feed(&frame1).is_ok());
+
+        let frame2 = Frame::new(1, FLAG_DATA, b"d".to_vec()).encode().unwrap();
+        assert_eq!(asm.feed(&frame2).unwrap_err(), MuxError::CapExceeded);
+    }
+
+    #[test]
+    fn response_assembler_default_cap_is_max_assembled_bytes() {
+        let asm = ResponseAssembler::new(1);
+        assert_eq!(asm.cap, MAX_ASSEMBLED_BYTES);
+        assert_eq!(MAX_ASSEMBLED_BYTES, 4 * 1024 * 1024);
     }
 }

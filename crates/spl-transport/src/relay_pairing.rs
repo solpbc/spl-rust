@@ -47,11 +47,32 @@ pub async fn pair_over_relay(
     device_label: &str,
     additional_fields: &serde_json::Map<String, serde_json::Value>,
 ) -> Result<Credential, TransportError> {
+    #[expect(
+        clippy::large_futures,
+        reason = "the copied transport future keeps its established stack layout; this site goes red if a later refactor shrinks it"
+    )]
+    pair_over_relay_observed(link, device_label, additional_fields, None).await
+}
+
+/// Complete the relay-form SPL pairing ceremony with operation observation.
+///
+/// # Errors
+///
+/// Returns a relay, TLS, JSON, certificate-binding, enrollment, or credential
+/// verification error when the ceremony cannot complete safely.
+pub async fn pair_over_relay_observed(
+    link: &RelayPairLink,
+    device_label: &str,
+    additional_fields: &serde_json::Map<String, serde_json::Value>,
+    observer: Option<&crate::observe::OperationObserver>,
+) -> Result<Credential, TransportError> {
     let rk = spl_core::relay_window::derive_rk(&link.s);
     let url = spl_core::relay::pair_dial_url(&link.relay_origin)
         .map_err(|e| TransportError::PairLink(format!("relay origin: {e}")))?;
+    crate::observe::note_dial_attempt(observer);
     let ws = relay::dial_pair_relay_ws(&url, &hex_lower(&rk), relay::outer_config()).await?;
     let (duplex, termination) = relay::WsByteDuplex::new(ws);
+    crate::observe::note_dial_attempt(observer);
     let material = match pair_over_carrier(duplex, link, device_label, additional_fields).await {
         Ok(material) => material,
         Err(error) => {
@@ -77,6 +98,7 @@ pub async fn pair_over_relay(
     } else {
         match material.pair.home_attestation.as_deref() {
             Some(home_attestation) => {
+                crate::observe::note_enrollment(observer);
                 #[expect(
                     clippy::large_futures,
                     reason = "compatibility enrollment retains the established control-plane future"
@@ -99,6 +121,8 @@ pub async fn pair_over_relay(
         .map(|claims| claims.exp);
     let ca_fp_prefix = ca::sha256(material.pinned_ca.as_ref())[..16].to_vec();
     let endpoints = endpoint_addrs_from_local_endpoints(material.pair.local_endpoints.as_ref());
+
+    crate::observe::note_selected_path(observer, crate::request::SelectedPath::Relay);
 
     Ok(Credential {
         client_key_pem: material.client_key_pem,

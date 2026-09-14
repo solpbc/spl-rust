@@ -121,13 +121,39 @@ pub async fn pair(
     device_label: &str,
     additional_fields: &serde_json::Map<String, serde_json::Value>,
 ) -> Result<Credential, TransportError> {
-    pair_with_seam(
+    pair_observed(
+        endpoints,
+        nonce_hex,
+        ca_fp_prefix,
+        device_label,
+        additional_fields,
+        None,
+    )
+    .await
+}
+
+/// Pair against the given candidate endpoints with an optional operation observer.
+///
+/// # Errors
+///
+/// Returns an endpoint, TLS, I/O, HTTP, JSON, or pairing-verification error if
+/// the ceremony cannot produce a verified credential.
+pub async fn pair_observed(
+    endpoints: &[Endpoint],
+    nonce_hex: &str,
+    ca_fp_prefix: &[u8],
+    device_label: &str,
+    additional_fields: &serde_json::Map<String, serde_json::Value>,
+    observer: Option<&crate::observe::OperationObserver>,
+) -> Result<Credential, TransportError> {
+    pair_with_seam_observed(
         endpoints,
         nonce_hex,
         ca_fp_prefix,
         device_label,
         Arc::new(RealDirectPairingSeam),
         additional_fields,
+        observer,
     )
     .await
 }
@@ -151,6 +177,38 @@ pub async fn pair_with_seam(
     seam: Arc<dyn DirectPairingSeam>,
     additional_fields: &serde_json::Map<String, serde_json::Value>,
 ) -> Result<Credential, TransportError> {
+    pair_with_seam_observed(
+        endpoints,
+        nonce_hex,
+        ca_fp_prefix,
+        device_label,
+        seam,
+        additional_fields,
+        None,
+    )
+    .await
+}
+
+/// Pair through a consumer-supplied direct transport with an optional operation observer.
+///
+/// # Errors
+///
+/// Returns an endpoint, TLS, I/O, HTTP, JSON, or pairing-verification error if
+/// the ceremony cannot produce a verified credential.
+///
+/// # Panics
+///
+/// Does not panic: the non-empty endpoint guard and exhaustive candidate loop
+/// guarantee a preparation error is recorded before the invariant assertion.
+pub async fn pair_with_seam_observed(
+    endpoints: &[Endpoint],
+    nonce_hex: &str,
+    ca_fp_prefix: &[u8],
+    device_label: &str,
+    seam: Arc<dyn DirectPairingSeam>,
+    additional_fields: &serde_json::Map<String, serde_json::Value>,
+    observer: Option<&crate::observe::OperationObserver>,
+) -> Result<Credential, TransportError> {
     if endpoints.is_empty() {
         return Err(TransportError::NoEndpoint);
     }
@@ -163,9 +221,11 @@ pub async fn pair_with_seam(
 
     let mut last_err: Option<TransportError> = None;
     for endpoint in endpoints {
+        crate::observe::note_dial_attempt(observer);
         match seam.prepare(config.clone(), endpoint).await {
             Ok(connection) => {
                 let response = connection.send("POST", &path, &headers, &body).await?;
+                crate::observe::note_selected_path(observer, crate::request::SelectedPath::Direct);
                 return credential_from_direct_pair_response(
                     response,
                     generated,
@@ -198,32 +258,63 @@ pub async fn pair_from_link(
         clippy::large_futures,
         reason = "the copied transport future keeps its established stack layout; this site goes red if a later refactor shrinks it"
     )]
-    let result = pair_from_link_with_seam(
+    pair_from_link_observed(link, device_label, additional_fields, None).await
+}
+
+/// Parse a `https://go.solstone.app/p#…` pair-link and pair against it with an optional operation observer.
+///
+/// # Errors
+///
+/// Returns a pair-link parsing error or any direct/relay pairing error.
+pub async fn pair_from_link_observed(
+    link: &str,
+    device_label: &str,
+    additional_fields: &serde_json::Map<String, serde_json::Value>,
+    observer: Option<&crate::observe::OperationObserver>,
+) -> Result<Credential, TransportError> {
+    #[expect(
+        clippy::large_futures,
+        reason = "the copied transport future keeps its established stack layout; this site goes red if a later refactor shrinks it"
+    )]
+    let result = pair_from_link_with_seam_observed(
         link,
         device_label,
         Arc::new(RealDirectPairingSeam),
         additional_fields,
+        observer,
     )
     .await;
     result
 }
 
+#[cfg(test)]
 async fn pair_from_link_with_seam(
     link: &str,
     device_label: &str,
     seam: Arc<dyn DirectPairingSeam>,
     additional_fields: &serde_json::Map<String, serde_json::Value>,
 ) -> Result<Credential, TransportError> {
+    pair_from_link_with_seam_observed(link, device_label, seam, additional_fields, None).await
+}
+
+async fn pair_from_link_with_seam_observed(
+    link: &str,
+    device_label: &str,
+    seam: Arc<dyn DirectPairingSeam>,
+    additional_fields: &serde_json::Map<String, serde_json::Value>,
+    observer: Option<&crate::observe::OperationObserver>,
+) -> Result<Credential, TransportError> {
     let parsed = pairlink::parse(link).map_err(|e| TransportError::PairLink(e.to_string()))?;
     match parsed {
         ParsedPairLink::Direct(pl) => {
-            pair_with_seam(
+            pair_with_seam_observed(
                 &pl.candidates,
                 &pl.nonce_hex,
                 &pl.ca_fp_prefix,
                 device_label,
                 seam,
                 additional_fields,
+                observer,
             )
             .await
         }
@@ -232,7 +323,13 @@ async fn pair_from_link_with_seam(
                 clippy::large_futures,
                 reason = "the copied transport future keeps its established stack layout; this site goes red if a later refactor shrinks it"
             )]
-            let result = relay_pairing::pair_over_relay(&rl, device_label, additional_fields).await;
+            let result = relay_pairing::pair_over_relay_observed(
+                &rl,
+                device_label,
+                additional_fields,
+                observer,
+            )
+            .await;
             result
         }
     }

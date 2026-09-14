@@ -99,16 +99,11 @@ pub enum RequestError {
 }
 
 fn check_fence(publication: Option<&crate::client::TokenPublication>) -> Result<(), RequestError> {
-    if let Some(pub_cfg) = publication
-        && let Some(fence) = &pub_cfg.fence
-    {
-        match fence.permit(pub_cfg.incarnation) {
-            RelayPermit::Allow => {}
-            RelayPermit::Disabled => return Err(RequestError::RelayDisabled),
-            RelayPermit::Retired => return Err(RequestError::RelayRetired),
-        }
+    match crate::client::relay_fence_permit(publication) {
+        Ok(()) | Err(RelayPermit::Allow) => Ok(()),
+        Err(RelayPermit::Disabled) => Err(RequestError::RelayDisabled),
+        Err(RelayPermit::Retired) => Err(RequestError::RelayRetired),
     }
-    Ok(())
 }
 
 impl TransportClient {

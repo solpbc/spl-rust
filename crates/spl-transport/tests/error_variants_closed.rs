@@ -6,7 +6,18 @@
 //! If a variant is added or removed from either enum, this fixture will fail to compile
 //! because of non-exhaustive matching.
 
-use spl_transport::{RelayError, TransportError};
+use spl_transport::{CarrierOpenError, RelayError, TransportError};
+
+#[allow(dead_code)]
+fn match_carrier_open_error_exhaustively(err: &CarrierOpenError) -> &'static str {
+    match err {
+        CarrierOpenError::Transport(_) => "transport",
+        CarrierOpenError::RelayDisabled => "relay_disabled",
+        CarrierOpenError::RelayRetired => "relay_retired",
+        CarrierOpenError::PublicationRejected => "publication_rejected",
+        CarrierOpenError::PublicationIndeterminate => "publication_indeterminate",
+    }
+}
 
 #[allow(dead_code)]
 fn match_transport_error_exhaustively(err: &TransportError) -> &'static str {

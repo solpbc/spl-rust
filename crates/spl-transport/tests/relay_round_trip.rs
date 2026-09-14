@@ -48,7 +48,7 @@ use spl_transport::home_relay::{
 use spl_transport::journal_bridge::{self, BridgePolicy, CarrierOpener, JournalBridgeConfig};
 use spl_transport::relay::{dial_relay_ws, request_once_over_ws, request_once_relay};
 use spl_transport::tls::{mtls_config, pairing_config};
-use spl_transport::{RelayError, TransportError, transport_error_code};
+use spl_transport::{RelayError, RelayFence, TransportError, transport_error_code};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, DuplexStream};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::task::JoinHandle;
@@ -3092,5 +3092,1000 @@ async fn relay_publication_split_guard_mutex_synchronizes_state() {
 
     // After publication finishes, fence lock is released
     assert!(fence.lock.try_lock().is_ok());
+    relay.abort();
+}
+
+// // =========================================================================
+// open_carrier AC1 / AC2 / AC3 / AC4 tests
+// =========================================================================
+
+#[tokio::test]
+#[expect(
+    clippy::large_futures,
+    reason = "the copied transport future keeps its established stack layout; this site goes red if a later refactor shrinks it"
+)]
+async fn open_carrier_direct_succeeds_while_relay_disabled() {
+    let (pin, acceptor) = tls_pair_with_pin();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+
+    tokio::spawn(async move {
+        let (tcp, _) = listener.accept().await.unwrap();
+        let _tls = acceptor.accept(tcp).await.unwrap();
+    });
+
+    let now = epoch_secs();
+    let token = mint_jwt(now, now + 10_000);
+    let mut cred = relay_credential(pin, port, "https://invalid.relay.test".into(), token);
+    cred.endpoints = vec![EndpointAddr {
+        host: "127.0.0.1".into(),
+        port,
+    }];
+
+    let fence = Arc::new(TestFence {
+        permit: std::sync::atomic::AtomicU8::new(1), // Disabled
+    });
+    let tx = Arc::new(TestTransaction {
+        outcome: std::sync::atomic::AtomicU8::new(0),
+        commits: std::sync::atomic::AtomicUsize::new(0),
+    });
+    let pub_cfg = spl_transport::TokenPublication {
+        transaction: tx,
+        fence: Some(fence),
+        incarnation: 1,
+    };
+
+    let client = TransportClient::new_with_publication(cred, pub_cfg).unwrap();
+    let obs = spl_transport::OperationObserver::new();
+
+    let _carrier = client.open_carrier(Some(&obs)).await.unwrap();
+    assert_eq!(obs.dial_attempts(), 1);
+    assert_eq!(
+        obs.selected_path(),
+        Some(spl_transport::SelectedPath::Direct)
+    );
+}
+
+#[tokio::test]
+#[expect(
+    clippy::large_futures,
+    reason = "the copied transport future keeps its established stack layout; this site goes red if a later refactor shrinks it"
+)]
+async fn open_carrier_initial_relay_denial_does_not_dial() {
+    let (pin, acceptor) = tls_pair_with_pin();
+    let now = epoch_secs();
+    let token = mint_jwt(now, now + 10_000);
+    let relay = spawn_combined_relay(acceptor, CombinedWsMode::AcceptAny, token.clone()).await;
+    let cred = relay_only_credential(pin, relay.origin.clone(), token);
+
+    let fence = Arc::new(TestFence {
+        permit: std::sync::atomic::AtomicU8::new(1), // Disabled
+    });
+    let tx = Arc::new(TestTransaction {
+        outcome: std::sync::atomic::AtomicU8::new(0),
+        commits: std::sync::atomic::AtomicUsize::new(0),
+    });
+    let pub_cfg = spl_transport::TokenPublication {
+        transaction: tx,
+        fence: Some(fence.clone()),
+        incarnation: 1,
+    };
+
+    let client = TransportClient::new_relay_only_with_publication(cred, pub_cfg).unwrap();
+    let obs = spl_transport::OperationObserver::new();
+
+    // Fence disabled
+    let Err(err) = client.open_carrier(Some(&obs)).await else {
+        panic!("expected failure");
+    };
+    assert!(matches!(
+        err,
+        spl_transport::CarrierOpenError::RelayDisabled
+    ));
+    assert_eq!(relay.state.ws_dials.load(Ordering::SeqCst), 0);
+    assert_eq!(obs.dial_attempts(), 0);
+    assert_eq!(obs.selected_path(), None);
+
+    // Fence retired
+    fence.permit.store(2, Ordering::SeqCst);
+    let obs2 = spl_transport::OperationObserver::new();
+    let Err(err2) = client.open_carrier(Some(&obs2)).await else {
+        panic!("expected failure");
+    };
+    assert!(matches!(
+        err2,
+        spl_transport::CarrierOpenError::RelayRetired
+    ));
+    assert_eq!(relay.state.ws_dials.load(Ordering::SeqCst), 0);
+    assert_eq!(obs2.dial_attempts(), 0);
+    assert_eq!(obs2.selected_path(), None);
+
+    relay.abort();
+}
+
+#[tokio::test]
+#[expect(
+    clippy::large_futures,
+    reason = "the copied transport future keeps its established stack layout; this site goes red if a later refactor shrinks it"
+)]
+async fn open_carrier_fence_disabled_during_backoff_aborts_retry() {
+    let (pin, acceptor) = tls_pair_with_pin();
+    let now = epoch_secs();
+    let token = mint_jwt(now, now + 10_000);
+    let relay =
+        spawn_combined_relay(acceptor, CombinedWsMode::UpgradeReject(503), token.clone()).await;
+    let cred = relay_only_credential(pin, relay.origin.clone(), token);
+
+    let fence = Arc::new(TestFence {
+        permit: std::sync::atomic::AtomicU8::new(0), // Allow
+    });
+    let tx = Arc::new(TestTransaction {
+        outcome: std::sync::atomic::AtomicU8::new(0),
+        commits: std::sync::atomic::AtomicUsize::new(0),
+    });
+    let pub_cfg = spl_transport::TokenPublication {
+        transaction: tx,
+        fence: Some(fence.clone()),
+        incarnation: 1,
+    };
+
+    let client = TransportClient::new_relay_only_with_publication(cred, pub_cfg).unwrap();
+    let fence_clone = fence.clone();
+    let state_clone = relay.state.clone();
+
+    tokio::spawn(async move {
+        while state_clone.ws_dials.load(Ordering::SeqCst) == 0 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        fence_clone.permit.store(1, Ordering::SeqCst); // Disabled
+    });
+
+    let Err(err) = client.open_carrier(None).await else {
+        panic!("expected failure");
+    };
+    assert!(matches!(
+        err,
+        spl_transport::CarrierOpenError::RelayDisabled
+    ));
+    assert_eq!(relay.state.ws_dials.load(Ordering::SeqCst), 1);
+
+    relay.abort();
+}
+
+struct BarrierWaitFence {
+    entered: std::sync::mpsc::Sender<()>,
+    release: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
+    permit_val: std::sync::atomic::AtomicU8,
+}
+
+impl spl_transport::RelayFence for BarrierWaitFence {
+    fn permit(&self, _incarnation: u64) -> spl_transport::RelayPermit {
+        match self.permit_val.load(Ordering::SeqCst) {
+            0 => spl_transport::RelayPermit::Allow,
+            1 => spl_transport::RelayPermit::Disabled,
+            _ => spl_transport::RelayPermit::Retired,
+        }
+    }
+    fn with_publication(&self, f: &mut dyn FnMut()) {
+        let _ = self.entered.send(());
+        self.release
+            .lock()
+            .unwrap()
+            .recv_timeout(std::time::Duration::from_secs(30))
+            .expect("barrier timed out");
+        f();
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[expect(
+    clippy::large_futures,
+    reason = "the copied transport future keeps its established stack layout; this site goes red if a later refactor shrinks it"
+)]
+async fn open_carrier_retirement_during_refresh_prevents_publication_and_redial() {
+    let (pin, acceptor) = tls_pair_with_pin();
+    let now = epoch_secs();
+    let expired_token = mint_jwt(now - 1000, now - 10);
+    let fresh_token = mint_jwt(now, now + 10_000);
+    let relay =
+        spawn_combined_relay(acceptor, CombinedWsMode::AcceptAny, fresh_token.clone()).await;
+    let cred = relay_only_credential(pin, relay.origin.clone(), expired_token.clone());
+
+    let (enter_tx, enter_rx) = std::sync::mpsc::channel();
+    let (rel_tx, rel_rx) = std::sync::mpsc::channel();
+    let tx = Arc::new(TestTransaction {
+        outcome: std::sync::atomic::AtomicU8::new(0),
+        commits: std::sync::atomic::AtomicUsize::new(0),
+    });
+    let fence = Arc::new(BarrierWaitFence {
+        entered: enter_tx,
+        release: std::sync::Mutex::new(rel_rx),
+        permit_val: std::sync::atomic::AtomicU8::new(0), // Allow initially
+    });
+    let pub_cfg = spl_transport::TokenPublication {
+        transaction: tx.clone(),
+        fence: Some(fence.clone()),
+        incarnation: 1,
+    };
+
+    let client = TransportClient::new_relay_only_with_publication(cred, pub_cfg).unwrap();
+    let live_token_mutex = client.live_token_mutex_for_test().unwrap();
+    let obs = spl_transport::OperationObserver::new();
+    let obs_task = obs.clone();
+
+    let open_task = tokio::spawn(async move { client.open_carrier(Some(&obs_task)).await });
+
+    // Wait until with_publication is entered
+    enter_rx
+        .recv_timeout(std::time::Duration::from_secs(30))
+        .expect("barrier timed out");
+
+    // Retire the fence before with_publication body runs permit check
+    fence.permit_val.store(2, Ordering::SeqCst); // Retired
+
+    // Release with_publication
+    rel_tx.send(()).unwrap();
+
+    let res = open_task.await.unwrap();
+    let Err(err) = res else {
+        panic!("expected failure");
+    };
+    assert!(matches!(err, spl_transport::CarrierOpenError::RelayRetired));
+    assert_eq!(tx.commits.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        live_token_mutex.lock().await.as_str(),
+        expired_token.as_str()
+    );
+    assert_eq!(relay.state.ws_dials.load(Ordering::SeqCst), 0);
+    assert_eq!(obs.selected_path(), None);
+    assert_eq!(obs.dial_attempts(), 0);
+    relay.abort();
+}
+
+#[tokio::test]
+#[expect(
+    clippy::large_futures,
+    reason = "the copied transport future keeps its established stack layout; this site goes red if a later refactor shrinks it"
+)]
+async fn open_carrier_remote_401_is_transport_unauthorized() {
+    let (pin, acceptor) = tls_pair_with_pin();
+    let now = epoch_secs();
+    let token = mint_jwt(now, now + 10_000);
+    let relay =
+        spawn_combined_relay(acceptor, CombinedWsMode::AlwaysUnauthorized, token.clone()).await;
+    let cred = relay_only_credential(pin, relay.origin.clone(), token);
+
+    let fence = Arc::new(TestFence {
+        permit: std::sync::atomic::AtomicU8::new(0), // Allow
+    });
+    let tx = Arc::new(TestTransaction {
+        outcome: std::sync::atomic::AtomicU8::new(0),
+        commits: std::sync::atomic::AtomicUsize::new(0),
+    });
+    let pub_cfg = spl_transport::TokenPublication {
+        transaction: tx,
+        fence: Some(fence),
+        incarnation: 1,
+    };
+
+    let client = TransportClient::new_relay_only_with_publication(cred, pub_cfg).unwrap();
+
+    let Err(err) = client.open_carrier(None).await else {
+        panic!("expected failure");
+    };
+    assert!(matches!(
+        err,
+        spl_transport::CarrierOpenError::Transport(TransportError::Relay(RelayError::Unauthorized))
+    ));
+    relay.abort();
+}
+
+#[tokio::test]
+#[expect(
+    clippy::large_futures,
+    reason = "the copied transport future keeps its established stack layout; this site goes red if a later refactor shrinks it"
+)]
+async fn open_carrier_proactive_publication_unchanged_surfaces_rejected() {
+    let (pin, acceptor) = tls_pair_with_pin();
+    let now = epoch_secs();
+    let expired_token = mint_jwt(now - 1000, now - 10);
+    let fresh_token = mint_jwt(now, now + 10_000);
+    let relay = spawn_combined_relay(acceptor, CombinedWsMode::AcceptAny, fresh_token).await;
+    let cred = relay_only_credential(pin, relay.origin.clone(), expired_token.clone());
+
+    let tx = Arc::new(TestTransaction {
+        outcome: std::sync::atomic::AtomicU8::new(1), // Unchanged
+        commits: std::sync::atomic::AtomicUsize::new(0),
+    });
+    let pub_cfg = spl_transport::TokenPublication {
+        transaction: tx.clone(),
+        fence: None,
+        incarnation: 1,
+    };
+
+    let client = TransportClient::new_relay_only_with_publication(cred, pub_cfg).unwrap();
+    let live_token_mutex = client.live_token_mutex_for_test().unwrap();
+
+    let Err(err) = client.open_carrier(None).await else {
+        panic!("expected failure");
+    };
+    assert!(matches!(
+        err,
+        spl_transport::CarrierOpenError::PublicationRejected
+    ));
+    assert_eq!(tx.commits.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        live_token_mutex.lock().await.as_str(),
+        expired_token.as_str()
+    );
+    assert_eq!(relay.state.ws_dials.load(Ordering::SeqCst), 0);
+
+    relay.abort();
+}
+
+#[tokio::test]
+#[expect(
+    clippy::large_futures,
+    reason = "the copied transport future keeps its established stack layout; this site goes red if a later refactor shrinks it"
+)]
+async fn open_carrier_proactive_publication_indeterminate_latches_ineligible() {
+    let (pin, acceptor) = tls_pair_with_pin();
+    let now = epoch_secs();
+    let expired_token = mint_jwt(now - 1000, now - 10);
+    let fresh_token = mint_jwt(now, now + 10_000);
+    let relay = spawn_combined_relay(acceptor, CombinedWsMode::AcceptAny, fresh_token).await;
+    let cred = relay_only_credential(pin, relay.origin.clone(), expired_token.clone());
+
+    let tx = Arc::new(TestTransaction {
+        outcome: std::sync::atomic::AtomicU8::new(2), // Indeterminate
+        commits: std::sync::atomic::AtomicUsize::new(0),
+    });
+    let pub_cfg = spl_transport::TokenPublication {
+        transaction: tx.clone(),
+        fence: None,
+        incarnation: 1,
+    };
+
+    let client = TransportClient::new_relay_only_with_publication(cred, pub_cfg).unwrap();
+    let live_token_mutex = client.live_token_mutex_for_test().unwrap();
+
+    let Err(err) = client.open_carrier(None).await else {
+        panic!("expected failure");
+    };
+    assert!(matches!(
+        err,
+        spl_transport::CarrierOpenError::PublicationIndeterminate
+    ));
+    assert_eq!(tx.commits.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        live_token_mutex.lock().await.as_str(),
+        expired_token.as_str()
+    );
+    assert_eq!(relay.state.ws_dials.load(Ordering::SeqCst), 0);
+
+    // Subsequent open_carrier fails immediately because client is ineligible
+    let Err(err2) = client.open_carrier(None).await else {
+        panic!("expected failure");
+    };
+    assert!(matches!(
+        err2,
+        spl_transport::CarrierOpenError::PublicationIndeterminate
+    ));
+    assert_eq!(relay.state.ws_dials.load(Ordering::SeqCst), 0);
+
+    relay.abort();
+}
+
+#[tokio::test]
+#[expect(
+    clippy::large_futures,
+    reason = "the copied transport future keeps its established stack layout; this site goes red if a later refactor shrinks it"
+)]
+async fn open_carrier_reactive_publication_unchanged_surfaces_rejected() {
+    let (pin, acceptor) = tls_pair_with_pin();
+    let now = epoch_secs();
+    let old_token = mint_jwt(now, now + 10_000);
+    let fresh_token = mint_jwt(now, now + 20_000);
+    let relay = spawn_combined_relay(acceptor, CombinedWsMode::FreshOnly, fresh_token).await;
+    let cred = relay_only_credential(pin, relay.origin.clone(), old_token.clone());
+
+    let tx = Arc::new(TestTransaction {
+        outcome: std::sync::atomic::AtomicU8::new(1), // Unchanged
+        commits: std::sync::atomic::AtomicUsize::new(0),
+    });
+    let pub_cfg = spl_transport::TokenPublication {
+        transaction: tx.clone(),
+        fence: None,
+        incarnation: 1,
+    };
+
+    let client = TransportClient::new_relay_only_with_publication(cred, pub_cfg).unwrap();
+    let live_token_mutex = client.live_token_mutex_for_test().unwrap();
+
+    let Err(err) = client.open_carrier(None).await else {
+        panic!("expected failure");
+    };
+    assert!(matches!(
+        err,
+        spl_transport::CarrierOpenError::PublicationRejected
+    ));
+    assert_eq!(tx.commits.load(Ordering::SeqCst), 1);
+    assert_eq!(live_token_mutex.lock().await.as_str(), old_token.as_str());
+    assert_eq!(relay.state.ws_dials.load(Ordering::SeqCst), 1);
+
+    relay.abort();
+}
+
+#[tokio::test]
+#[expect(
+    clippy::large_futures,
+    reason = "the copied transport future keeps its established stack layout; this site goes red if a later refactor shrinks it"
+)]
+async fn open_carrier_reactive_publication_indeterminate_latches_ineligible() {
+    let (pin, acceptor) = tls_pair_with_pin();
+    let now = epoch_secs();
+    let old_token = mint_jwt(now, now + 10_000);
+    let fresh_token = mint_jwt(now, now + 20_000);
+    let relay = spawn_combined_relay(acceptor, CombinedWsMode::FreshOnly, fresh_token).await;
+    let cred = relay_only_credential(pin, relay.origin.clone(), old_token.clone());
+
+    let tx = Arc::new(TestTransaction {
+        outcome: std::sync::atomic::AtomicU8::new(2), // Indeterminate
+        commits: std::sync::atomic::AtomicUsize::new(0),
+    });
+    let pub_cfg = spl_transport::TokenPublication {
+        transaction: tx.clone(),
+        fence: None,
+        incarnation: 1,
+    };
+
+    let client = TransportClient::new_relay_only_with_publication(cred, pub_cfg).unwrap();
+    let live_token_mutex = client.live_token_mutex_for_test().unwrap();
+
+    let Err(err) = client.open_carrier(None).await else {
+        panic!("expected failure");
+    };
+    assert!(matches!(
+        err,
+        spl_transport::CarrierOpenError::PublicationIndeterminate
+    ));
+    assert_eq!(tx.commits.load(Ordering::SeqCst), 1);
+    assert_eq!(live_token_mutex.lock().await.as_str(), old_token.as_str());
+    assert_eq!(relay.state.ws_dials.load(Ordering::SeqCst), 1);
+
+    // Subsequent open_carrier fails immediately because client is ineligible
+    let Err(err2) = client.open_carrier(None).await else {
+        panic!("expected failure");
+    };
+    assert!(matches!(
+        err2,
+        spl_transport::CarrierOpenError::PublicationIndeterminate
+    ));
+    assert_eq!(relay.state.ws_dials.load(Ordering::SeqCst), 1);
+
+    relay.abort();
+}
+
+#[tokio::test]
+#[expect(
+    clippy::large_futures,
+    reason = "the copied transport future keeps its established stack layout; this site goes red if a later refactor shrinks it"
+)]
+async fn open_carrier_ineligible_lan_recovery_and_subsequent_exhaustion() {
+    let (pin, acceptor) = tls_pair_with_pin();
+    let now = epoch_secs();
+    let expired_token = mint_jwt(now - 1000, now - 10);
+    let fresh_token = mint_jwt(now, now + 10_000);
+    let relay =
+        spawn_combined_relay(acceptor.clone(), CombinedWsMode::AcceptAny, fresh_token).await;
+
+    let unused_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let lan_port = unused_listener.local_addr().unwrap().port();
+    drop(unused_listener);
+
+    let mut cred = relay_credential(pin, lan_port, relay.origin.clone(), expired_token);
+    cred.endpoints = vec![EndpointAddr {
+        host: "127.0.0.1".into(),
+        port: lan_port,
+    }];
+
+    let tx = Arc::new(TestTransaction {
+        outcome: std::sync::atomic::AtomicU8::new(2), // Indeterminate
+        commits: std::sync::atomic::AtomicUsize::new(0),
+    });
+    let pub_cfg = spl_transport::TokenPublication {
+        transaction: tx.clone(),
+        fence: None,
+        incarnation: 1,
+    };
+
+    let client = TransportClient::new_with_publication(cred, pub_cfg).unwrap();
+
+    // Call 1: Direct LAN fails, falls back to relay, proactive refresh triggers Indeterminate commit
+    let Err(err1) = client.open_carrier(None).await else {
+        panic!("expected failure");
+    };
+    assert!(matches!(
+        err1,
+        spl_transport::CarrierOpenError::PublicationIndeterminate
+    ));
+    assert_eq!(tx.commits.load(Ordering::SeqCst), 1);
+    assert_eq!(relay.state.ws_dials.load(Ordering::SeqCst), 0);
+
+    // Call 2: Direct LAN recovers (bind listener). open_carrier must succeed directly despite relay ineligibility.
+    let listener = TcpListener::bind(("127.0.0.1", lan_port)).await.unwrap();
+    let acceptor_clone = acceptor.clone();
+    let lan_task = tokio::spawn(async move {
+        let (tcp, _) = listener.accept().await.unwrap();
+        let _tls = acceptor_clone.accept(tcp).await.unwrap();
+    });
+
+    let obs = spl_transport::OperationObserver::new();
+    let _carrier = client.open_carrier(Some(&obs)).await.unwrap();
+    assert_eq!(
+        obs.selected_path(),
+        Some(spl_transport::SelectedPath::Direct)
+    );
+    assert_eq!(relay.state.ws_dials.load(Ordering::SeqCst), 0);
+    lan_task.await.unwrap();
+
+    // Call 3: LAN is down again. Direct LAN exhausted, ineligible flag returns PublicationIndeterminate with zero ws_dials.
+    let Err(err3) = client.open_carrier(None).await else {
+        panic!("expected failure");
+    };
+    assert!(matches!(
+        err3,
+        spl_transport::CarrierOpenError::PublicationIndeterminate
+    ));
+    assert_eq!(relay.state.ws_dials.load(Ordering::SeqCst), 0);
+
+    relay.abort();
+}
+
+#[tokio::test]
+#[expect(
+    clippy::large_futures,
+    reason = "the copied transport future keeps its established stack layout; this site goes red if a later refactor shrinks it"
+)]
+async fn open_carrier_fence_stale_incarnation_retires_and_fresh_succeeds() {
+    let (pin, acceptor) = tls_pair_with_pin();
+    let now = epoch_secs();
+    let token = mint_jwt(now, now + 10_000);
+    let relay = spawn_combined_relay(acceptor, CombinedWsMode::AcceptAny, token.clone()).await;
+    let cred = relay_only_credential(pin, relay.origin.clone(), token);
+
+    let tx = Arc::new(TestTransaction {
+        outcome: std::sync::atomic::AtomicU8::new(0),
+        commits: std::sync::atomic::AtomicUsize::new(0),
+    });
+    let shared_fence = Arc::new(StaleIncarnationFence);
+
+    // Incarnation 1 is stale => Retired
+    let pub_stale = spl_transport::TokenPublication {
+        transaction: tx.clone(),
+        fence: Some(shared_fence.clone()),
+        incarnation: 1,
+    };
+    let stale_client =
+        TransportClient::new_relay_only_with_publication(cred.clone(), pub_stale).unwrap();
+    let Err(err) = stale_client.open_carrier(None).await else {
+        panic!("expected failure");
+    };
+    assert!(matches!(err, spl_transport::CarrierOpenError::RelayRetired));
+    assert_eq!(relay.state.ws_dials.load(Ordering::SeqCst), 0);
+
+    // Incarnation 2 is active => Allowed and dials
+    let pub_active = spl_transport::TokenPublication {
+        transaction: tx,
+        fence: Some(shared_fence),
+        incarnation: 2,
+    };
+    let active_client = TransportClient::new_relay_only_with_publication(cred, pub_active).unwrap();
+    let obs = spl_transport::OperationObserver::new();
+    let _carrier = active_client.open_carrier(Some(&obs)).await.unwrap();
+    assert_eq!(
+        obs.selected_path(),
+        Some(spl_transport::SelectedPath::Relay)
+    );
+    assert_eq!(relay.state.ws_dials.load(Ordering::SeqCst), 1);
+
+    relay.abort();
+}
+
+struct RacingFence {
+    lock: std::sync::Mutex<()>,
+    retired: std::sync::atomic::AtomicBool,
+}
+
+impl spl_transport::RelayFence for RacingFence {
+    fn permit(&self, _incarnation: u64) -> spl_transport::RelayPermit {
+        if self.retired.load(Ordering::SeqCst) {
+            spl_transport::RelayPermit::Retired
+        } else {
+            spl_transport::RelayPermit::Allow
+        }
+    }
+    fn with_publication(&self, f: &mut dyn FnMut()) {
+        let _guard = self.lock.lock().unwrap();
+        f();
+    }
+}
+
+struct CapturingTx {
+    entered: std::sync::mpsc::Sender<()>,
+    release: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
+    committed_token: std::sync::Mutex<Option<String>>,
+}
+
+impl spl_transport::TokenTransaction for CapturingTx {
+    fn commit(&self, ctx: spl_transport::TokenCommitContext<'_>) -> spl_transport::TokenCommit {
+        let _ = self.entered.send(());
+        self.release
+            .lock()
+            .unwrap()
+            .recv_timeout(std::time::Duration::from_secs(30))
+            .expect("barrier timed out");
+        *self.committed_token.lock().unwrap() = Some(ctx.token.to_string());
+        spl_transport::TokenCommit::Committed { generation: 1 }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[expect(
+    clippy::large_futures,
+    reason = "the copied transport future keeps its established stack layout; this site goes red if a later refactor shrinks it"
+)]
+async fn open_carrier_publication_wins_race_updates_token_and_aborts_on_retired_fence() {
+    let (pin, acceptor) = tls_pair_with_pin();
+    let now = epoch_secs();
+    let old_token = mint_jwt(now, now + 10_000);
+    let fresh_token = mint_jwt(now, now + 20_000);
+    let relay =
+        spawn_combined_relay(acceptor, CombinedWsMode::FreshOnly, fresh_token.clone()).await;
+    let cred = relay_only_credential(pin, relay.origin.clone(), old_token);
+
+    let (enter_tx, enter_rx) = std::sync::mpsc::channel();
+    let (rel_tx, rel_rx) = std::sync::mpsc::channel();
+    let tx = Arc::new(CapturingTx {
+        entered: enter_tx,
+        release: std::sync::Mutex::new(rel_rx),
+        committed_token: std::sync::Mutex::new(None),
+    });
+    let fence = Arc::new(RacingFence {
+        lock: std::sync::Mutex::new(()),
+        retired: std::sync::atomic::AtomicBool::new(false),
+    });
+    let pub_cfg = spl_transport::TokenPublication {
+        transaction: tx.clone(),
+        fence: Some(fence.clone()),
+        incarnation: 1,
+    };
+
+    let client = TransportClient::new_relay_only_with_publication(cred, pub_cfg).unwrap();
+    let live_token_mutex = client.live_token_mutex_for_test().unwrap();
+
+    let open_task = tokio::spawn(async move { client.open_carrier(None).await });
+
+    // Wait until commit is entered in blocking thread (inside with_publication)
+    enter_rx
+        .recv_timeout(std::time::Duration::from_secs(30))
+        .expect("barrier timed out");
+
+    // Spawn task to retire fence via with_publication (blocks until publication finishes)
+    let fence_clone = fence.clone();
+    let retire_task = tokio::task::spawn_blocking(move || {
+        fence_clone.with_publication(&mut || {
+            fence_clone.retired.store(true, Ordering::SeqCst);
+        });
+    });
+
+    // Release commit so publication completes
+    rel_tx.send(()).unwrap();
+    retire_task.await.unwrap();
+
+    let res = open_task.await.unwrap();
+    let Err(err) = res else {
+        panic!("expected failure");
+    };
+    assert!(matches!(err, spl_transport::CarrierOpenError::RelayRetired));
+    assert_eq!(
+        tx.committed_token.lock().unwrap().as_deref(),
+        Some(fresh_token.as_str())
+    );
+    assert_eq!(live_token_mutex.lock().await.as_str(), fresh_token.as_str());
+    assert_eq!(relay.state.ws_dials.load(Ordering::SeqCst), 1);
+
+    relay.abort();
+}
+
+struct ReactiveRetireFence {
+    lock: std::sync::Mutex<()>,
+    entered_with_pub: std::sync::mpsc::Sender<()>,
+    release_with_pub: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
+    retired: std::sync::atomic::AtomicBool,
+}
+
+impl spl_transport::RelayFence for ReactiveRetireFence {
+    fn permit(&self, _incarnation: u64) -> spl_transport::RelayPermit {
+        if self.retired.load(Ordering::SeqCst) {
+            spl_transport::RelayPermit::Retired
+        } else {
+            spl_transport::RelayPermit::Allow
+        }
+    }
+    fn with_publication(&self, f: &mut dyn FnMut()) {
+        let _guard = self.lock.lock().unwrap();
+        let _ = self.entered_with_pub.send(());
+        self.release_with_pub
+            .lock()
+            .unwrap()
+            .recv_timeout(std::time::Duration::from_secs(30))
+            .expect("barrier timed out");
+        f();
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[expect(
+    clippy::large_futures,
+    reason = "the copied transport future keeps its established stack layout; this site goes red if a later refactor shrinks it"
+)]
+async fn open_carrier_retirement_wins_before_permit_prevents_commit_and_redial() {
+    let (pin, acceptor) = tls_pair_with_pin();
+    let now = epoch_secs();
+    let old_token = mint_jwt(now, now + 10_000);
+    let fresh_token = mint_jwt(now, now + 20_000);
+    let relay = spawn_combined_relay(acceptor, CombinedWsMode::FreshOnly, fresh_token).await;
+    let cred = relay_only_credential(pin, relay.origin.clone(), old_token.clone());
+
+    let (enter_pub_tx, enter_pub_rx) = std::sync::mpsc::channel();
+    let (rel_pub_tx, rel_pub_rx) = std::sync::mpsc::channel();
+    let fence = Arc::new(ReactiveRetireFence {
+        lock: std::sync::Mutex::new(()),
+        entered_with_pub: enter_pub_tx,
+        release_with_pub: std::sync::Mutex::new(rel_pub_rx),
+        retired: std::sync::atomic::AtomicBool::new(false),
+    });
+    let tx = Arc::new(TestTransaction {
+        outcome: std::sync::atomic::AtomicU8::new(0),
+        commits: std::sync::atomic::AtomicUsize::new(0),
+    });
+    let pub_cfg = spl_transport::TokenPublication {
+        transaction: tx.clone(),
+        fence: Some(fence.clone()),
+        incarnation: 1,
+    };
+
+    let client = TransportClient::new_relay_only_with_publication(cred, pub_cfg).unwrap();
+    let live_token_mutex = client.live_token_mutex_for_test().unwrap();
+
+    let open_task = tokio::spawn(async move { client.open_carrier(None).await });
+
+    // Wait until with_publication is entered (after initial 401 WS dial and HTTPS refresh)
+    enter_pub_rx
+        .recv_timeout(std::time::Duration::from_secs(30))
+        .expect("barrier timed out");
+
+    // Retire the fence while with_publication is paused before f()
+    fence.retired.store(true, Ordering::SeqCst);
+
+    // Release with_publication so f() runs and checks permit
+    rel_pub_tx.send(()).unwrap();
+
+    let res = open_task.await.unwrap();
+    let Err(err) = res else {
+        panic!("expected failure");
+    };
+    assert!(matches!(err, spl_transport::CarrierOpenError::RelayRetired));
+    assert_eq!(tx.commits.load(Ordering::SeqCst), 0);
+    assert_eq!(live_token_mutex.lock().await.as_str(), old_token.as_str());
+    assert_eq!(relay.state.ws_dials.load(Ordering::SeqCst), 1);
+
+    relay.abort();
+}
+
+#[tokio::test]
+#[expect(
+    clippy::large_futures,
+    reason = "the copied transport future keeps its established stack layout; this site goes red if a later refactor shrinks it"
+)]
+async fn open_carrier_canonical_mixed_six_attempts_with_observer() {
+    let (pin, acceptor) = tls_pair_with_pin();
+    let now = epoch_secs();
+    let expired_token = mint_jwt(now - 1000, now - 10);
+    let fresh_token = mint_jwt(now, now + 10_000);
+    let relay = spawn_combined_relay(acceptor, CombinedWsMode::FreshOnly, fresh_token).await;
+
+    let unused_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let closed_port = unused_listener.local_addr().unwrap().port();
+    drop(unused_listener);
+
+    let mut cred = relay_credential(pin, closed_port, relay.origin.clone(), expired_token);
+    cred.endpoints = vec![EndpointAddr {
+        host: "127.0.0.1".into(),
+        port: closed_port,
+    }];
+
+    let client = TransportClient::new(cred, None).unwrap();
+    let obs = spl_transport::OperationObserver::new();
+
+    let _carrier = client.open_carrier(Some(&obs)).await.unwrap();
+
+    // 5 LAN retries + 1 relay dial = 6
+    assert_eq!(obs.dial_attempts(), 6);
+    assert_eq!(
+        obs.selected_path(),
+        Some(spl_transport::SelectedPath::Relay)
+    );
+    assert_eq!(relay.state.refreshes.load(Ordering::SeqCst), 1);
+    assert_eq!(relay.state.ws_dials.load(Ordering::SeqCst), 1);
+
+    relay.abort();
+}
+
+#[tokio::test]
+#[expect(
+    clippy::large_futures,
+    reason = "the copied transport future keeps its established stack layout; this site goes red if a later refactor shrinks it"
+)]
+async fn open_carrier_observer_counts_match_ws_dials_not_tcp_accepts() {
+    let (pin, acceptor) = tls_pair_with_pin();
+    let now = epoch_secs();
+    let expired_token = mint_jwt(now - 1000, now - 10);
+    let fresh_token = mint_jwt(now, now + 10_000);
+    let relay = spawn_combined_relay(acceptor, CombinedWsMode::FreshOnly, fresh_token).await;
+    let cred = relay_only_credential(pin, relay.origin.clone(), expired_token);
+    let client = TransportClient::new_relay_only(cred, None).unwrap();
+    let obs = spl_transport::OperationObserver::new();
+
+    let carrier = client.open_carrier(Some(&obs)).await.unwrap();
+    drop(carrier);
+
+    // 1 HTTPS refresh accept + 1 WS dial accept = 2 tcp accepts
+    assert_eq!(relay.state.tcp_accepts.load(Ordering::SeqCst), 2);
+    assert_eq!(relay.state.ws_dials.load(Ordering::SeqCst), 1);
+    assert_eq!(obs.dial_attempts(), 1);
+    assert_eq!(
+        obs.selected_path(),
+        Some(spl_transport::SelectedPath::Relay)
+    );
+
+    relay.abort();
+}
+
+#[tokio::test]
+#[expect(
+    clippy::large_futures,
+    reason = "the copied transport future keeps its established stack layout; this site goes red if a later refactor shrinks it"
+)]
+async fn open_carrier_failed_and_denied_dials_leave_selected_path_unset() {
+    // 1. LAN exhaustion
+    let (pin, _acceptor) = tls_pair_with_pin();
+    let unused_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let closed_port = unused_listener.local_addr().unwrap().port();
+    drop(unused_listener);
+
+    let now = epoch_secs();
+    let token = mint_jwt(now, now + 10_000);
+    let mut cred = relay_credential(
+        pin.clone(),
+        closed_port,
+        "https://invalid.relay.test".into(),
+        token.clone(),
+    );
+    cred.relay_origin = None;
+    cred.endpoints = vec![EndpointAddr {
+        host: "127.0.0.1".into(),
+        port: closed_port,
+    }];
+    let client = TransportClient::new(cred, None).unwrap();
+    let obs1 = spl_transport::OperationObserver::new();
+    let _ = client.open_carrier(Some(&obs1)).await;
+    assert_eq!(obs1.selected_path(), None);
+    assert_eq!(obs1.dial_attempts(), 5);
+
+    // 2. Fence denial
+    let cred2 = relay_only_credential(
+        pin.clone(),
+        "https://invalid.relay.test".into(),
+        token.clone(),
+    );
+    let fence = Arc::new(TestFence {
+        permit: std::sync::atomic::AtomicU8::new(1), // Disabled
+    });
+    let tx = Arc::new(TestTransaction {
+        outcome: std::sync::atomic::AtomicU8::new(0),
+        commits: std::sync::atomic::AtomicUsize::new(0),
+    });
+    let pub_cfg = spl_transport::TokenPublication {
+        transaction: tx,
+        fence: Some(fence),
+        incarnation: 1,
+    };
+    let client2 = TransportClient::new_relay_only_with_publication(cred2, pub_cfg).unwrap();
+    let obs2 = spl_transport::OperationObserver::new();
+    let _ = client2.open_carrier(Some(&obs2)).await;
+    assert_eq!(obs2.selected_path(), None);
+    assert_eq!(obs2.dial_attempts(), 0);
+
+    // 3. Terminal relay error
+    let (_pin3, acceptor3) = tls_pair_with_pin();
+    let relay = spawn_combined_relay(acceptor3, CombinedWsMode::Close(4402), token.clone()).await;
+    let cred3 = relay_only_credential(pin, relay.origin.clone(), token);
+    let client3 = TransportClient::new_relay_only(cred3, None).unwrap();
+    let obs3 = spl_transport::OperationObserver::new();
+    let _ = client3.open_carrier(Some(&obs3)).await;
+    assert_eq!(obs3.selected_path(), None);
+    assert_eq!(obs3.dial_attempts(), 1);
+    relay.abort();
+}
+
+#[tokio::test]
+#[expect(
+    clippy::large_futures,
+    reason = "the copied transport future keeps its established stack layout; this site goes red if a later refactor shrinks it"
+)]
+async fn open_carrier_relay_transient_linear_retry() {
+    let (pin, acceptor) = tls_pair_with_pin();
+    let now = epoch_secs();
+    let token = mint_jwt(now, now + 10_000);
+    let relay =
+        spawn_combined_relay(acceptor, CombinedWsMode::UpgradeReject(503), token.clone()).await;
+    let cred = relay_only_credential(pin, relay.origin.clone(), token);
+    let client = TransportClient::new_relay_only(cred, None).unwrap();
+
+    let obs = spl_transport::OperationObserver::new();
+    let Err(err) = client.open_carrier(Some(&obs)).await else {
+        panic!("expected failure");
+    };
+    assert!(matches!(
+        err,
+        spl_transport::CarrierOpenError::Transport(TransportError::Relay(RelayError::HomeOffline))
+    ));
+    assert_eq!(relay.state.ws_dials.load(Ordering::SeqCst), 5);
+    assert_eq!(obs.dial_attempts(), 5);
+    assert_eq!(obs.selected_path(), None);
+
+    relay.abort();
+}
+
+#[tokio::test]
+#[expect(
+    clippy::large_futures,
+    reason = "the copied transport future keeps its established stack layout; this site goes red if a later refactor shrinks it"
+)]
+async fn open_carrier_persist_hook_reconstructed_client_does_not_refresh_again() {
+    let (pin, acceptor) = tls_pair_with_pin();
+    let now = epoch_secs();
+    let old_token = mint_jwt(now, now + 10_000);
+    let fresh_token = mint_jwt(now, now + 20_000);
+    let relay =
+        spawn_combined_relay(acceptor, CombinedWsMode::FreshOnly, fresh_token.clone()).await;
+    let credential = relay_only_credential(pin, relay.origin.clone(), old_token);
+    let persisted = Arc::new(Mutex::new(credential.clone()));
+    let persisted_for_hook = persisted.clone();
+    let hook: TokenPersistHook = Arc::new(move |token, expires_at| {
+        let mut credential = persisted_for_hook.lock().unwrap();
+        credential.device_token = Some(token.to_string());
+        credential.device_token_expires_at = Some(expires_at);
+    });
+    let client = TransportClient::new_relay_only(credential, Some(hook)).unwrap();
+
+    let first_carrier = client.open_carrier(None).await.unwrap();
+    let persisted_credential = persisted.lock().unwrap().clone();
+    assert_eq!(
+        persisted_credential.device_token.as_deref(),
+        Some(fresh_token.as_str())
+    );
+    assert_eq!(
+        persisted_credential.device_token_expires_at,
+        Some(now + 20_000)
+    );
+    assert_eq!(relay.state.refreshes.load(Ordering::SeqCst), 1);
+
+    drop(first_carrier);
+    let restarted = TransportClient::new_relay_only(persisted_credential, None).unwrap();
+    let _restarted_carrier = restarted.open_carrier(None).await.unwrap();
+    assert_eq!(relay.state.refreshes.load(Ordering::SeqCst), 1);
     relay.abort();
 }

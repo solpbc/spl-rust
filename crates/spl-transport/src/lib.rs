@@ -35,8 +35,10 @@
 //! durable commits before live assignment inside an owned background task.
 //! [`client::RelayFence`] gates relay communication locally against consumer
 //! lifecycle (`Disabled`/`Retired`), distinctly from remote `RelayError::Unauthorized`.
-//! Note that [`client::TransportClient::dial_carrier`] remains frozen and does
-//! not enforce the local fence or attach an observer.
+//! [`client::TransportClient::open_carrier`] provides fence-coordinated,
+//! observer-capable persistent-carrier establishment for lifecycle-fenced consumers
+//! and journal-bridge adapters. Note that [`client::TransportClient::dial_carrier`]
+//! remains frozen and does not enforce the local fence or attach an observer.
 //!
 //! [`client::TransportClient::request`] provides one-request execution over direct
 //! LAN or relay fallback with write-initiated replay protection ([`request::ReplayPolicy`]),
@@ -94,8 +96,8 @@ pub(crate) mod spki_pin;
 pub mod tls;
 
 pub use client::{
-    DialedCarrier, RelayFence, RelayPermit, TokenCommit, TokenCommitContext, TokenPersistHook,
-    TokenPublication, TokenTransaction, TransportClient,
+    CarrierOpenError, DialedCarrier, RelayFence, RelayPermit, TokenCommit, TokenCommitContext,
+    TokenPersistHook, TokenPublication, TokenTransaction, TransportClient,
 };
 pub use observe::OperationObserver;
 pub use pairing::{

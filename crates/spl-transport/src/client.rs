@@ -104,6 +104,56 @@ pub(crate) enum RefreshAction {
     FenceDenied(RelayPermit),
 }
 
+/// Errors returned when opening a direct-or-relay carrier.
+#[derive(Debug, thiserror::Error)]
+pub enum CarrierOpenError {
+    /// Relay communication is disabled by the local fence.
+    #[error("relay communication is disabled by local fence")]
+    RelayDisabled,
+    /// Relay communication was retired by the local fence.
+    #[error("relay communication was retired by local fence")]
+    RelayRetired,
+    /// Refreshed token publication was rejected by durable storage.
+    #[error("refreshed token publication was rejected by storage")]
+    PublicationRejected,
+    /// Refreshed token publication outcome is indeterminate; live token was not updated.
+    #[error("refreshed token publication outcome is indeterminate")]
+    PublicationIndeterminate,
+    /// An underlying transport error occurred.
+    #[error("transport error: {0}")]
+    Transport(#[from] TransportError),
+}
+
+pub(crate) fn relay_fence_permit(
+    publication: Option<&TokenPublication>,
+) -> Result<(), RelayPermit> {
+    let Some(publ) = publication else {
+        return Ok(());
+    };
+    let Some(fence) = &publ.fence else {
+        return Ok(());
+    };
+    let permit = fence.permit(publ.incarnation);
+    if permit != RelayPermit::Allow {
+        return Err(permit);
+    }
+    Ok(())
+}
+
+fn map_fence_permit(permit: RelayPermit) -> CarrierOpenError {
+    match permit {
+        RelayPermit::Disabled => CarrierOpenError::RelayDisabled,
+        RelayPermit::Retired => CarrierOpenError::RelayRetired,
+        RelayPermit::Allow => unreachable!("allow is not a fence rejection"),
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CarrierPolicy {
+    Legacy,
+    Fenced,
+}
+
 pub(crate) trait CarrierIo: AsyncRead + AsyncWrite + Send + Unpin {}
 
 impl<T: AsyncRead + AsyncWrite + Send + Unpin> CarrierIo for T {}
@@ -324,7 +374,8 @@ impl TransportClient {
     /// falling back to the relay only after transient direct failures.
     ///
     /// Note: `dial_carrier` does not consult the local [`RelayFence`]; use
-    /// [`TransportClient::request`] for fence-coordinated access.
+    /// [`TransportClient::open_carrier`] or [`TransportClient::request`] for
+    /// fence-coordinated access.
     ///
     /// A newly paired fingerprint can take a moment to reach every journal
     /// worker because the listener fans out across `SO_REUSEPORT` processes.
@@ -337,13 +388,59 @@ impl TransportClient {
     ///
     /// Returns the last direct transport error when relay fallback is
     /// unavailable, or the terminal relay error after bounded relay attempts.
+    #[expect(
+        clippy::large_futures,
+        reason = "the carrier dialing future keeps its established stack layout; callers in tests pin the size"
+    )]
     pub async fn dial_carrier(&self) -> Result<DialedCarrier, TransportError> {
+        match self.establish_carrier(None, CarrierPolicy::Legacy).await {
+            Ok(carrier) => Ok(carrier),
+            Err(CarrierOpenError::Transport(err)) => Err(err),
+            Err(
+                CarrierOpenError::RelayDisabled
+                | CarrierOpenError::RelayRetired
+                | CarrierOpenError::PublicationRejected
+                | CarrierOpenError::PublicationIndeterminate,
+            ) => unreachable!("legacy carrier policy never produces classified error variants"),
+        }
+    }
+
+    /// Open a direct-or-relay carrier using local fence coordination,
+    /// publication hooks, and an optional operation observer.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CarrierOpenError`] detailing transport, fence rejection,
+    /// or publication failure.
+    #[expect(
+        clippy::large_futures,
+        reason = "the carrier dialing future keeps its established stack layout; callers in tests pin the size"
+    )]
+    pub async fn open_carrier(
+        &self,
+        observer: Option<&crate::observe::OperationObserver>,
+    ) -> Result<DialedCarrier, CarrierOpenError> {
+        self.establish_carrier(observer, CarrierPolicy::Fenced)
+            .await
+    }
+
+    pub(crate) async fn establish_carrier(
+        &self,
+        observer: Option<&crate::observe::OperationObserver>,
+        policy: CarrierPolicy,
+    ) -> Result<DialedCarrier, CarrierOpenError> {
         const MAX_ATTEMPTS: usize = 5;
         let mut last_err: Option<TransportError> = None;
         for attempt in 0..MAX_ATTEMPTS {
             for endpoint in &self.credential.endpoints {
+                if let Some(obs) = observer {
+                    obs.record_dial_attempt();
+                }
                 match dial_tls(self.config.clone(), &endpoint.host, endpoint.port).await {
                     Ok(stream) => {
+                        if let Some(obs) = observer {
+                            obs.record_selected_path(crate::request::SelectedPath::Direct);
+                        }
                         return Ok(DialedCarrier {
                             stream: Box::new(stream),
                             kind: CarrierKind::Lan,
@@ -353,7 +450,7 @@ impl TransportClient {
                         error @ (TransportError::TlsAccessDenied
                         | TransportError::TlsCertificateUnknown),
                     ) => {
-                        return Err(error);
+                        return Err(CarrierOpenError::Transport(error));
                     }
                     Err(error) => last_err = Some(error),
                 }
@@ -371,15 +468,30 @@ impl TransportClient {
             lan_err,
             TransportError::Tls(_) | TransportError::Io(_) | TransportError::NoEndpoint
         );
-        if lan_unreachable && self.relay_eligible() {
+        if !lan_unreachable {
+            return Err(CarrierOpenError::Transport(lan_err));
+        }
+
+        if self.relay_ineligible.load(Ordering::SeqCst) {
+            if policy == CarrierPolicy::Fenced {
+                return Err(CarrierOpenError::PublicationIndeterminate);
+            }
+            return Err(CarrierOpenError::Transport(lan_err));
+        }
+
+        if self.relay_eligible() {
+            if policy == CarrierPolicy::Fenced {
+                relay_fence_permit(self.publication.as_ref()).map_err(map_fence_permit)?;
+            }
+
             #[expect(
                 clippy::large_futures,
                 reason = "the copied transport future keeps its established stack layout; this site goes red if a later refactor shrinks it"
             )]
-            let relay = self.dial_carrier_over_relay().await;
+            let relay = self.dial_carrier_over_relay(observer, policy).await;
             return relay;
         }
-        Err(lan_err)
+        Err(CarrierOpenError::Transport(lan_err))
     }
 
     pub(crate) fn relay_eligible(&self) -> bool {
@@ -496,34 +608,73 @@ impl TransportClient {
         }
     }
 
-    async fn dial_carrier_over_relay(&self) -> Result<DialedCarrier, TransportError> {
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the relay carrier dial loop coordinates proactive refresh, loop fence checks, observer recording, and transient retry backoff"
+    )]
+    async fn dial_carrier_over_relay(
+        &self,
+        observer: Option<&crate::observe::OperationObserver>,
+        policy: CarrierPolicy,
+    ) -> Result<DialedCarrier, CarrierOpenError> {
         let origin = self
             .credential
             .relay_origin
             .as_deref()
-            .ok_or(TransportError::NoEndpoint)?;
+            .ok_or(CarrierOpenError::Transport(TransportError::NoEndpoint))?;
         let instance_id = &self.credential.instance_id;
         let current = self.current_token().await;
-        let proactive_refresh = if token_should_refresh(&current, now_secs()) {
+        if token_should_refresh(&current, now_secs()) {
             #[expect(
                 clippy::large_futures,
                 reason = "the copied transport future keeps its established stack layout; this site goes red if a later refactor shrinks it"
             )]
             let refresh = self.refresh_if_current(origin, &current).await;
-            matches!(refresh, RefreshAction::Terminal)
-        } else {
-            false
-        };
-        if proactive_refresh {
-            return Err(TransportError::Relay(RelayError::Unauthorized));
+            match policy {
+                CarrierPolicy::Legacy => {
+                    if matches!(refresh, RefreshAction::Terminal) {
+                        return Err(CarrierOpenError::Transport(TransportError::Relay(
+                            RelayError::Unauthorized,
+                        )));
+                    }
+                }
+                CarrierPolicy::Fenced => match refresh {
+                    RefreshAction::Redial | RefreshAction::Transient => {}
+                    RefreshAction::Terminal => {
+                        return Err(CarrierOpenError::Transport(TransportError::Relay(
+                            RelayError::Unauthorized,
+                        )));
+                    }
+                    RefreshAction::Rejected => {
+                        return Err(CarrierOpenError::PublicationRejected);
+                    }
+                    RefreshAction::Indeterminate => {
+                        return Err(CarrierOpenError::PublicationIndeterminate);
+                    }
+                    RefreshAction::FenceDenied(permit) => {
+                        return Err(map_fence_permit(permit));
+                    }
+                },
+            }
         }
 
         let mut reactive_refreshed = false;
         let mut transient_attempt = 0usize;
         loop {
+            if policy == CarrierPolicy::Fenced {
+                relay_fence_permit(self.publication.as_ref()).map_err(map_fence_permit)?;
+            }
+
+            if let Some(obs) = observer {
+                obs.record_dial_attempt();
+            }
+
             let token = self.current_token().await;
             match dial_relay_carrier(self.config.clone(), origin, instance_id, &token).await {
                 Ok(carrier) => {
+                    if let Some(obs) = observer {
+                        obs.record_selected_path(crate::request::SelectedPath::Relay);
+                    }
                     return Ok(DialedCarrier {
                         stream: Box::new(carrier.stream),
                         kind: CarrierKind::Relay {
@@ -533,7 +684,9 @@ impl TransportClient {
                 }
                 Err(TransportError::Relay(RelayError::Unauthorized)) => {
                     if reactive_refreshed {
-                        return Err(TransportError::Relay(RelayError::Unauthorized));
+                        return Err(CarrierOpenError::Transport(TransportError::Relay(
+                            RelayError::Unauthorized,
+                        )));
                     }
                     reactive_refreshed = true;
                     #[expect(
@@ -541,29 +694,46 @@ impl TransportClient {
                         reason = "the copied transport future keeps its established stack layout; this site goes red if a later refactor shrinks it"
                     )]
                     let refresh = self.refresh_if_current(origin, &token).await;
-                    match refresh {
-                        #[expect(
-                            clippy::needless_continue,
-                            reason = "the explicit redial branch documents that refreshed credentials restart the relay dial loop"
-                        )]
-                        RefreshAction::Redial => continue,
-                        RefreshAction::Terminal
-                        | RefreshAction::Transient
-                        | RefreshAction::Rejected
-                        | RefreshAction::Indeterminate
-                        | RefreshAction::FenceDenied(_) => {
-                            return Err(TransportError::Relay(RelayError::Unauthorized));
-                        }
+                    match policy {
+                        CarrierPolicy::Legacy => match refresh {
+                            RefreshAction::Redial => {}
+                            RefreshAction::Terminal
+                            | RefreshAction::Transient
+                            | RefreshAction::Rejected
+                            | RefreshAction::Indeterminate
+                            | RefreshAction::FenceDenied(_) => {
+                                return Err(CarrierOpenError::Transport(TransportError::Relay(
+                                    RelayError::Unauthorized,
+                                )));
+                            }
+                        },
+                        CarrierPolicy::Fenced => match refresh {
+                            RefreshAction::Redial => {}
+                            RefreshAction::Terminal | RefreshAction::Transient => {
+                                return Err(CarrierOpenError::Transport(TransportError::Relay(
+                                    RelayError::Unauthorized,
+                                )));
+                            }
+                            RefreshAction::Rejected => {
+                                return Err(CarrierOpenError::PublicationRejected);
+                            }
+                            RefreshAction::Indeterminate => {
+                                return Err(CarrierOpenError::PublicationIndeterminate);
+                            }
+                            RefreshAction::FenceDenied(permit) => {
+                                return Err(map_fence_permit(permit));
+                            }
+                        },
                     }
                 }
                 Err(error) if relay_fault_is_transient_err(&error) => {
                     transient_attempt += 1;
                     if transient_attempt >= RELAY_MAX_TRANSIENT_ATTEMPTS {
-                        return Err(error);
+                        return Err(CarrierOpenError::Transport(error));
                     }
                     tokio::time::sleep(Duration::from_millis(250 * transient_attempt as u64)).await;
                 }
-                Err(error) => return Err(error),
+                Err(error) => return Err(CarrierOpenError::Transport(error)),
             }
         }
     }
@@ -831,6 +1001,97 @@ mod tests {
             let client = test_client(vec![first, second]);
 
             let carrier = client.dial_carrier().await.unwrap();
+            drop(carrier);
+            first_task.await.unwrap();
+            accepted.await.unwrap();
+        }
+    }
+    #[tokio::test]
+    async fn open_carrier_tls_access_denied_short_circuits() {
+        let (first, first_task) = scripted_alert_listener(49).await;
+        let later = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let later_endpoint = EndpointAddr {
+            host: "127.0.0.1".into(),
+            port: later.local_addr().unwrap().port(),
+        };
+        let (later_accept_tx, mut later_accept_rx) = oneshot::channel();
+        let later_task = tokio::spawn(async move {
+            let (stream, _) = later.accept().await.unwrap();
+            drop(stream);
+            let _ = later_accept_tx.send(());
+        });
+        let client = test_client(vec![first, later_endpoint]);
+
+        assert!(matches!(
+            client.open_carrier(None).await,
+            Err(CarrierOpenError::Transport(TransportError::TlsAccessDenied))
+        ));
+        first_task.await.unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), &mut later_accept_rx)
+                .await
+                .is_err()
+        );
+        later_task.abort();
+    }
+
+    #[tokio::test]
+    async fn open_carrier_tls_certificate_unknown_short_circuits() {
+        let (first, first_task) = scripted_alert_listener(46).await;
+        let later = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let later_endpoint = EndpointAddr {
+            host: "127.0.0.1".into(),
+            port: later.local_addr().unwrap().port(),
+        };
+        let (later_accept_tx, mut later_accept_rx) = oneshot::channel();
+        let later_task = tokio::spawn(async move {
+            let (stream, _) = later.accept().await.unwrap();
+            drop(stream);
+            let _ = later_accept_tx.send(());
+        });
+        let relay = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let relay_origin = format!("http://{}", relay.local_addr().unwrap());
+        let (relay_accept_tx, mut relay_accept_rx) = oneshot::channel();
+        let relay_task = tokio::spawn(async move {
+            let (stream, _) = relay.accept().await.unwrap();
+            drop(stream);
+            let _ = relay_accept_tx.send(());
+        });
+        let client = test_client_with_relay(
+            vec![first, later_endpoint],
+            relay_origin,
+            "test-token".into(),
+        );
+
+        assert!(matches!(
+            client.open_carrier(None).await,
+            Err(CarrierOpenError::Transport(
+                TransportError::TlsCertificateUnknown
+            ))
+        ));
+        first_task.await.unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), &mut later_accept_rx)
+                .await
+                .is_err()
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), &mut relay_accept_rx)
+                .await
+                .is_err()
+        );
+        later_task.abort();
+        relay_task.abort();
+    }
+
+    #[tokio::test]
+    async fn open_carrier_unclassified_alerts_continue_to_later_endpoint() {
+        for description in [80, 200] {
+            let (first, first_task) = scripted_alert_listener(description).await;
+            let (second, accepted) = healthy_tls_listener().await;
+            let client = test_client(vec![first, second]);
+
+            let carrier = client.open_carrier(None).await.unwrap();
             drop(carrier);
             first_task.await.unwrap();
             accepted.await.unwrap();

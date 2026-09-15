@@ -23,6 +23,7 @@
 //! queues rely on reserved capacity rather than an exhaustive scheduling contract.
 
 use std::future::Future;
+use std::ops::{Deref, DerefMut};
 use std::pin::Pin;
 use std::sync::{Arc, Mutex, MutexGuard};
 
@@ -34,7 +35,7 @@ use spl_core::mux::{StreamEnd, StreamItem};
 use tokio::io::{AsyncReadExt, AsyncWrite, AsyncWriteExt, Interest};
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{oneshot, watch};
+use tokio::sync::{broadcast, oneshot, watch};
 use tokio::task::{JoinHandle, JoinSet};
 
 use crate::client::DialedCarrier;
@@ -98,35 +99,90 @@ pub enum JournalBridgeTerminalReason {
     TlsAccessDenied,
 }
 
-pub(crate) type SharedStatus = Arc<Mutex<StatusRecord>>;
+const STATUS_EVENT_CAPACITY: usize = 64;
+
+pub(crate) struct StatusState {
+    record: Mutex<StatusRecord>,
+    events: broadcast::Sender<JournalBridgeStatus>,
+}
+
+pub(crate) type SharedStatus = Arc<StatusState>;
 
 pub(crate) struct StatusRecord {
     pub(crate) snapshot: JournalBridgeStatus,
     pub(crate) current_carrier: Option<Arc<()>>,
 }
 
-pub(crate) fn lock_status(status: &SharedStatus) -> MutexGuard<'_, StatusRecord> {
-    match status.lock() {
+pub(crate) struct StatusGuard<'a> {
+    guard: MutexGuard<'a, StatusRecord>,
+    events: &'a broadcast::Sender<JournalBridgeStatus>,
+    initial: JournalBridgeStatus,
+}
+
+impl Deref for StatusGuard<'_> {
+    type Target = StatusRecord;
+
+    fn deref(&self) -> &Self::Target {
+        &self.guard
+    }
+}
+
+impl DerefMut for StatusGuard<'_> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.guard
+    }
+}
+
+impl Drop for StatusGuard<'_> {
+    fn drop(&mut self) {
+        if self.guard.snapshot != self.initial {
+            let _ = self.events.send(self.guard.snapshot);
+        }
+    }
+}
+
+pub(crate) fn lock_status(status: &SharedStatus) -> StatusGuard<'_> {
+    let guard = match status.record.lock() {
         Ok(guard) => guard,
         Err(poisoned) => poisoned.into_inner(),
+    };
+    let initial = guard.snapshot;
+    StatusGuard {
+        guard,
+        events: &status.events,
+        initial,
     }
 }
 
 pub(crate) fn new_status() -> SharedStatus {
-    Arc::new(Mutex::new(StatusRecord {
-        snapshot: JournalBridgeStatus {
-            listener_active: false,
-            contacted: false,
-            carrier_live: false,
-            terminal_reason: None,
-            active_requests: 0,
-        },
-        current_carrier: None,
-    }))
+    let snapshot = JournalBridgeStatus {
+        listener_active: false,
+        contacted: false,
+        carrier_live: false,
+        terminal_reason: None,
+        active_requests: 0,
+    };
+    let (events, _) = broadcast::channel(STATUS_EVENT_CAPACITY);
+    Arc::new(StatusState {
+        record: Mutex::new(StatusRecord {
+            snapshot,
+            current_carrier: None,
+        }),
+        events,
+    })
 }
 
 fn status_snapshot(status: &SharedStatus) -> JournalBridgeStatus {
     lock_status(status).snapshot
+}
+
+fn status_subscription(status: &SharedStatus) -> JournalBridgeStatusSubscription {
+    let record = lock_status(status);
+    let receiver = status.events.subscribe();
+    JournalBridgeStatusSubscription {
+        initial: record.snapshot,
+        receiver,
+    }
 }
 
 struct ListenerActiveGuard {
@@ -266,6 +322,33 @@ pub struct JournalBridgeHandle {
     join: JoinHandle<JournalBridgeStatus>,
 }
 
+/// Ordered status stream for one bridge.
+///
+/// The initial snapshot and receiver are captured under the same status lock.
+/// A slow consumer receives an explicit [`broadcast::error::RecvError::Lagged`]
+/// instead of silently missing a carrier transition.
+pub struct JournalBridgeStatusSubscription {
+    initial: JournalBridgeStatus,
+    receiver: broadcast::Receiver<JournalBridgeStatus>,
+}
+
+impl JournalBridgeStatusSubscription {
+    /// Status at the instant the subscription was created.
+    pub fn initial(&self) -> JournalBridgeStatus {
+        self.initial
+    }
+
+    /// Receive the next ordered status transition.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Closed` after the bridge drops its sender, or `Lagged` with the
+    /// exact number of skipped transitions when the bounded receiver falls behind.
+    pub async fn recv(&mut self) -> Result<JournalBridgeStatus, broadcast::error::RecvError> {
+        self.receiver.recv().await
+    }
+}
+
 impl JournalBridgeHandle {
     /// Return the bound loopback TCP port.
     pub fn port(&self) -> u16 {
@@ -281,6 +364,11 @@ impl JournalBridgeHandle {
     /// Return one coherent owned bridge-status snapshot.
     pub fn status(&self) -> JournalBridgeStatus {
         status_snapshot(&self.status)
+    }
+
+    /// Subscribe to ordered status transitions without a snapshot/subscription race.
+    pub fn subscribe_status(&self) -> JournalBridgeStatusSubscription {
+        status_subscription(&self.status)
     }
 
     /// Return the bootstrap URL when capability authorization is enabled.
@@ -1516,5 +1604,20 @@ mod tests {
             safe_content_type("text/plain\r\nx-injected: value"),
             "application/octet-stream"
         );
+    }
+
+    #[tokio::test]
+    async fn status_subscription_preserves_transient_carrier_edges_in_order() {
+        let status = new_status();
+        let mut subscription = status_subscription(&status);
+        assert!(!subscription.initial().carrier_live);
+
+        lock_status(&status).snapshot.carrier_live = true;
+        lock_status(&status).snapshot.carrier_live = false;
+        lock_status(&status).snapshot.carrier_live = true;
+
+        assert!(subscription.recv().await.unwrap().carrier_live);
+        assert!(!subscription.recv().await.unwrap().carrier_live);
+        assert!(subscription.recv().await.unwrap().carrier_live);
     }
 }

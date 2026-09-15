@@ -2906,6 +2906,7 @@ async fn journal_bridge_shutdown_closes_active_carrier_and_streams() {
 #[tokio::test]
 async fn journal_bridge_carrier_death_redials_without_replaying_failed_stream() {
     let (handle, mut server) = start_bridge_with_persistent_server().await;
+    let mut status_events = handle.subscribe_status();
     let port = handle.port();
     let cap = capability_from(&handle);
 
@@ -2927,6 +2928,7 @@ async fn journal_bridge_carrier_death_redials_without_replaying_failed_stream() 
     assert!(String::from_utf8_lossy(&ok_request.bytes).starts_with("GET /ok HTTP/1.1\r\n"));
     server.send_http(ok_request.stream_id, "200 OK", b"ok");
     assert_eq!(response_body(&ok.await.unwrap()), "ok");
+    while !status_events.recv().await.unwrap().carrier_live {}
 
     let dying_cap = cap.clone();
     let dying = tokio::spawn(async move {
@@ -2950,6 +2952,7 @@ async fn journal_bridge_carrier_death_redials_without_replaying_failed_stream() 
         .expect("dead carrier should fail in-flight local request")
         .unwrap();
     assert_eq!(response_status(&dying_response), 502);
+    while status_events.recv().await.unwrap().carrier_live {}
 
     let after_cap = cap.clone();
     let after = tokio::spawn(async move {
@@ -2973,6 +2976,7 @@ async fn journal_bridge_carrier_death_redials_without_replaying_failed_stream() 
     );
     server.send_http(after_request.stream_id, "200 OK", b"after");
     assert_eq!(response_body(&after.await.unwrap()), "after");
+    while !status_events.recv().await.unwrap().carrier_live {}
     assert_eq!(server.accepted_carriers(), 2);
 
     handle.shutdown_and_wait().await;

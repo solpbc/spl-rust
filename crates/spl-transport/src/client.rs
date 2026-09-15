@@ -759,19 +759,8 @@ pub(crate) fn now_secs() -> i64 {
         })
 }
 
-#[expect(
-    clippy::trivially_copy_pass_by_ref,
-    reason = "relay errors are matched by reference consistently with TransportError inspection"
-)]
-fn relay_fault_is_transient(error: &RelayError) -> bool {
-    matches!(
-        error,
-        RelayError::HomeOffline | RelayError::Abnormal | RelayError::Overflow | RelayError::Stalled
-    )
-}
-
 pub(crate) fn relay_fault_is_transient_err(error: &TransportError) -> bool {
-    matches!(error, TransportError::Relay(relay) if relay_fault_is_transient(relay))
+    matches!(error, TransportError::Relay(relay) if relay.is_transient())
 }
 
 #[cfg(test)]
@@ -894,15 +883,19 @@ mod tests {
             RelayError::Overflow,
             RelayError::Stalled,
         ] {
-            assert!(relay_fault_is_transient(&err), "{err:?} should retry");
+            assert!(err.is_transient(), "{err:?} should retry");
         }
         for err in [
             RelayError::Unauthorized,
             RelayError::Unpaid,
             RelayError::UnknownInstance,
+            RelayError::PairWindowClosed,
             RelayError::UpgradeRejected,
+            RelayError::HomeListenConnection,
+            RelayError::HomeRelayConfiguration,
+            RelayError::HomeTunnelRejected(503),
         ] {
-            assert!(!relay_fault_is_transient(&err), "{err:?} should stop");
+            assert!(!err.is_transient(), "{err:?} should stop");
         }
     }
 

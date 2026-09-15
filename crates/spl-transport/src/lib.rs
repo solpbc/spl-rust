@@ -147,6 +147,18 @@ pub enum RelayError {
     HomeTunnelRejected(u16),
 }
 
+impl RelayError {
+    /// Whether retrying the relay data-plane operation can recover without
+    /// changing credentials or configuration.
+    #[must_use]
+    pub const fn is_transient(self) -> bool {
+        matches!(
+            self,
+            Self::HomeOffline | Self::Overflow | Self::Abnormal | Self::Stalled
+        )
+    }
+}
+
 impl fmt::Display for RelayError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         let message = match self {

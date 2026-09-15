@@ -87,7 +87,7 @@ fn protocol_mirror_has_exact_pinned_contents() -> Result<(), Box<dyn Error>> {
     let pinned_documents = [
         (
             "framing.md",
-            "0691a9d7cf76234986d9277604a5717b213d1abc63d98c28b9978c0121575e76",
+            "13a7a0cacb86b4667d35dca093182dbdc63e4b9858723cb312dc202312455f9b",
         ),
         (
             "identity.md",

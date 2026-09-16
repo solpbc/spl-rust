@@ -533,6 +533,89 @@ async fn rejected_client_certificate_surfaces_access_denied_to_dialer() {
     assert!(matches!(home.await.unwrap(), Err(spl_home::HomeError::Tls)));
 }
 
+/// Copy one direction until it ends, then end the other side's writes.
+async fn forward(
+    mut from: tokio::net::tcp::OwnedReadHalf,
+    mut to: tokio::net::tcp::OwnedWriteHalf,
+) -> io::Result<()> {
+    let mut buffer = vec![0u8; 16 * 1024];
+    loop {
+        let count = from.read(&mut buffer).await?;
+        if count == 0 {
+            return to.shutdown().await;
+        }
+        to.write_all(&buffer[..count]).await?;
+    }
+}
+
+/// A relay leg that ends the whole tunnel when either direction ends, as a
+/// journal's relay forwarder does.
+async fn racing_tunnel(listener: tokio::net::TcpListener, home: std::net::SocketAddr) {
+    loop {
+        let (client, _) = listener.accept().await.unwrap();
+        tokio::spawn(async move {
+            let upstream = tokio::net::TcpStream::connect(home).await.unwrap();
+            let (client_read, client_write) = client.into_split();
+            let (home_read, home_write) = upstream.into_split();
+            tokio::select! {
+                _ = forward(client_read, home_write) => {}
+                _ = forward(home_read, client_write) => {}
+            }
+        });
+    }
+}
+
+// Protocol: `.proto-ref/session.md` § 7. A dialer writes its request as soon as its side of the
+// handshake completes, so a refused carrier still holds unread bytes. Falsified by dropping the
+// refused socket at once: the unread bytes turn the close into a reset, the forwarder's write
+// fails, and the tunnel ends before the refusal reaches the dialer.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_refusal_reaches_a_dialer_through_a_tunnel_while_it_uploads() {
+    let fixture = Arc::new(fixture());
+    let home = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let home_addr = home.local_addr().unwrap();
+    let home_fixture = Arc::clone(&fixture);
+    let home_task = tokio::spawn(async move {
+        loop {
+            let (stream, _) = home.accept().await.unwrap();
+            let config = config(&home_fixture, Arc::new(RejectVerifier));
+            tokio::spawn(HomeConnection::accept(stream, config));
+        }
+    });
+    let tunnel = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let tunnel_addr = tunnel.local_addr().unwrap();
+    let tunnel_task = tokio::spawn(racing_tunnel(tunnel, home_addr));
+
+    let connector = TlsConnector::from(Arc::new(client_config(&fixture)));
+    let body = vec![0x5a_u8; 900 * 1024];
+    let mut lost = 0;
+    for _ in 0..20 {
+        let tcp = tokio::net::TcpStream::connect(tunnel_addr).await.unwrap();
+        let mut dialer = connector
+            .connect(ServerName::try_from("spl.local").unwrap(), tcp)
+            .await
+            .unwrap();
+        let _ = dialer.write_all(&body).await;
+        let _ = dialer.flush().await;
+        let mut byte = [0u8; 1];
+        let verdict = tokio::time::timeout(Duration::from_secs(5), dialer.read(&mut byte))
+            .await
+            .expect("the dialer hears something");
+        let denied = verdict.as_ref().err().and_then(|error| {
+            error
+                .get_ref()
+                .and_then(|error| error.downcast_ref::<Error>())
+                .cloned()
+        }) == Some(Error::AlertReceived(AlertDescription::AccessDenied));
+        if !denied {
+            lost += 1;
+        }
+    }
+    home_task.abort();
+    tunnel_task.abort();
+    assert_eq!(lost, 0, "refusals lost in the tunnel");
+}
+
 #[tokio::test]
 async fn a_stream_limit_refusal_is_counted_where_nothing_else_records_it() {
     // A per-stream refusal resets one stream and deliberately leaves the
@@ -885,6 +968,87 @@ async fn pairing_window_expired_writes_no_carrier_bytes() {
         ))
     ));
     assert_eq!(written.load(Ordering::SeqCst), 0);
+}
+
+/// Accept every client certificate the inner verifier accepts, counting checks.
+#[derive(Debug)]
+struct CountingVerifier(Arc<dyn ClientCertVerifier>, Arc<AtomicUsize>);
+
+impl ClientCertVerifier for CountingVerifier {
+    fn root_hint_subjects(&self) -> &[rustls::DistinguishedName] {
+        self.0.root_hint_subjects()
+    }
+
+    fn verify_client_cert(
+        &self,
+        end_entity: &CertificateDer<'_>,
+        intermediates: &[CertificateDer<'_>],
+        now: UnixTime,
+    ) -> Result<ClientCertVerified, Error> {
+        self.1.fetch_add(1, Ordering::SeqCst);
+        self.0.verify_client_cert(end_entity, intermediates, now)
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, Error> {
+        self.0.verify_tls12_signature(message, cert, dss)
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, Error> {
+        self.0.verify_tls13_signature(message, cert, dss)
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        self.0.supported_verify_schemes()
+    }
+}
+
+// A resumed session skips the check of the device certificate, so a device unpaired since its
+// last session would be admitted unchecked. Falsified by sharing one server configuration, and so
+// one session cache, across accepted carriers: a dialer that offers resumption gets it.
+#[tokio::test]
+async fn every_carrier_checks_the_device_certificate_even_when_the_dialer_offers_resumption() {
+    let fixture = fixture();
+    let checks = Arc::new(AtomicUsize::new(0));
+    let home = config(
+        &fixture,
+        Arc::new(CountingVerifier(
+            verifier(fixture.ca.clone()),
+            Arc::clone(&checks),
+        )),
+    );
+    let mut client = client_config(&fixture);
+    client.resumption = rustls::client::Resumption::default();
+    let connector = TlsConnector::from(Arc::new(client));
+
+    for round in 1..=2 {
+        let (dialer_io, home_io) = tokio::io::duplex(64 * 1024);
+        let accepted = tokio::spawn(HomeConnection::accept(home_io, home.clone()));
+        let mut dialer = connector
+            .connect(ServerName::try_from("spl.local").unwrap(), dialer_io)
+            .await
+            .unwrap();
+        let connection = accepted.await.unwrap().unwrap();
+        // Let the dialer read the session tickets the home sends after the handshake.
+        let mut byte = [0u8; 1];
+        let _ = tokio::time::timeout(Duration::from_millis(50), dialer.read(&mut byte)).await;
+        assert_eq!(
+            dialer.get_ref().1.handshake_kind(),
+            Some(rustls::HandshakeKind::Full),
+            "round {round}"
+        );
+        assert_eq!(checks.load(Ordering::SeqCst), round);
+        drop(connection);
+    }
 }
 
 #[test]

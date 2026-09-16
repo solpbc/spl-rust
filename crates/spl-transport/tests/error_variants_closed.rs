@@ -26,6 +26,8 @@ fn match_transport_error_exhaustively(err: &TransportError) -> &'static str {
         TransportError::Tls(_) => "tls",
         TransportError::TlsAccessDenied => "tls_access_denied",
         TransportError::TlsCertificateUnknown => "tls_certificate_unknown",
+        TransportError::TlsRefused => "tls_refused",
+        TransportError::UnknownJournal(_) => "unknown_journal",
         TransportError::Crypto(_) => "crypto",
         TransportError::Mux(_) => "mux",
         TransportError::Http(_) => "http",

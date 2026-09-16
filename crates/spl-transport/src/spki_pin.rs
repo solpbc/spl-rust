@@ -29,20 +29,28 @@ pub(crate) fn verify_live_peer_binding(
 }
 
 pub(crate) fn verify_ca_self_signed(pinned_ca: &CertificateDer<'_>) -> Result<(), TransportError> {
-    let (tbs, signature) = spl_core::ca::extract_tbs_and_signature(pinned_ca.as_ref())
-        .map_err(|_| TransportError::Pairing("relay ca not self signed".into()))?;
-    let spki = spl_core::ca::extract_spki_der(pinned_ca.as_ref())
-        .map_err(|_| TransportError::Pairing("relay ca not self signed".into()))?;
-    let spki_der = SubjectPublicKeyInfoDer::from(spki.as_slice());
-    let rpk = webpki::RawPublicKeyEntity::try_from(&spki_der)
-        .map_err(|_| TransportError::Pairing("relay ca not self signed".into()))?;
-
-    for alg in webpki::ALL_VERIFICATION_ALGS {
-        if rpk.verify_signature(*alg, &tbs, &signature).is_ok() {
-            return Ok(());
-        }
+    if signed_by(pinned_ca, pinned_ca) {
+        Ok(())
+    } else {
+        Err(TransportError::Pairing("relay ca not self signed".into()))
     }
-    Err(TransportError::Pairing("relay ca not self signed".into()))
+}
+
+/// Whether `ca`'s key signed `cert`, without checking validity dates or usage.
+pub(crate) fn signed_by(cert: &CertificateDer<'_>, ca: &CertificateDer<'_>) -> bool {
+    let Ok((tbs, signature)) = spl_core::ca::extract_tbs_and_signature(cert.as_ref()) else {
+        return false;
+    };
+    let Ok(spki) = spl_core::ca::extract_spki_der(ca.as_ref()) else {
+        return false;
+    };
+    let spki_der = SubjectPublicKeyInfoDer::from(spki.as_slice());
+    let Ok(rpk) = webpki::RawPublicKeyEntity::try_from(&spki_der) else {
+        return false;
+    };
+    webpki::ALL_VERIFICATION_ALGS
+        .iter()
+        .any(|alg| rpk.verify_signature(*alg, &tbs, &signature).is_ok())
 }
 
 #[cfg(test)]

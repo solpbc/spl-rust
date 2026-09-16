@@ -16,6 +16,12 @@
 //! never replayed. Application code owns retry and the associated idempotency
 //! policy.
 //!
+//! A streamed response whose upstream declared a body length keeps that length,
+//! so a caller can tell a body that ended early from a complete one; a streamed
+//! body with no declared length, such as `GET /sse/events`, stays delimited by
+//! the connection close. A failed dial is always a local `502`; the bridge's
+//! status says whether the journal was reached and how it refused.
+//!
 //! Limitations: request bodies stream incrementally within a fixed per-stream
 //! memory bound. Buffered upstream-response paths remain buffered, and
 //! `connection::request_once` remains caller-buffered. Ordinary short bodies,
@@ -39,6 +45,7 @@ use tokio::sync::{broadcast, oneshot, watch};
 use tokio::task::{JoinHandle, JoinSet};
 
 use crate::client::DialedCarrier;
+use crate::handshake::RefusalTracker;
 use crate::journal_bridge_carrier::{BodyTx, MuxCarrier, OpenedStream};
 use crate::{TransportError, transport_error_code};
 
@@ -76,6 +83,11 @@ pub struct LocalResponse {
 }
 
 /// Owned point-in-time status for one journal bridge.
+///
+/// The bridge's local HTTP answer to a failed dial is always `502`. These
+/// fields carry what that answer cannot: whether the journal was reached, and
+/// how it refused. They implement the client half of the SPL session
+/// protocol's handshake-refusal rules.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct JournalBridgeStatus {
     /// Whether the loopback listener task has not exited.
@@ -84,20 +96,27 @@ pub struct JournalBridgeStatus {
     pub contacted: bool,
     /// Whether the current persistent carrier is live.
     pub carrier_live: bool,
-    /// Terminal reason observed while dialing or using the persistent carrier,
-    /// if any; latched once and never cleared.
+    /// Why the bridge stopped dialing, if it has. Latched once and never
+    /// cleared; only access denied (49) and an exhausted refusal bound latch.
+    /// Certificate unknown (46) never latches.
     pub terminal_reason: Option<JournalBridgeTerminalReason>,
+    /// How the most recent carrier attempt failed, if the journal has not
+    /// accepted a carrier since. Cleared when the journal accepts one.
+    pub last_failure: Option<JournalBridgeFailure>,
+    /// Refusals counted toward [`JournalBridgeTerminalReason::RefusalsExhausted`]
+    /// since the journal last accepted a carrier. See [`REFUSAL_LIMIT`].
+    pub refusals: u32,
     /// Accepted connection tasks that have not completed.
     pub active_requests: usize,
 }
 
-/// Terminal condition observed while dialing or using a journal bridge carrier;
-/// latched once and never cleared.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum JournalBridgeTerminalReason {
-    /// The peer rejected the TLS session with access denied.
-    TlsAccessDenied,
-}
+/// Why a journal bridge stopped dialing; latched once and never cleared.
+pub type JournalBridgeTerminalReason = HandshakeStop;
+
+/// How one attempt to reach the journal failed.
+pub type JournalBridgeFailure = HandshakeFailure;
+
+pub use crate::handshake::{HandshakeFailure, HandshakeStop, REFUSAL_LIMIT, REFUSAL_SPACING};
 
 const STATUS_EVENT_CAPACITY: usize = 64;
 
@@ -111,6 +130,17 @@ pub(crate) type SharedStatus = Arc<StatusState>;
 pub(crate) struct StatusRecord {
     pub(crate) snapshot: JournalBridgeStatus,
     pub(crate) current_carrier: Option<Arc<()>>,
+    refusals: RefusalTracker,
+    /// The newest carrier attempt; outcomes of older attempts are ignored.
+    attempt: u64,
+}
+
+impl StatusRecord {
+    fn publish_refusals(&mut self) {
+        self.snapshot.terminal_reason = self.refusals.stop();
+        self.snapshot.last_failure = self.refusals.last_failure();
+        self.snapshot.refusals = self.refusals.refusals();
+    }
 }
 
 pub(crate) struct StatusGuard<'a> {
@@ -160,6 +190,8 @@ pub(crate) fn new_status() -> SharedStatus {
         contacted: false,
         carrier_live: false,
         terminal_reason: None,
+        last_failure: None,
+        refusals: 0,
         active_requests: 0,
     };
     let (events, _) = broadcast::channel(STATUS_EVENT_CAPACITY);
@@ -167,9 +199,49 @@ pub(crate) fn new_status() -> SharedStatus {
         record: Mutex::new(StatusRecord {
             snapshot,
             current_carrier: None,
+            refusals: RefusalTracker::new(),
+            attempt: 0,
         }),
         events,
     })
+}
+
+/// Stop the bridge for access denied, whether or not the attempt was resolved.
+pub(crate) fn latch_tls_access_denied(status: &SharedStatus) {
+    let mut record = lock_status(status);
+    record.refusals.deny();
+    record.publish_refusals();
+}
+
+/// Start a carrier attempt; its outcome counts only while no newer attempt has started.
+pub(crate) fn begin_carrier_attempt(status: &SharedStatus) -> u64 {
+    let mut record = lock_status(status);
+    record.attempt = record.attempt.wrapping_add(1);
+    record.attempt
+}
+
+/// Record that the journal accepted a carrier: only this clears the refusal count.
+pub(crate) fn record_carrier_accepted(status: &SharedStatus, attempt: u64) {
+    let mut record = lock_status(status);
+    if record.attempt != attempt {
+        return;
+    }
+    record.refusals.accepted();
+    record.publish_refusals();
+}
+
+/// Record how one carrier attempt failed.
+pub(crate) fn record_carrier_failure(
+    status: &SharedStatus,
+    attempt: u64,
+    failure: HandshakeFailure,
+) {
+    let mut record = lock_status(status);
+    if record.attempt != attempt {
+        return;
+    }
+    record.refusals.failed(failure);
+    record.publish_refusals();
 }
 
 fn status_snapshot(status: &SharedStatus) -> JournalBridgeStatus {
@@ -349,7 +421,33 @@ impl JournalBridgeStatusSubscription {
     }
 }
 
+/// Cloneable read access to one bridge's status, for code that does not own
+/// the bridge handle.
+#[derive(Clone)]
+pub struct JournalBridgeStatusReader {
+    status: SharedStatus,
+}
+
+impl JournalBridgeStatusReader {
+    /// Return one coherent owned bridge-status snapshot.
+    pub fn status(&self) -> JournalBridgeStatus {
+        status_snapshot(&self.status)
+    }
+
+    /// Subscribe to ordered status transitions without a snapshot/subscription race.
+    pub fn subscribe(&self) -> JournalBridgeStatusSubscription {
+        status_subscription(&self.status)
+    }
+}
+
 impl JournalBridgeHandle {
+    /// Return cloneable read access to this bridge's status.
+    pub fn status_reader(&self) -> JournalBridgeStatusReader {
+        JournalBridgeStatusReader {
+            status: self.status.clone(),
+        }
+    }
+
     /// Return the bound loopback TCP port.
     pub fn port(&self) -> u16 {
         self.port
@@ -971,6 +1069,17 @@ struct ResponseForwarder<'a> {
     head: Option<spl_core::mux::HttpHead>,
     body: Vec<u8>,
     head_written: bool,
+    /// Body length a streamed response declared to the local caller.
+    declared_len: Option<usize>,
+    /// Body bytes a streamed response with a declared length has received.
+    received_len: usize,
+    /// The final declared byte, written only once the journal ends the stream
+    /// cleanly, so an early or overlong end always leaves the body short.
+    held_last: Option<u8>,
+    /// The head of a streamed response that declared an empty body, written
+    /// only once the journal ends the stream, so an unexpected body can still
+    /// become a local 502.
+    deferred_head: Option<(u16, Vec<(String, String)>)>,
 }
 
 impl<'a> ResponseForwarder<'a> {
@@ -988,6 +1097,10 @@ impl<'a> ResponseForwarder<'a> {
             head: None,
             body: Vec::new(),
             head_written: false,
+            declared_len: None,
+            received_len: 0,
+            held_last: None,
+            deferred_head: None,
         }
     }
 
@@ -1049,8 +1162,25 @@ impl<'a> ResponseForwarder<'a> {
             &self.runtime.loopback_origin,
             &self.runtime.bridge_names,
         );
-        let content_length = (self.request_head.method == "HEAD")
-            .then(|| upstream_content_length(&head.headers).unwrap_or(0));
+        // A finite streamed body keeps the length the journal declared, so a
+        // caller can tell a body that ended early from a complete one. A body
+        // with no declared length, such as an event stream, stays delimited by
+        // the connection close. `response_headers` has already removed the
+        // upstream field, so this is the only length header written.
+        let content_length = if self.request_head.method == "HEAD" {
+            Some(upstream_content_length(&head.headers).unwrap_or(0))
+        } else if status_permits_body(head.status) && !has_transfer_encoding(&head.headers) {
+            upstream_content_length(&head.headers)
+        } else {
+            None
+        };
+        if self.request_head.method != "HEAD" {
+            self.declared_len = content_length;
+            if content_length == Some(0) {
+                self.deferred_head = Some((head.status, headers));
+                return ResponseControl::Continue;
+            }
+        }
         let write_result = until_shutdown(
             shutdown,
             write_stream_head(&mut self.write, head.status, &headers, content_length),
@@ -1074,14 +1204,46 @@ impl<'a> ResponseForwarder<'a> {
             self.body.extend_from_slice(bytes);
             return ResponseControl::Continue;
         }
+        if self.deferred_head.is_some() {
+            // A body after an empty declaration: the head is still unwritten,
+            // so this becomes a local 502.
+            return if bytes.is_empty() {
+                ResponseControl::Continue
+            } else {
+                ResponseControl::Incomplete
+            };
+        }
         if !self.head_written {
             return ResponseControl::Complete;
         }
         if self.request_head.method == "HEAD" {
             return ResponseControl::Continue;
         }
+        let mut writable = bytes;
+        if let Some(declared) = self.declared_len {
+            let received = self.received_len.saturating_add(bytes.len());
+            if received > declared {
+                // More body than the journal declared. Never write past the
+                // declared length, and never write the held final byte, so
+                // the caller sees the body as incomplete.
+                log_upstream_io_failure();
+                rx.cancel();
+                let _ = until_shutdown(shutdown, self.write.shutdown()).await;
+                return ResponseControl::Handled;
+            }
+            self.received_len = received;
+            if received == declared
+                && let Some((&last, rest)) = bytes.split_last()
+            {
+                self.held_last = Some(last);
+                writable = rest;
+            }
+        }
+        if writable.is_empty() {
+            return ResponseControl::Continue;
+        }
         let write_result = until_shutdown(shutdown, async {
-            self.write.write_all(bytes).await?;
+            self.write.write_all(writable).await?;
             self.write.flush().await
         })
         .await;
@@ -1098,7 +1260,29 @@ impl<'a> ResponseForwarder<'a> {
         shutdown: &mut watch::Receiver<bool>,
     ) {
         if matches!(self.mode, ResponseMode::Streaming) {
-            if self.head_written {
+            if let Some((status, headers)) = self.deferred_head.take() {
+                let _ = until_shutdown(shutdown, async {
+                    write_stream_head(&mut self.write, status, &headers, Some(0)).await?;
+                    self.write.shutdown().await
+                })
+                .await;
+            } else if self.head_written {
+                let complete = self
+                    .declared_len
+                    .is_none_or(|declared| declared == self.received_len);
+                if complete {
+                    if let Some(last) = self.held_last.take() {
+                        let _ = until_shutdown(shutdown, async {
+                            self.write.write_all(&[last]).await?;
+                            self.write.flush().await
+                        })
+                        .await;
+                    }
+                } else {
+                    // The journal closed the stream before its declared length.
+                    // The declared length already makes this visible to the caller.
+                    log_upstream_io_failure();
+                }
                 let _ = until_shutdown(shutdown, self.write.shutdown()).await;
             } else {
                 log_upstream_io_failure();
@@ -1464,6 +1648,19 @@ where
     stream.shutdown().await
 }
 
+/// Whether the upstream framed its body with a transfer coding, which takes
+/// precedence over any length it also declared.
+fn has_transfer_encoding(headers: &[(String, String)]) -> bool {
+    headers
+        .iter()
+        .any(|(name, _)| name.eq_ignore_ascii_case("transfer-encoding"))
+}
+
+/// Whether a response with this status can carry a body, and so a length.
+fn status_permits_body(status: u16) -> bool {
+    !matches!(status, 100..=199 | 204 | 304)
+}
+
 fn upstream_content_length(headers: &[(String, String)]) -> Option<usize> {
     headers
         .iter()
@@ -1596,6 +1793,8 @@ mod tests {
             contacted: true,
             carrier_live: false,
             terminal_reason: None,
+            last_failure: None,
+            refusals: 0,
             active_requests: 1,
         };
         assert!(local_response(&request("GET", "/other"), &status).is_none());
@@ -1603,6 +1802,75 @@ mod tests {
         assert_eq!(
             safe_content_type("text/plain\r\nx-injected: value"),
             "application/octet-stream"
+        );
+    }
+
+    // Falsified by publishing the tracker without its stop: a latched refusal never reaches the
+    // status a consumer reads.
+    #[test]
+    fn status_publishes_the_refusal_state() {
+        let status = new_status();
+        let first = begin_carrier_attempt(&status);
+        record_carrier_failure(&status, first, HandshakeFailure::TlsRefused);
+        let snapshot = status_snapshot(&status);
+        assert_eq!(snapshot.last_failure, Some(HandshakeFailure::TlsRefused));
+        assert_eq!(snapshot.refusals, 1);
+        assert_eq!(snapshot.terminal_reason, None);
+
+        record_carrier_failure(&status, first, HandshakeFailure::TlsCertificateUnknown);
+        assert_eq!(
+            status_snapshot(&status).last_failure,
+            Some(HandshakeFailure::TlsCertificateUnknown)
+        );
+        assert_eq!(status_snapshot(&status).refusals, 1);
+
+        record_carrier_accepted(&status, first);
+        let snapshot = status_snapshot(&status);
+        assert_eq!((snapshot.last_failure, snapshot.refusals), (None, 0));
+
+        latch_tls_access_denied(&status);
+        record_carrier_accepted(&status, first);
+        assert_eq!(
+            status_snapshot(&status).terminal_reason,
+            Some(JournalBridgeTerminalReason::TlsAccessDenied)
+        );
+    }
+
+    // Falsified by recording every outcome: a superseded carrier's late failure would overwrite
+    // the newer carrier's accepted state.
+    #[test]
+    fn a_superseded_attempt_cannot_overwrite_a_newer_one() {
+        let status = new_status();
+        let old = begin_carrier_attempt(&status);
+        let new = begin_carrier_attempt(&status);
+        record_carrier_accepted(&status, new);
+        record_carrier_failure(&status, old, HandshakeFailure::TlsRefused);
+        record_carrier_failure(&status, old, HandshakeFailure::Unreachable);
+        let snapshot = status_snapshot(&status);
+        assert_eq!((snapshot.last_failure, snapshot.refusals), (None, 0));
+
+        record_carrier_failure(&status, new, HandshakeFailure::TlsRefused);
+        assert_eq!(status_snapshot(&status).refusals, 1);
+        record_carrier_accepted(&status, old);
+        assert_eq!(status_snapshot(&status).refusals, 1);
+    }
+
+    #[tokio::test]
+    async fn status_reader_sees_the_same_status_as_its_bridge() {
+        let status = new_status();
+        let reader = JournalBridgeStatusReader {
+            status: status.clone(),
+        };
+        let mut subscription = reader.subscribe();
+        let attempt = begin_carrier_attempt(&status);
+        record_carrier_failure(&status, attempt, HandshakeFailure::TlsAccessDenied);
+        assert_eq!(
+            reader.status().terminal_reason,
+            Some(JournalBridgeTerminalReason::TlsAccessDenied)
+        );
+        assert_eq!(
+            subscription.recv().await.unwrap().terminal_reason,
+            Some(JournalBridgeTerminalReason::TlsAccessDenied)
         );
     }
 

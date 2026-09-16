@@ -88,7 +88,7 @@ fn server_config(cert: CertificateDer<'static>, key: PrivateKeyDer<'static>) -> 
 }
 
 #[derive(Debug)]
-struct RejectVerifier;
+struct RejectVerifier(CertificateError);
 
 impl ClientCertVerifier for RejectVerifier {
     fn root_hint_subjects(&self) -> &[rustls::DistinguishedName] {
@@ -101,9 +101,7 @@ impl ClientCertVerifier for RejectVerifier {
         _intermediates: &[CertificateDer<'_>],
         _now: UnixTime,
     ) -> Result<ClientCertVerified, Error> {
-        Err(Error::InvalidCertificate(
-            CertificateError::ApplicationVerificationFailure,
-        ))
+        Err(Error::InvalidCertificate(self.0.clone()))
     }
 
     fn verify_tls12_signature(
@@ -133,16 +131,161 @@ impl ClientCertVerifier for RejectVerifier {
     }
 }
 
+/// A journal-like server that accepts every client certificate and counts its checks.
+#[derive(Debug)]
+struct CountingAcceptVerifier(Arc<AtomicUsize>);
+
+impl ClientCertVerifier for CountingAcceptVerifier {
+    fn root_hint_subjects(&self) -> &[rustls::DistinguishedName] {
+        &[]
+    }
+
+    fn verify_client_cert(
+        &self,
+        _end_entity: &CertificateDer<'_>,
+        _intermediates: &[CertificateDer<'_>],
+        _now: UnixTime,
+    ) -> Result<ClientCertVerified, Error> {
+        self.0.fetch_add(1, Ordering::SeqCst);
+        Ok(ClientCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        _message: &[u8],
+        _cert: &CertificateDer<'_>,
+        _dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, Error> {
+        Ok(HandshakeSignatureValid::assertion())
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        _message: &[u8],
+        _cert: &CertificateDer<'_>,
+        _dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, Error> {
+        Ok(HandshakeSignatureValid::assertion())
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        vec![SignatureScheme::ECDSA_NISTP256_SHA256]
+    }
+}
+
+// A resumed TLS session skips the journal's check of the device certificate, so a journal could
+// neither refuse an unpaired device nor say why. Falsified by leaving client session resumption
+// on: the second session resumes against a server that allows it, unchecked.
+#[tokio::test]
+async fn every_mtls_session_is_a_full_handshake_the_journal_checks() {
+    let (cert, key) = self_signed();
+    let pin = spl_core::ca::sha256(cert.as_ref())[..16].to_vec();
+    let checks = Arc::new(AtomicUsize::new(0));
+    let server = Arc::new(
+        ServerConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_client_cert_verifier(Arc::new(CountingAcceptVerifier(checks.clone())))
+            .with_single_cert(vec![cert], key)
+            .unwrap(),
+    );
+    let client_key = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).unwrap();
+    let client_cert = CertificateParams::new(vec!["transport.test".to_string()])
+        .unwrap()
+        .self_signed(&client_key)
+        .unwrap();
+    let client = Arc::new(
+        spl_transport::tls::mtls_config(
+            &pin,
+            vec![CertificateDer::from(client_cert.der().to_vec())],
+            PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(client_key.serialize_der())),
+        )
+        .unwrap(),
+    );
+
+    let mut kinds = Vec::new();
+    for _ in 0..2 {
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+        let acceptor = TlsAcceptor::from(server.clone());
+        let session = tokio::spawn(async move {
+            let mut tls = acceptor.accept(server_io).await.unwrap();
+            let kind = tls.get_ref().1.handshake_kind();
+            tls.write_all(b"x").await.unwrap();
+            tls.flush().await.unwrap();
+            let mut byte = [0_u8; 1];
+            let _ = tls.read(&mut byte).await;
+            kind
+        });
+        let mut tls = tokio_rustls::TlsConnector::from(client.clone())
+            .connect(
+                rustls::pki_types::ServerName::try_from("spl.local").unwrap(),
+                client_io,
+            )
+            .await
+            .unwrap();
+        // Reading processes the session tickets the server sends after the handshake.
+        let mut byte = [0_u8; 1];
+        tls.read_exact(&mut byte).await.unwrap();
+        tls.write_all(b"y").await.unwrap();
+        tls.flush().await.unwrap();
+        drop(tls);
+        kinds.push(session.await.unwrap());
+    }
+    assert_eq!(kinds, vec![Some(rustls::HandshakeKind::Full); 2]);
+    assert_eq!(checks.load(Ordering::SeqCst), 2);
+}
+
 fn rejecting_server_config(
     cert: CertificateDer<'static>,
     key: PrivateKeyDer<'static>,
 ) -> ServerConfig {
+    refusing_server_config(cert, key, CertificateError::ApplicationVerificationFailure)
+}
+
+/// A journal-like server that finishes its side of TLS 1.3 and then refuses the
+/// client certificate, so the alert reaches the client after its handshake.
+/// rustls sends 49 for `ApplicationVerificationFailure`, 46 for `Other`, and
+/// 48 for `UnknownIssuer`.
+fn refusing_server_config(
+    cert: CertificateDer<'static>,
+    key: PrivateKeyDer<'static>,
+    error: CertificateError,
+) -> ServerConfig {
     ServerConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
         .with_safe_default_protocol_versions()
         .unwrap()
-        .with_client_cert_verifier(Arc::new(RejectVerifier))
+        .with_client_cert_verifier(Arc::new(RejectVerifier(error)))
         .with_single_cert(vec![cert], key)
         .unwrap()
+}
+
+/// A server-side refusal, the status it should record, and the error it should surface.
+type RefusalClass = (
+    CertificateError,
+    Option<journal_bridge::JournalBridgeFailure>,
+    fn(&TransportError) -> bool,
+);
+
+fn refusal_classes() -> [RefusalClass; 3] {
+    [
+        (
+            CertificateError::ApplicationVerificationFailure,
+            Some(journal_bridge::JournalBridgeFailure::TlsAccessDenied),
+            |error| matches!(error, TransportError::TlsAccessDenied),
+        ),
+        (
+            CertificateError::Other(rustls::OtherError(Arc::new(std::io::Error::other(
+                "pairing records unreadable",
+            )))),
+            Some(journal_bridge::JournalBridgeFailure::TlsCertificateUnknown),
+            |error| matches!(error, TransportError::TlsCertificateUnknown),
+        ),
+        (
+            CertificateError::UnknownIssuer,
+            Some(journal_bridge::JournalBridgeFailure::TlsRefused),
+            |error| matches!(error, TransportError::TlsRefused),
+        ),
+    ]
 }
 
 fn transport_credential(pin: Vec<u8>, port: u16) -> Credential {
@@ -983,6 +1126,236 @@ async fn journal_bridge_latches_real_received_access_denied() {
     );
     handle.shutdown_and_wait().await;
     server.abort();
+}
+
+// Protocol: `.proto-ref/session.md` § 7. The journal refuses after the client's TLS 1.3
+// handshake completes. Falsified by leaving post-dial reads unclassified: every class records
+// the journal as unreachable, so neither the unpaired stop nor the catch-all can fire.
+#[tokio::test]
+async fn journal_bridge_records_each_real_post_handshake_refusal() {
+    for (error, expected, _) in refusal_classes() {
+        let (cert, key) = self_signed();
+        let pin = spl_core::ca::sha256(cert.as_ref())[..16].to_vec();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            let acceptor = TlsAcceptor::from(Arc::new(refusing_server_config(cert, key, error)));
+            loop {
+                let (stream, _) = listener.accept().await.unwrap();
+                let _ = acceptor.accept(stream).await;
+            }
+        });
+        let handle = start_bridge(transport_credential(pin, port)).await;
+        let capability = capability_from(&handle);
+        let cookie = Some(format!("{TEST_CAP_COOKIE_NAME}={capability}"));
+        let host = Some(loopback_host(handle.port()));
+
+        let response =
+            raw_bridge_request(handle.port(), "GET", "/healthz", host, cookie, &[], b"").await;
+        assert_eq!(response_status(&response), 502, "{expected:?}");
+        let status = handle.status();
+        assert_eq!(status.last_failure, expected);
+        let (refusals, terminal) = match expected {
+            Some(journal_bridge::JournalBridgeFailure::TlsAccessDenied) => (
+                0,
+                Some(journal_bridge::JournalBridgeTerminalReason::TlsAccessDenied),
+            ),
+            Some(journal_bridge::JournalBridgeFailure::TlsRefused) => (1, None),
+            _ => (0, None),
+        };
+        assert_eq!(status.refusals, refusals, "{expected:?}");
+        assert_eq!(status.terminal_reason, terminal, "{expected:?}");
+        handle.shutdown_and_wait().await;
+        server.abort();
+    }
+}
+
+// Protocol: `.proto-ref/session.md` § 7. Every endpoint and the relay reach the same journal, so a
+// refusal over the direct path is the answer. Falsified by trying another endpoint or the relay
+// after a direct refusal: their own failure is returned, so the refusal never counts.
+#[tokio::test]
+#[expect(
+    clippy::large_futures,
+    reason = "the copied transport future keeps its established stack layout; this site goes red if a later refactor shrinks it"
+)]
+async fn transport_client_request_returns_a_direct_refusal_without_trying_the_relay() {
+    let (cert, key) = self_signed();
+    let pin = spl_core::ca::sha256(cert.as_ref())[..16].to_vec();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let server = tokio::spawn(async move {
+        let acceptor = TlsAcceptor::from(Arc::new(refusing_server_config(
+            cert,
+            key,
+            CertificateError::UnknownIssuer,
+        )));
+        loop {
+            let (stream, _) = listener.accept().await.unwrap();
+            let _ = acceptor.accept(stream).await;
+        }
+    });
+    let relay = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let relay_origin = format!("http://{}", relay.local_addr().unwrap());
+    let relay_dials = Arc::new(AtomicUsize::new(0));
+    let counted = relay_dials.clone();
+    let relay_task = tokio::spawn(async move {
+        loop {
+            let (stream, _) = relay.accept().await.unwrap();
+            counted.fetch_add(1, Ordering::SeqCst);
+            drop(stream);
+        }
+    });
+    let second = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let second_port = second.local_addr().unwrap().port();
+    let second_dials = Arc::new(AtomicUsize::new(0));
+    let second_counted = second_dials.clone();
+    let second_task = tokio::spawn(async move {
+        loop {
+            let (stream, _) = second.accept().await.unwrap();
+            second_counted.fetch_add(1, Ordering::SeqCst);
+            drop(stream);
+        }
+    });
+    let mut credential = transport_credential(pin, port);
+    credential.endpoints.push(EndpointAddr {
+        host: "127.0.0.1".into(),
+        port: second_port,
+    });
+    credential.relay_origin = Some(relay_origin);
+    credential.device_token = Some("relay-token".into());
+    let client = TransportClient::new(credential, None).unwrap();
+
+    for (replay, replay_unsafe) in [
+        (spl_transport::ReplayPolicy::ForbidAfterWrite, true),
+        (spl_transport::ReplayPolicy::ReplaySafe, false),
+    ] {
+        let options = spl_transport::RequestOptions {
+            replay,
+            ..spl_transport::RequestOptions::default()
+        };
+        let err = client
+            .request("GET", "/healthz", &[], b"", options)
+            .await
+            .unwrap_err();
+        // The refusal proves nothing about whether the request was read, so a request that must
+        // not be replayed says so.
+        assert!(
+            match &err {
+                spl_transport::RequestError::ReplayUnsafe(TransportError::TlsRefused) => {
+                    replay_unsafe
+                }
+                spl_transport::RequestError::Transport(TransportError::TlsRefused) => {
+                    !replay_unsafe
+                }
+                _ => false,
+            },
+            "{replay:?}: {err:?}"
+        );
+    }
+    assert_eq!(second_dials.load(Ordering::SeqCst), 0);
+    assert_eq!(relay_dials.load(Ordering::SeqCst), 0);
+    server.abort();
+    second_task.abort();
+    relay_task.abort();
+}
+
+// A peer at the saved address that is not the paired journal is neither a refusal nor a stop.
+// Falsified by classifying an unknown journal as a refusal: the count advances.
+#[tokio::test]
+async fn journal_bridge_records_an_unknown_journal_without_counting_it() {
+    let (paired, _) = self_signed();
+    let pin = spl_core::ca::sha256(paired.as_ref())[..16].to_vec();
+    let (cert, key) = self_signed();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let server = tokio::spawn(async move {
+        let acceptor = TlsAcceptor::from(Arc::new(server_config(cert, key)));
+        loop {
+            let (stream, _) = listener.accept().await.unwrap();
+            let _ = acceptor.accept(stream).await;
+        }
+    });
+    let handle = start_bridge(transport_credential(pin, port)).await;
+    let capability = capability_from(&handle);
+    let cookie = Some(format!("{TEST_CAP_COOKIE_NAME}={capability}"));
+    let host = Some(loopback_host(handle.port()));
+
+    let response =
+        raw_bridge_request(handle.port(), "GET", "/healthz", host, cookie, &[], b"").await;
+    assert_eq!(response_status(&response), 502);
+    let status = handle.status();
+    assert_eq!(
+        status.last_failure,
+        Some(journal_bridge::JournalBridgeFailure::UnknownJournal)
+    );
+    assert_eq!(status.refusals, 0);
+    assert_eq!(status.terminal_reason, None);
+    handle.shutdown_and_wait().await;
+    server.abort();
+}
+
+// Falsified by leaving post-dial request errors as plain I/O: a consumer that makes its own
+// requests cannot tell a refusal from an outage.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[expect(
+    clippy::large_futures,
+    reason = "the copied transport future keeps its established stack layout; this site goes red if a later refactor shrinks it"
+)]
+async fn transport_client_request_names_real_post_handshake_refusals() {
+    // A journal that refuses resets the connection, so an upload's write can fail before the
+    // refusal is read. Falsified by dropping the verdict read: the bodies report plain I/O.
+    for (error, expected, matches_expected) in refusal_classes()
+        .into_iter()
+        .flat_map(|class| [0, 4 * 1024, 64 * 1024, 900 * 1024].map(|len| (class.clone(), len)))
+        .map(|((error, expected, matches_expected), len)| {
+            ((error, len), expected, matches_expected)
+        })
+    {
+        let (error, body_len) = error;
+        let (cert, key) = self_signed();
+        let pin = spl_core::ca::sha256(cert.as_ref())[..16].to_vec();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            let acceptor = TlsAcceptor::from(Arc::new(refusing_server_config(cert, key, error)));
+            let (stream, _) = listener.accept().await.unwrap();
+            let _ = acceptor.accept(stream).await;
+        });
+        let client = TransportClient::new(transport_credential(pin, port), None).unwrap();
+        let options = spl_transport::RequestOptions {
+            response_cap: 1024 * 1024,
+            replay: spl_transport::ReplayPolicy::ForbidAfterWrite,
+            observer: None,
+        };
+
+        let body = vec![0x5a; body_len];
+        let method = if body.is_empty() { "GET" } else { "POST" };
+        let err = client
+            .request(method, "/healthz", &[], &body, options)
+            .await
+            .unwrap_err();
+        // Access denied and certificate unknown come before the journal reads anything, so they
+        // are never a replay hazard. Any other refusal keeps the replay guarantee once written.
+        let transport = match (&err, expected) {
+            (
+                spl_transport::RequestError::ReplayUnsafe(error),
+                Some(journal_bridge::JournalBridgeFailure::TlsRefused),
+            )
+            | (
+                spl_transport::RequestError::Transport(error),
+                Some(
+                    journal_bridge::JournalBridgeFailure::TlsAccessDenied
+                    | journal_bridge::JournalBridgeFailure::TlsCertificateUnknown,
+                ),
+            ) => Some(error),
+            _ => None,
+        };
+        assert!(
+            transport.is_some_and(matches_expected),
+            "{expected:?} with a {body_len}-byte body: {err:?}"
+        );
+        server.await.unwrap();
+    }
 }
 
 async fn partial_body_bridge_request(
@@ -2383,6 +2756,244 @@ async fn journal_bridge_selected_streaming_head_preserves_length_without_body() 
     server.abort();
 }
 
+fn media_stream_policy() -> BridgePolicy {
+    BridgePolicy {
+        capability_gate: CapabilityGate::Disabled,
+        stream_response: Arc::new(|head| head.path() == "/media/clip"),
+        ..BridgePolicy::default()
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+enum StreamEnding {
+    Close,
+    Reset,
+}
+
+async fn streamed_media_response(
+    headers: &[(&str, &str)],
+    chunks: &[&[u8]],
+    ending: StreamEnding,
+) -> Vec<u8> {
+    let (handle, mut server) =
+        start_bridge_with_persistent_server_policy(media_stream_policy()).await;
+    let port = handle.port();
+    let client = tokio::spawn(raw_bridge_request(
+        port,
+        "GET",
+        "/media/clip",
+        Some(loopback_host(port)),
+        None,
+        &[],
+        b"",
+    ));
+    let request = server.next_request().await;
+    server.send_stream_head(request.stream_id, "200 OK", headers);
+    for chunk in chunks {
+        server.send_body(request.stream_id, chunk);
+    }
+    match ending {
+        StreamEnding::Close => server.close_stream(request.stream_id),
+        StreamEnding::Reset => server.reset_stream(request.stream_id),
+    }
+    let response = tokio::time::timeout(std::time::Duration::from_secs(5), client)
+        .await
+        .expect("streamed response did not end")
+        .unwrap();
+    handle.shutdown_and_wait().await;
+    server.abort();
+    response
+}
+
+fn declared_length(head: &str) -> Vec<usize> {
+    head.lines()
+        .filter_map(|line| line.strip_prefix("content-length:"))
+        .map(|value| value.trim().parse().unwrap())
+        .collect()
+}
+
+// Falsified by restoring the HEAD-only length: the complete body arrives with no length, so a
+// short one could not be told apart from it.
+#[tokio::test]
+async fn journal_bridge_finite_stream_declares_the_upstream_length_once() {
+    let response = streamed_media_response(
+        &[("Content-Type", "audio/mp4"), ("Content-Length", "11")],
+        &[b"hello ", b"world"],
+        StreamEnding::Close,
+    )
+    .await;
+
+    assert_eq!(response_status(&response), 200);
+    let head = response_head(&response);
+    assert_eq!(declared_length(&head), vec![11]);
+    assert!(!head.contains("transfer-encoding"));
+    assert_eq!(response_body(&response), "hello world");
+}
+
+// The defect: a truncated finite body reached the caller as a complete-looking response.
+// Falsified by restoring the HEAD-only length: no length is declared for either ending.
+#[tokio::test]
+async fn journal_bridge_truncated_finite_stream_is_short_of_its_declared_length() {
+    for ending in [StreamEnding::Close, StreamEnding::Reset] {
+        let response = streamed_media_response(
+            &[("Content-Type", "audio/mp4"), ("Content-Length", "64")],
+            &[b"partial"],
+            ending,
+        )
+        .await;
+
+        assert_eq!(response_status(&response), 200, "{ending:?}");
+        let head = response_head(&response);
+        assert_eq!(declared_length(&head), vec![64], "{ending:?}");
+        assert_eq!(response_body(&response), "partial", "{ending:?}");
+    }
+}
+
+// Falsified by writing every upstream chunk: the caller would receive more than was declared.
+#[tokio::test]
+async fn journal_bridge_finite_stream_never_writes_past_its_declared_length() {
+    let response = streamed_media_response(
+        &[("Content-Type", "audio/mp4"), ("Content-Length", "5")],
+        &[b"0123", b"456789"],
+        StreamEnding::Close,
+    )
+    .await;
+
+    let head = response_head(&response);
+    assert_eq!(declared_length(&head), vec![5]);
+    let body = response_body(&response);
+    assert!(body.len() < 5, "wrote {body:?} past a 5-byte declaration");
+    assert!("0123".starts_with(&body), "{body:?}");
+}
+
+// Falsified by writing the final declared byte before the journal ends the stream: a body that
+// overflows exactly at its declared length reaches the caller looking complete.
+#[tokio::test]
+async fn journal_bridge_finite_stream_overflowing_at_its_length_still_ends_short() {
+    let response = streamed_media_response(
+        &[("Content-Type", "audio/mp4"), ("Content-Length", "5")],
+        &[b"01234", b"5"],
+        StreamEnding::Close,
+    )
+    .await;
+
+    assert_eq!(declared_length(&response_head(&response)), vec![5]);
+    let body = response_body(&response);
+    assert!(body.len() < 5, "{body:?} looks complete");
+    assert!("0123".starts_with(&body), "{body:?}");
+}
+
+// Falsified by writing the held final byte when the stream fails: a body that ends abnormally
+// after its last declared byte reaches the caller looking complete.
+#[tokio::test]
+async fn journal_bridge_finite_stream_reset_after_its_length_still_ends_short() {
+    let response = streamed_media_response(
+        &[("Content-Type", "audio/mp4"), ("Content-Length", "5")],
+        &[b"01234"],
+        StreamEnding::Reset,
+    )
+    .await;
+
+    assert_eq!(declared_length(&response_head(&response)), vec![5]);
+    let body = response_body(&response);
+    assert!(body.len() < 5, "{body:?} looks complete");
+    assert!("0123".starts_with(&body), "{body:?}");
+}
+
+// Falsified by writing an empty body's head before the stream ends: a body that arrives anyway
+// cannot be refused, and the caller reads a complete empty response.
+#[tokio::test]
+async fn journal_bridge_empty_declared_stream_with_a_body_is_a_local_502() {
+    let response = streamed_media_response(
+        &[("Content-Type", "audio/mp4"), ("Content-Length", "0")],
+        &[b"unexpected"],
+        StreamEnding::Close,
+    )
+    .await;
+    assert_eq!(response_status(&response), 502);
+    assert_eq!(response_body(&response), "journal unreachable");
+
+    let response = streamed_media_response(
+        &[("Content-Type", "audio/mp4"), ("Content-Length", "0")],
+        &[],
+        StreamEnding::Close,
+    )
+    .await;
+    assert_eq!(response_status(&response), 200);
+    assert_eq!(declared_length(&response_head(&response)), vec![0]);
+    assert_eq!(response_body(&response), "");
+}
+
+// Falsified by forwarding a length beside a transfer coding: the de-chunked body would not match it.
+#[tokio::test]
+async fn journal_bridge_chunked_stream_declares_no_length() {
+    let response = streamed_media_response(
+        &[
+            ("Content-Type", "application/octet-stream"),
+            ("Transfer-Encoding", "chunked"),
+            ("Content-Length", "64"),
+        ],
+        &[b"5\r\nhello\r\n0\r\n\r\n"],
+        StreamEnding::Close,
+    )
+    .await;
+
+    assert_eq!(response_status(&response), 200);
+    let head = response_head(&response);
+    assert!(declared_length(&head).is_empty(), "{head}");
+    assert!(!head.contains("transfer-encoding"), "{head}");
+    assert_eq!(response_body(&response), "hello");
+}
+
+#[tokio::test]
+async fn journal_bridge_stream_without_a_declared_length_stays_close_delimited() {
+    let response = streamed_media_response(
+        &[("Content-Type", "application/octet-stream")],
+        &[b"first ", b"second"],
+        StreamEnding::Close,
+    )
+    .await;
+
+    let head = response_head(&response);
+    assert!(declared_length(&head).is_empty());
+    assert!(head.contains("connection: close"));
+    assert_eq!(response_body(&response), "first second");
+}
+
+#[tokio::test]
+async fn journal_bridge_bodiless_stream_status_declares_no_length() {
+    for status in ["304 Not Modified", "204 No Content"] {
+        let (handle, mut server) =
+            start_bridge_with_persistent_server_policy(media_stream_policy()).await;
+        let port = handle.port();
+        let client = tokio::spawn(raw_bridge_request(
+            port,
+            "GET",
+            "/media/clip",
+            Some(loopback_host(port)),
+            None,
+            &[("If-None-Match", "\"clip\"")],
+            b"",
+        ));
+        let request = server.next_request().await;
+        server.send_stream_head(
+            request.stream_id,
+            status,
+            &[("ETag", "\"clip\""), ("Content-Length", "64")],
+        );
+        server.close_stream(request.stream_id);
+        let response = client.await.unwrap();
+        let code: u16 = status.split_whitespace().next().unwrap().parse().unwrap();
+        assert_eq!(response_status(&response), code);
+        assert!(
+            declared_length(&response_head(&response)).is_empty(),
+            "{status}"
+        );
+        handle.shutdown_and_wait().await;
+        server.abort();
+    }
+}
+
 #[tokio::test]
 async fn journal_bridge_sse_fail_before_head_returns_502() {
     let (handle, upstream) = start_bridge_with_sse(SseMode::EofBeforeHead).await;
@@ -3733,98 +4344,292 @@ async fn transport_client_request_replay_unsafe_after_partial_write() {
     server.await.unwrap();
 }
 
-#[tokio::test]
-#[expect(
-    clippy::large_futures,
-    reason = "the copied transport future keeps its established stack layout; this site goes red if a later refactor shrinks it"
-)]
-async fn transport_client_request_terminal_tls_alert_access_denied_returns_immediately() {
-    let (cert, _) = self_signed();
-    let pin = spl_core::ca::sha256(cert.as_ref())[..16].to_vec();
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let port = listener.local_addr().unwrap().port();
-
-    let server = tokio::spawn(async move {
-        let (mut stream, _) = listener.accept().await.unwrap();
-        let mut header = [0u8; 5];
-        stream.read_exact(&mut header).await.unwrap();
-        let mut hello = vec![0u8; u16::from_be_bytes([header[3], header[4]]) as usize];
-        stream.read_exact(&mut hello).await.unwrap();
-        stream
-            .write_all(&[0x15, 0x03, 0x03, 0x00, 0x02, 0x02, 49])
-            .await
-            .unwrap();
-        stream.flush().await.unwrap();
-    });
-
-    let obs = spl_transport::OperationObserver::new();
-    let cred = transport_credential(pin, port);
-    let client = TransportClient::new(cred, None).unwrap();
-    let options = spl_transport::RequestOptions {
-        response_cap: 1024 * 1024,
-        replay: spl_transport::ReplayPolicy::ForbidAfterWrite,
-        observer: Some(&obs),
-    };
-
-    let err = client
-        .request("GET", "/healthz", &[], b"", options)
-        .await
-        .unwrap_err();
-
-    assert!(matches!(
-        err,
-        spl_transport::RequestError::Transport(TransportError::TlsAccessDenied)
-    ));
-    assert_eq!(obs.dial_attempts(), 1);
-
-    server.await.unwrap();
+/// The journal ID a client reports for a peer presenting `cert`.
+fn jid_of(cert: &CertificateDer<'_>) -> String {
+    spl_core::relay_window::jid_from_spki(&spl_core::ca::extract_spki_der(cert.as_ref()).unwrap())
+        .unwrap()
 }
 
+/// A TLS server whose certificate does not match the pin in the credential, accepting every
+/// connection until aborted. Returns its port and journal ID.
+async fn impostor_listener() -> (u16, String, tokio::task::JoinHandle<()>) {
+    let (cert, key) = self_signed();
+    let jid = jid_of(&cert);
+    let acceptor = TlsAcceptor::from(Arc::new(server_config(cert, key)));
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let task = tokio::spawn(async move {
+        loop {
+            let (stream, _) = listener.accept().await.unwrap();
+            let _ = acceptor.accept(stream).await;
+        }
+    });
+    (port, jid, task)
+}
+
+// A peer at a saved address that is not the paired journal is named, with where it answered and
+// which journal it claims to be. Falsified by keeping only the last endpoint's error on the
+// request path (the closed second endpoint hides the sighting and the request reports an
+// outage), or by dropping the peer's address or journal ID.
 #[tokio::test]
 #[expect(
     clippy::large_futures,
     reason = "the copied transport future keeps its established stack layout; this site goes red if a later refactor shrinks it"
 )]
-async fn transport_client_request_terminal_tls_alert_cert_unknown_returns_immediately() {
-    let (cert, _) = self_signed();
-    let pin = spl_core::ca::sha256(cert.as_ref())[..16].to_vec();
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let port = listener.local_addr().unwrap().port();
-
-    let server = tokio::spawn(async move {
-        let (mut stream, _) = listener.accept().await.unwrap();
-        let mut header = [0u8; 5];
-        stream.read_exact(&mut header).await.unwrap();
-        let mut hello = vec![0u8; u16::from_be_bytes([header[3], header[4]]) as usize];
-        stream.read_exact(&mut hello).await.unwrap();
-        stream
-            .write_all(&[0x15, 0x03, 0x03, 0x00, 0x02, 0x02, 46])
-            .await
-            .unwrap();
-        stream.flush().await.unwrap();
+async fn transport_client_request_does_not_let_a_closed_endpoint_hide_an_unknown_journal() {
+    let (pinned, _) = self_signed();
+    let pin = spl_core::ca::sha256(pinned.as_ref())[..16].to_vec();
+    let (impostor_port, impostor_jid, impostor) = impostor_listener().await;
+    let closed = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let closed_port = closed.local_addr().unwrap().port();
+    drop(closed);
+    let mut credential = transport_credential(pin, impostor_port);
+    credential.endpoints.push(EndpointAddr {
+        host: "127.0.0.1".into(),
+        port: closed_port,
     });
-
-    let obs = spl_transport::OperationObserver::new();
-    let cred = transport_credential(pin, port);
-    let client = TransportClient::new(cred, None).unwrap();
-    let options = spl_transport::RequestOptions {
-        response_cap: 1024 * 1024,
-        replay: spl_transport::ReplayPolicy::ForbidAfterWrite,
-        observer: Some(&obs),
+    let client = TransportClient::new(credential, None).unwrap();
+    let expected = spl_transport::UnknownJournal {
+        address: Some(format!("127.0.0.1:{impostor_port}")),
+        jid: Some(impostor_jid),
     };
 
     let err = client
-        .request("GET", "/healthz", &[], b"", options)
+        .request(
+            "GET",
+            "/healthz",
+            &[],
+            b"",
+            spl_transport::RequestOptions::default(),
+        )
         .await
         .unwrap_err();
+    let reported = match &err {
+        spl_transport::RequestError::Transport(TransportError::UnknownJournal(unknown)) => {
+            Some(unknown.clone())
+        }
+        _ => None,
+    };
+    assert_eq!(reported, Some(expected.clone()), "{err:?}");
+    assert_eq!(client.unknown_journals(), vec![expected]);
+    impostor.abort();
+}
 
-    assert!(matches!(
-        err,
-        spl_transport::RequestError::Transport(TransportError::TlsCertificateUnknown)
-    ));
-    assert_eq!(obs.dial_attempts(), 1);
+/// A TLS listener at one fixed address whose certificate can be swapped between connections.
+async fn swappable_listener(
+    config: ServerConfig,
+) -> (
+    u16,
+    Arc<Mutex<Arc<ServerConfig>>>,
+    tokio::task::JoinHandle<()>,
+) {
+    let current = Arc::new(Mutex::new(Arc::new(config)));
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let serving = current.clone();
+    let task = tokio::spawn(async move {
+        loop {
+            let (stream, _) = listener.accept().await.unwrap();
+            let config = serving.lock().unwrap().clone();
+            let _ = TlsAcceptor::from(config).accept(stream).await;
+        }
+    });
+    (port, current, task)
+}
 
-    server.await.unwrap();
+// The owner stays told while another address works, and the sighting clears once that address
+// holds the paired journal again. Falsified by keeping one sighting for the whole client (the
+// working second address clears it on every dial) or by never clearing it.
+#[tokio::test]
+#[expect(
+    clippy::large_futures,
+    reason = "the copied transport future keeps its established stack layout; this site goes red if a later refactor shrinks it"
+)]
+async fn an_unknown_journal_is_kept_per_address_until_that_address_reaches_the_journal() {
+    let (cert, key) = self_signed();
+    let pin = spl_core::ca::sha256(cert.as_ref())[..16].to_vec();
+    let (other_cert, other_key) = self_signed();
+    let other_jid = jid_of(&other_cert);
+    let (swap_port, swap, swap_task) =
+        swappable_listener(server_config(other_cert, other_key)).await;
+    let (journal_port, journal_task) = {
+        let acceptor = TlsAcceptor::from(Arc::new(server_config(cert.clone(), key.clone_key())));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let task = tokio::spawn(async move {
+            loop {
+                let (stream, _) = listener.accept().await.unwrap();
+                let _ = acceptor.accept(stream).await;
+            }
+        });
+        (port, task)
+    };
+    let mut credential = transport_credential(pin, swap_port);
+    credential.endpoints.push(EndpointAddr {
+        host: "127.0.0.1".into(),
+        port: journal_port,
+    });
+    let client = TransportClient::new(credential, None).unwrap();
+    let sighting = spl_transport::UnknownJournal {
+        address: Some(format!("127.0.0.1:{swap_port}")),
+        jid: Some(other_jid),
+    };
+
+    for _ in 0..2 {
+        drop(
+            client
+                .dial_carrier()
+                .await
+                .expect("the second address holds the journal"),
+        );
+        assert_eq!(client.unknown_journals(), vec![sighting.clone()]);
+    }
+
+    *swap.lock().unwrap() = Arc::new(server_config(cert, key));
+    drop(
+        client
+            .dial_carrier()
+            .await
+            .expect("the first address holds the journal again"),
+    );
+    assert_eq!(client.unknown_journals(), Vec::new());
+
+    swap_task.abort();
+    journal_task.abort();
+}
+
+// Falsified by letting an unknown journal outrank the real journal's answer on another endpoint,
+// in either order: the answer is hidden and the request is replayed.
+#[tokio::test]
+#[expect(
+    clippy::large_futures,
+    reason = "the copied transport future keeps its established stack layout; this site goes red if a later refactor shrinks it"
+)]
+async fn transport_client_request_keeps_the_real_journals_answer_over_an_unknown_journal() {
+    for journal_first in [false, true] {
+        let (cert, key) = self_signed();
+        let pin = spl_core::ca::sha256(cert.as_ref())[..16].to_vec();
+        let (impostor_port, _, impostor) = impostor_listener().await;
+        let journal = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let journal_port = journal.local_addr().unwrap().port();
+        let handled = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let journal_handled = handled.clone();
+        let journal_task = tokio::spawn(async move {
+            let acceptor = TlsAcceptor::from(Arc::new(server_config(cert, key)));
+            loop {
+                let (stream, _) = journal.accept().await.unwrap();
+                let Ok(mut tls) = acceptor.accept(stream).await else {
+                    continue;
+                };
+                journal_handled.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let mut buf = [0u8; 4096];
+                let _ = tls.read(&mut buf).await;
+                // Not a valid frame: the journal answered, and its answer is a protocol error.
+                let _ = tls.write_all(&[0xff; 32]).await;
+                let _ = tls.flush().await;
+            }
+        });
+        let journal_endpoint = EndpointAddr {
+            host: "127.0.0.1".into(),
+            port: journal_port,
+        };
+        let impostor_endpoint = EndpointAddr {
+            host: "127.0.0.1".into(),
+            port: impostor_port,
+        };
+        let mut credential = transport_credential(pin, impostor_port);
+        credential.endpoints = if journal_first {
+            vec![journal_endpoint, impostor_endpoint]
+        } else {
+            vec![impostor_endpoint, journal_endpoint]
+        };
+        let client = TransportClient::new(credential, None).unwrap();
+        let options = spl_transport::RequestOptions {
+            replay: spl_transport::ReplayPolicy::ReplaySafe,
+            ..spl_transport::RequestOptions::default()
+        };
+
+        let err = client
+            .request("GET", "/healthz", &[], b"", options)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                spl_transport::RequestError::Transport(TransportError::Mux(_))
+            ),
+            "journal first: {journal_first}: {err:?}"
+        );
+        assert_eq!(
+            client.unknown_journals().len(),
+            1,
+            "journal first: {journal_first}"
+        );
+        assert_eq!(
+            handled.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "journal first: {journal_first}"
+        );
+        impostor.abort();
+        journal_task.abort();
+    }
+}
+
+// A TLS 1.3 journal's verdict on the client certificate arrives after the dial, so an alert read
+// during the dial is not trusted. Falsified by classifying dial-time alerts: the request stops on
+// the first attempt with a terminal refusal.
+#[tokio::test]
+#[expect(
+    clippy::large_futures,
+    reason = "the copied transport future keeps its established stack layout; this site goes red if a later refactor shrinks it"
+)]
+async fn transport_client_request_dial_time_alert_is_not_a_verdict() {
+    for description in [49, 46] {
+        let (cert, _) = self_signed();
+        let pin = spl_core::ca::sha256(cert.as_ref())[..16].to_vec();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut header = [0u8; 5];
+            stream.read_exact(&mut header).await.unwrap();
+            let mut hello = vec![0u8; u16::from_be_bytes([header[3], header[4]]) as usize];
+            stream.read_exact(&mut hello).await.unwrap();
+            stream
+                .write_all(&[0x15, 0x03, 0x03, 0x00, 0x02, 0x02, description])
+                .await
+                .unwrap();
+            stream.flush().await.unwrap();
+        });
+
+        let obs = spl_transport::OperationObserver::new();
+        let cred = transport_credential(pin, port);
+        let client = TransportClient::new(cred, None).unwrap();
+        let options = spl_transport::RequestOptions {
+            response_cap: 1024 * 1024,
+            replay: spl_transport::ReplayPolicy::ForbidAfterWrite,
+            observer: Some(&obs),
+        };
+
+        let err = client
+            .request("GET", "/healthz", &[], b"", options)
+            .await
+            .unwrap_err();
+
+        assert!(
+            !matches!(
+                err,
+                spl_transport::RequestError::Transport(
+                    TransportError::TlsAccessDenied | TransportError::TlsCertificateUnknown
+                )
+            ),
+            "alert {description}: {err:?}"
+        );
+        assert!(obs.dial_attempts() > 1, "alert {description}");
+
+        server.await.unwrap();
+    }
 }
 
 #[tokio::test]

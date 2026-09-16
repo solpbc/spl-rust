@@ -14,7 +14,9 @@ use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, Server
 use rustls::crypto::{CryptoProvider, verify_tls12_signature, verify_tls13_signature};
 use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName, UnixTime};
-use rustls::{ClientConfig, DigitallySignedStruct, Error as RustlsError, SignatureScheme};
+use rustls::{
+    CertificateError, ClientConfig, DigitallySignedStruct, Error as RustlsError, SignatureScheme,
+};
 
 use crate::TransportError;
 
@@ -35,6 +37,56 @@ struct TrustAllPairingVerifier {
     provider: Arc<CryptoProvider>,
 }
 
+/// A peer that is not the paired journal, carried out of the rustls verifier.
+#[derive(Debug)]
+pub(crate) struct JournalIdentityMismatch {
+    /// The journal ID of the self-signed P-256 certificate the peer presented,
+    /// as a journal's CA is. `None` when it presented none, or presented the
+    /// paired journal's CA without a certificate that CA signed.
+    pub(crate) jid: Option<String>,
+}
+
+impl std::fmt::Display for JournalIdentityMismatch {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("peer is not the paired journal")
+    }
+}
+
+impl std::error::Error for JournalIdentityMismatch {}
+
+/// The paired journal's own certificate, rejected for its dates or usage.
+#[derive(Debug)]
+struct PairedJournalCertificateRejected;
+
+impl std::fmt::Display for PairedJournalCertificateRejected {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .write_str("the paired journal's certificate is not valid at this time or for this use")
+    }
+}
+
+impl std::error::Error for PairedJournalCertificateRejected {}
+
+fn identity_mismatch(jid: Option<String>) -> RustlsError {
+    RustlsError::InvalidCertificate(CertificateError::Other(rustls::OtherError(Arc::new(
+        JournalIdentityMismatch { jid },
+    ))))
+}
+
+/// The journal ID of the self-signed CA a peer presented, preferring the
+/// chain's root.
+fn responding_jid(
+    end_entity: &CertificateDer<'_>,
+    intermediates: &[CertificateDer<'_>],
+) -> Option<String> {
+    std::iter::once(end_entity)
+        .chain(intermediates.iter())
+        .rev()
+        .find(|cert| crate::spki_pin::verify_ca_self_signed(cert).is_ok())
+        .and_then(|ca| spl_core::ca::extract_spki_der(ca.as_ref()).ok())
+        .and_then(|spki| spl_core::relay_window::jid_from_spki(&spki).ok())
+}
+
 impl ServerCertVerifier for CaFpPinVerifier {
     fn verify_server_cert(
         &self,
@@ -47,12 +99,20 @@ impl ServerCertVerifier for CaFpPinVerifier {
         let pinned_ca = std::iter::once(end_entity)
             .chain(intermediates.iter())
             .find(|cert| spl_core::ca::cert_matches_prefix(cert.as_ref(), &self.prefix))
-            .ok_or_else(|| RustlsError::General("journal CA fingerprint pin mismatch".into()))?;
-        crate::spki_pin::verify_ca_self_signed(pinned_ca)
-            .and_then(|()| crate::spki_pin::verify_live_peer_binding(end_entity, pinned_ca))
-            .map_err(|_| {
-                RustlsError::General("journal certificate not signed by pinned CA".into())
-            })?;
+            .ok_or_else(|| identity_mismatch(responding_jid(end_entity, intermediates)))?;
+        if crate::spki_pin::verify_ca_self_signed(pinned_ca).is_err()
+            || !crate::spki_pin::signed_by(end_entity, pinned_ca)
+        {
+            // The paired journal's CA, presented without a certificate it signed.
+            return Err(identity_mismatch(None));
+        }
+        // The paired journal's own certificate. Any remaining defect, such as its dates
+        // against a skewed clock, is a failure to connect, not a different journal.
+        crate::spki_pin::verify_live_peer_binding(end_entity, pinned_ca).map_err(|_| {
+            RustlsError::InvalidCertificate(CertificateError::Other(rustls::OtherError(Arc::new(
+                PairedJournalCertificateRejected,
+            ))))
+        })?;
         Ok(ServerCertVerified::assertion())
     }
 
@@ -203,13 +263,17 @@ pub fn mtls_config(
         prefix: ca_fp_prefix.to_vec(),
         provider: provider.clone(),
     });
-    let config = ClientConfig::builder_with_provider(provider)
+    let mut config = ClientConfig::builder_with_provider(provider)
         .with_protocol_versions(&[&rustls::version::TLS13])
         .map_err(|e| TransportError::Tls(e.to_string()))?
         .dangerous()
         .with_custom_certificate_verifier(verifier)
         .with_client_auth_cert(client_cert_chain, client_key)
         .map_err(|e| TransportError::Tls(e.to_string()))?;
+    // A resumed session skips the journal's check of this device's certificate,
+    // so a journal could neither refuse an unpaired device nor say why. Every
+    // session is a full handshake.
+    config.resumption = rustls::client::Resumption::disabled();
     Ok(config)
 }
 

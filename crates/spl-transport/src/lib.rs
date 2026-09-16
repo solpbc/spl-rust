@@ -81,6 +81,7 @@
 pub mod client;
 pub mod connection;
 pub mod credential;
+pub mod handshake;
 pub mod home_relay;
 pub mod journal_bridge;
 mod journal_bridge_carrier;
@@ -205,6 +206,26 @@ impl fmt::Display for RelayControlEndpoint {
     }
 }
 
+/// A peer that answered where the paired journal was expected, but is not it.
+///
+/// Seen while dialing, before any request: the peer presented a certificate
+/// that does not chain to the paired journal's CA. A journal whose CA changed
+/// has a new journal ID, so this is how both "a different journal holds this
+/// address" and "this journal was reset" look to a client.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnknownJournal {
+    /// The direct endpoint (`host:port`) that answered, or `None` when the
+    /// peer answered through the relay.
+    pub address: Option<String>,
+    /// The journal ID the peer presented: the ID of the self-signed P-256
+    /// certificate in its chain, as a journal's CA is. This is what the peer
+    /// claims, not a proven identity, because any peer can present another
+    /// journal's public CA certificate. Show it to the owner; never decide
+    /// anything on it. `None` when the peer presented no such certificate, or
+    /// presented the paired journal's CA without a certificate that CA signed.
+    pub jid: Option<String>,
+}
+
 /// Errors from SPL connection, TLS, relay, pairing, and HTTP transport.
 #[derive(Debug, Error)]
 pub enum TransportError {
@@ -220,6 +241,13 @@ pub enum TransportError {
     /// The peer rejected the TLS session with certificate unknown.
     #[error("tls certificate unknown")]
     TlsCertificateUnknown,
+    /// The journal refused the TLS session with an alert other than access
+    /// denied or certificate unknown.
+    #[error("tls refused")]
+    TlsRefused,
+    /// A peer that is not the paired journal answered while dialing.
+    #[error("unknown journal")]
+    UnknownJournal(UnknownJournal),
     /// Cryptographic material or verification failed.
     #[error("crypto error: {0}")]
     Crypto(String),
@@ -270,8 +298,75 @@ pub enum TransportError {
     LocalOffset,
 }
 
-/// Classify a received TLS alert the client must name, without retaining peer-controlled detail.
-pub(crate) fn received_tls_alert(error: &io::Error) -> Option<TransportError> {
+/// A direct endpoint as `host:port`, bracketing an IPv6 host.
+pub(crate) fn endpoint_address(host: &str, port: u16) -> String {
+    if host.contains(':') && !host.starts_with('[') {
+        format!("[{host}]:{port}")
+    } else {
+        format!("{host}:{port}")
+    }
+}
+
+/// Classify a TLS failure seen while dialing, without retaining peer-controlled detail.
+///
+/// A TLS 1.3 journal checks the client certificate only after the client's side
+/// of the handshake is complete, so its verdict never arrives while dialing. A
+/// received alert at this point comes from a peer that has not authenticated
+/// and is not trusted. A peer whose certificate the pin check found is not the
+/// paired journal's is an [`TransportError::UnknownJournal`] at `address`
+/// (`None` through the relay). Any other certificate failure is left
+/// unclassified.
+pub(crate) fn classify_dial_refusal(
+    error: &io::Error,
+    address: Option<&str>,
+) -> Option<TransportError> {
+    let Some(RustlsError::InvalidCertificate(rustls::CertificateError::Other(other))) = error
+        .get_ref()
+        .and_then(|source| source.downcast_ref::<RustlsError>())
+    else {
+        return None;
+    };
+    let mismatch = other.0.downcast_ref::<tls::JournalIdentityMismatch>()?;
+    Some(TransportError::UnknownJournal(UnknownJournal {
+        address: address.map(str::to_owned),
+        jid: mismatch.jid.clone(),
+    }))
+}
+
+/// Keep the more informative of two failed direct-dial errors, so the order of
+/// a credential's endpoints cannot hide anything: a journal's own answer
+/// outranks its refusal, a refusal outranks a peer that is not the journal, and
+/// that outranks a failure to reach an endpoint at all. On a tie the later
+/// error wins.
+pub(crate) fn prefer_refusal(
+    previous: Option<TransportError>,
+    next: TransportError,
+) -> TransportError {
+    fn rank(error: &TransportError) -> u8 {
+        match error {
+            TransportError::Io(_) | TransportError::Tls(_) | TransportError::NoEndpoint => 0,
+            TransportError::UnknownJournal(_) => 1,
+            TransportError::TlsRefused => 2,
+            _ => 3,
+        }
+    }
+    match previous {
+        Some(previous) if rank(&previous) > rank(&next) => previous,
+        _ => next,
+    }
+}
+
+/// Classify a TLS refusal on an authenticated connection, without retaining
+/// peer-controlled detail.
+///
+/// Call this only once the handshake has completed and before the peer has
+/// sent any application data: that is when a journal's verdict on the client
+/// certificate arrives. Access denied (49) and certificate unknown (46) have
+/// their own variants. Any other received alert is a
+/// [`TransportError::TlsRefused`]. Everything else, including a plain socket
+/// error, a timeout, or a peer that does not speak TLS, is not a refusal and
+/// returns `None`.
+pub(crate) fn classify_tls_refusal(error: &io::Error) -> Option<TransportError> {
     match error
         .get_ref()
         .and_then(|source| source.downcast_ref::<RustlsError>())
@@ -282,6 +377,7 @@ pub(crate) fn received_tls_alert(error: &io::Error) -> Option<TransportError> {
         Some(RustlsError::AlertReceived(AlertDescription::CertificateUnknown)) => {
             Some(TransportError::TlsCertificateUnknown)
         }
+        Some(RustlsError::AlertReceived(_)) => Some(TransportError::TlsRefused),
         _ => None,
     }
 }
@@ -293,6 +389,8 @@ pub fn transport_error_code(error: &TransportError) -> String {
         TransportError::Tls(_) => "tls".to_string(),
         TransportError::TlsAccessDenied => "tls_access_denied".to_string(),
         TransportError::TlsCertificateUnknown => "tls_certificate_unknown".to_string(),
+        TransportError::TlsRefused => "tls_refused".to_string(),
+        TransportError::UnknownJournal(_) => "unknown_journal".to_string(),
         TransportError::Crypto(_) => "crypto".to_string(),
         TransportError::Mux(_) => "mux".to_string(),
         TransportError::Http(_) => "http".to_string(),
@@ -331,6 +429,15 @@ mod tests {
     use super::*;
 
     #[test]
+    fn unknown_journal_code_carries_neither_address_nor_journal_id() {
+        let code = transport_error_code(&TransportError::UnknownJournal(UnknownJournal {
+            address: Some("10.0.0.5:7657".into()),
+            jid: Some("jSECRET".into()),
+        }));
+        assert_eq!(code, "unknown_journal");
+    }
+
+    #[test]
     fn transport_error_code_maps_every_variant_without_inner_detail() {
         let json_error = serde_json::from_str::<serde_json::Value>("{").unwrap_err();
         let cases = [
@@ -344,6 +451,7 @@ mod tests {
                 TransportError::TlsCertificateUnknown,
                 "tls_certificate_unknown",
             ),
+            (TransportError::TlsRefused, "tls_refused"),
             (TransportError::Crypto("fingerprint abc".into()), "crypto"),
             (TransportError::Mux(MuxError::Incomplete), "mux"),
             (
@@ -437,26 +545,214 @@ mod tests {
         io::Error::new(io::ErrorKind::InvalidData, source)
     }
 
+    // Falsified by narrowing the refusal arm to recognized codes: 80 and an unassigned code
+    // then read as "not a refusal", which is the retry-forever defect session.md § 7 forbids.
     #[test]
-    fn received_tls_alert_maps_known_alerts_only() {
+    fn classify_tls_refusal_names_49_and_46_and_folds_every_other_refusal() {
         assert!(matches!(
-            received_tls_alert(&tls_io_error(RustlsError::AlertReceived(
+            classify_tls_refusal(&tls_io_error(RustlsError::AlertReceived(
                 AlertDescription::AccessDenied
             ))),
             Some(TransportError::TlsAccessDenied)
         ));
         assert!(matches!(
-            received_tls_alert(&tls_io_error(RustlsError::AlertReceived(
+            classify_tls_refusal(&tls_io_error(RustlsError::AlertReceived(
                 AlertDescription::CertificateUnknown
             ))),
             Some(TransportError::TlsCertificateUnknown)
         ));
+        for description in [
+            AlertDescription::InternalError,
+            AlertDescription::UnknownCA,
+            AlertDescription::BadCertificate,
+            AlertDescription::Unknown(200),
+        ] {
+            assert!(matches!(
+                classify_tls_refusal(&tls_io_error(RustlsError::AlertReceived(description))),
+                Some(TransportError::TlsRefused)
+            ));
+        }
+        // The journal's certificate was checked while dialing; it is not a refusal.
         assert!(
-            received_tls_alert(&tls_io_error(RustlsError::AlertReceived(
-                AlertDescription::InternalError
+            classify_tls_refusal(&tls_io_error(RustlsError::InvalidCertificate(
+                rustls::CertificateError::UnknownIssuer
             )))
             .is_none()
         );
-        assert!(received_tls_alert(&tls_io_error(RustlsError::DecryptError)).is_none());
+    }
+
+    // Falsified by keeping only the last endpoint's error: a refusal followed by an unreachable
+    // endpoint would be reported as unreachable and never counted.
+    #[test]
+    fn a_refusal_outranks_a_later_unreachable_endpoint() {
+        let unreachable = || TransportError::Io(io::Error::from(io::ErrorKind::ConnectionRefused));
+        assert!(matches!(
+            prefer_refusal(Some(TransportError::TlsRefused), unreachable()),
+            TransportError::TlsRefused
+        ));
+        assert!(matches!(
+            prefer_refusal(Some(unreachable()), TransportError::TlsRefused),
+            TransportError::TlsRefused
+        ));
+        assert!(matches!(
+            prefer_refusal(None, unreachable()),
+            TransportError::Io(_)
+        ));
+        assert!(matches!(
+            prefer_refusal(Some(TransportError::Tls("x".into())), unreachable()),
+            TransportError::Io(_)
+        ));
+        // What a journal that accepted the handshake said is never hidden by a refusal elsewhere,
+        // whichever endpoint came first.
+        assert!(matches!(
+            prefer_refusal(
+                Some(TransportError::TlsRefused),
+                TransportError::Mux(spl_core::mux::MuxError::Incomplete)
+            ),
+            TransportError::Mux(_)
+        ));
+        assert!(matches!(
+            prefer_refusal(
+                Some(TransportError::Mux(spl_core::mux::MuxError::Incomplete)),
+                TransportError::TlsRefused
+            ),
+            TransportError::Mux(_)
+        ));
+        assert!(matches!(
+            prefer_refusal(Some(TransportError::TlsRefused), TransportError::TlsRefused),
+            TransportError::TlsRefused
+        ));
+    }
+
+    // Falsified by ranking an unknown journal with unreachable endpoints: a stale address that
+    // now holds another journal would be reported as offline, and the owner never told.
+    #[test]
+    fn an_unknown_journal_outranks_unreachable_and_yields_to_a_refusal() {
+        let unreachable = || TransportError::Io(io::Error::from(io::ErrorKind::ConnectionRefused));
+        let unknown = || {
+            TransportError::UnknownJournal(UnknownJournal {
+                address: Some("10.0.0.5:7657".into()),
+                jid: None,
+            })
+        };
+        for (previous, next) in [
+            (Some(unknown()), unreachable()),
+            (Some(unreachable()), unknown()),
+        ] {
+            assert!(matches!(
+                prefer_refusal(previous, next),
+                TransportError::UnknownJournal(_)
+            ));
+        }
+        for (previous, next) in [
+            (Some(unknown()), TransportError::TlsRefused),
+            (Some(TransportError::TlsRefused), unknown()),
+        ] {
+            assert!(matches!(
+                prefer_refusal(previous, next),
+                TransportError::TlsRefused
+            ));
+        }
+    }
+
+    // Falsified by trusting a dial-time alert: an unauthenticated peer could unpair the device.
+    #[test]
+    fn classify_dial_refusal_trusts_only_the_certificate_check() {
+        for description in [
+            AlertDescription::AccessDenied,
+            AlertDescription::CertificateUnknown,
+            AlertDescription::InternalError,
+            AlertDescription::Unknown(200),
+        ] {
+            assert!(
+                classify_dial_refusal(
+                    &tls_io_error(RustlsError::AlertReceived(description)),
+                    Some("10.0.0.5:7657")
+                )
+                .is_none()
+            );
+        }
+        assert!(
+            classify_dial_refusal(
+                &io::Error::from(io::ErrorKind::ConnectionReset),
+                Some("10.0.0.5:7657")
+            )
+            .is_none()
+        );
+    }
+
+    // Falsified by dropping the identity the verifier carried, or the address: the owner could
+    // not be shown which peer answered or where.
+    #[test]
+    fn classify_dial_refusal_names_the_peer_that_is_not_the_journal() {
+        let mismatch = |jid: Option<&str>| {
+            tls_io_error(RustlsError::InvalidCertificate(
+                rustls::CertificateError::Other(rustls::OtherError(std::sync::Arc::new(
+                    tls::JournalIdentityMismatch {
+                        jid: jid.map(str::to_owned),
+                    },
+                ))),
+            ))
+        };
+        assert_eq!(
+            classify_dial_refusal(&mismatch(Some("jOTHER")), Some("10.0.0.5:7657")).map(|error| {
+                match error {
+                    TransportError::UnknownJournal(unknown) => Some(unknown),
+                    _ => None,
+                }
+            }),
+            Some(Some(UnknownJournal {
+                address: Some("10.0.0.5:7657".into()),
+                jid: Some("jOTHER".into()),
+            }))
+        );
+        assert!(matches!(
+            classify_dial_refusal(&mismatch(None), None),
+            Some(TransportError::UnknownJournal(UnknownJournal {
+                address: None,
+                jid: None
+            }))
+        ));
+        // A certificate failure the pin check did not attribute to another peer, such as the
+        // paired journal's own certificate outside its dates, is not an unknown journal.
+        for other in [
+            rustls::CertificateError::UnknownIssuer,
+            rustls::CertificateError::Expired,
+            rustls::CertificateError::Other(rustls::OtherError(std::sync::Arc::new(
+                io::Error::other("unrelated"),
+            ))),
+        ] {
+            assert!(
+                classify_dial_refusal(
+                    &tls_io_error(RustlsError::InvalidCertificate(other)),
+                    Some("10.0.0.5:7657")
+                )
+                .is_none()
+            );
+        }
+    }
+
+    #[test]
+    fn endpoint_address_brackets_only_a_bare_ipv6_host() {
+        assert_eq!(endpoint_address("10.0.0.5", 7657), "10.0.0.5:7657");
+        assert_eq!(
+            endpoint_address("journal.local", 7657),
+            "journal.local:7657"
+        );
+        assert_eq!(endpoint_address("fe80::1", 7657), "[fe80::1]:7657");
+        assert_eq!(endpoint_address("[fe80::1]", 7657), "[fe80::1]:7657");
+    }
+
+    #[test]
+    fn classify_tls_refusal_leaves_transport_failures_unclassified() {
+        assert!(classify_tls_refusal(&tls_io_error(RustlsError::DecryptError)).is_none());
+        assert!(
+            classify_tls_refusal(&tls_io_error(RustlsError::InvalidMessage(
+                rustls::InvalidMessage::InvalidContentType
+            )))
+            .is_none()
+        );
+        assert!(classify_tls_refusal(&io::Error::from(io::ErrorKind::UnexpectedEof)).is_none());
+        assert!(classify_tls_refusal(&io::Error::from(io::ErrorKind::ConnectionReset)).is_none());
     }
 }

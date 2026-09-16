@@ -28,7 +28,7 @@ use tokio::net::TcpStream;
 use tokio_rustls::{TlsConnector, client::TlsStream};
 
 use crate::tls::pinned_server_name;
-use crate::{TransportError, received_tls_alert};
+use crate::{TransportError, classify_dial_refusal, classify_tls_refusal};
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// Upper bound on the TLS handshake that follows a successful connect. A LAN or
@@ -53,6 +53,9 @@ const READ_BUF: usize = 64 * 1024;
 /// Send one HTTP request over a fresh PL connection and return the response.
 /// `headers` are the caller's extra headers (auth, content-type); framing-owned
 /// headers are added by [`http::build_request_head`].
+///
+/// A journal's refusal of this device is not named here (it reads as an I/O
+/// error); use [`crate::client::TransportClient::request`] for that.
 ///
 /// # Errors
 ///
@@ -120,9 +123,10 @@ where
             format!("tls handshake to {host}:{port} timed out"),
         ))),
         Ok(result) => result.map_err(|error| {
-            received_tls_alert(&error).unwrap_or_else(|| {
-                TransportError::Tls(format!("handshake to {host}:{port}: {error}"))
-            })
+            classify_dial_refusal(&error, Some(&crate::endpoint_address(host, port)))
+                .unwrap_or_else(|| {
+                    TransportError::Tls(format!("handshake to {host}:{port}: {error}"))
+                })
         }),
     }
 }
@@ -138,6 +142,8 @@ where
     S: AsyncRead + AsyncWrite + Unpin,
 {
     let write_initiated = std::sync::atomic::AtomicBool::new(false);
+    // Pairing and one-shot callers may talk to a peer that has not proven a pinned
+    // identity, so no alert on this stream is named as a refusal.
     run_request_over_stream_with_options(
         stream,
         method,
@@ -147,13 +153,14 @@ where
         spl_core::mux::MAX_ASSEMBLED_BYTES,
         None,
         &write_initiated,
+        RefusalNaming::Never,
     )
     .await
 }
 
 #[expect(
     clippy::too_many_arguments,
-    reason = "run_request_over_stream_with_options needs method, path, headers, body, cap, observer, and write_initiated"
+    reason = "run_request_over_stream_with_options needs method, path, headers, body, cap, observer, write_initiated, and refusal naming"
 )]
 #[expect(
     clippy::too_many_lines,
@@ -168,6 +175,7 @@ pub(crate) async fn run_request_over_stream_with_options<S>(
     response_cap: usize,
     observer: Option<&crate::observe::OperationObserver>,
     write_initiated: &std::sync::atomic::AtomicBool,
+    naming: RefusalNaming,
 ) -> Result<HttpResponse, TransportError>
 where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -181,110 +189,150 @@ where
     let mut sent_data_payload_bytes: u64 = 0;
 
     let mut buf = vec![0u8; READ_BUF];
-    loop {
-        // Send everything the current window permits — unless the peer has
-        // already responded and closed our stream (e.g. an early rejection),
-        // in which case there is nothing more worth sending.
-        if !assembler.is_closed() {
-            let mut wrote = false;
-            loop {
-                let capacity = upload.body_capacity();
-                if capacity > 0 && body_offset < body.len() {
-                    let end = (body_offset + capacity).min(body.len());
-                    upload.feed_body(&body[body_offset..end]).map_err(|error| {
-                        TransportError::Io(io::Error::new(io::ErrorKind::InvalidInput, error))
-                    })?;
-                    body_offset = end;
+    // Whether a TLS alert on this stream is no longer the peer's verdict on our
+    // certificate. A TLS 1.3 client finishes its handshake before the server has
+    // checked the client certificate, so the verdict arrives before any data.
+    let mut accepted = naming == RefusalNaming::Never;
+    let exchange = async {
+        loop {
+            // Send everything the current window permits — unless the peer has
+            // already responded and closed our stream (e.g. an early rejection),
+            // in which case there is nothing more worth sending.
+            if !assembler.is_closed() {
+                let mut wrote = false;
+                loop {
+                    let capacity = upload.body_capacity();
+                    if capacity > 0 && body_offset < body.len() {
+                        let end = (body_offset + capacity).min(body.len());
+                        upload.feed_body(&body[body_offset..end]).map_err(|error| {
+                            TransportError::Io(io::Error::new(io::ErrorKind::InvalidInput, error))
+                        })?;
+                        body_offset = end;
+                    }
+                    let Some(frame) = upload
+                        .poll_send()
+                        .map_err(|e| TransportError::Mux(MuxError::Frame(e)))?
+                    else {
+                        break;
+                    };
+                    let payload_len = if frame.len() > spl_core::frame::HEADER_LEN
+                        && (frame[4] & spl_core::frame::FLAG_DATA != 0)
+                    {
+                        frame.len() - spl_core::frame::HEADER_LEN
+                    } else {
+                        0
+                    };
+                    write_initiated.store(true, std::sync::atomic::Ordering::Release);
+                    write_all_with_timeout(
+                        &mut stream,
+                        &frame,
+                        "PL write timed out sending request frame",
+                        accepted,
+                    )
+                    .await?;
+                    if payload_len > 0 {
+                        sent_data_payload_bytes += payload_len as u64;
+                        crate::observe::note_request_bytes(observer, sent_data_payload_bytes);
+                    }
+                    wrote = true;
                 }
-                let Some(frame) = upload
-                    .poll_send()
-                    .map_err(|e| TransportError::Mux(MuxError::Frame(e)))?
-                else {
-                    break;
-                };
-                let payload_len = if frame.len() > spl_core::frame::HEADER_LEN
-                    && (frame[4] & spl_core::frame::FLAG_DATA != 0)
-                {
-                    frame.len() - spl_core::frame::HEADER_LEN
-                } else {
-                    0
-                };
-                write_initiated.store(true, std::sync::atomic::Ordering::Release);
+                if wrote {
+                    flush_with_timeout(
+                        &mut stream,
+                        "PL write timed out flushing request frames",
+                        accepted,
+                    )
+                    .await?;
+                }
+            }
+            if assembler.is_closed() {
+                break;
+            }
+
+            // Read inbound. WINDOW grants unblock more sending; PONGs keep the mux
+            // alive; DATA/CLOSE/RESET drive the response assembler.
+            let n = tokio::time::timeout(READ_TIMEOUT, stream.read(&mut buf))
+                .await
+                .map_err(|_| {
+                    TransportError::Io(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "PL read timed out awaiting response or window grant",
+                    ))
+                })?
+                .map_err(|error| stream_error(error, accepted))?;
+            if n == 0 {
+                break; // peer closed the connection
+            }
+            accepted = true;
+            let out = assembler.feed(&buf[..n])?;
+            for credit in out.window_grants {
+                if upload.grant(credit).is_err() {
+                    let reset = Frame::reset(stream_id, RESET_FLOW_CONTROL_ERROR)
+                        .encode()
+                        .map_err(|error| TransportError::Mux(MuxError::Frame(error)))?;
+                    write_all_with_timeout(
+                        &mut stream,
+                        &reset,
+                        "PL write timed out sending flow-control reset",
+                        accepted,
+                    )
+                    .await?;
+                    flush_with_timeout(
+                        &mut stream,
+                        "PL write timed out flushing flow-control reset",
+                        accepted,
+                    )
+                    .await?;
+                    return Err(TransportError::Mux(MuxError::FlowControl));
+                }
+            }
+            let mut originated = false;
+            for pong in out.pongs {
+                write_all_with_timeout(
+                    &mut stream,
+                    &pong,
+                    "PL write timed out sending pong",
+                    accepted,
+                )
+                .await?;
+                originated = true;
+            }
+            for frame in out.emit_frames {
                 write_all_with_timeout(
                     &mut stream,
                     &frame,
-                    "PL write timed out sending request frame",
+                    "PL write timed out sending originated frame",
+                    accepted,
                 )
                 .await?;
-                if payload_len > 0 {
-                    sent_data_payload_bytes += payload_len as u64;
-                    crate::observe::note_request_bytes(observer, sent_data_payload_bytes);
-                }
-                wrote = true;
+                originated = true;
             }
-            if wrote {
-                flush_with_timeout(&mut stream, "PL write timed out flushing request frames")
-                    .await?;
-            }
-        }
-        if assembler.is_closed() {
-            break;
-        }
-
-        // Read inbound. WINDOW grants unblock more sending; PONGs keep the mux
-        // alive; DATA/CLOSE/RESET drive the response assembler.
-        let n = tokio::time::timeout(READ_TIMEOUT, stream.read(&mut buf))
-            .await
-            .map_err(|_| {
-                TransportError::Io(std::io::Error::new(
-                    std::io::ErrorKind::TimedOut,
-                    "PL read timed out awaiting response or window grant",
-                ))
-            })??;
-        if n == 0 {
-            break; // peer closed the connection
-        }
-        let out = assembler.feed(&buf[..n])?;
-        for credit in out.window_grants {
-            if upload.grant(credit).is_err() {
-                let reset = Frame::reset(stream_id, RESET_FLOW_CONTROL_ERROR)
-                    .encode()
-                    .map_err(|error| TransportError::Mux(MuxError::Frame(error)))?;
-                write_all_with_timeout(
-                    &mut stream,
-                    &reset,
-                    "PL write timed out sending flow-control reset",
-                )
-                .await?;
+            if originated {
                 flush_with_timeout(
                     &mut stream,
-                    "PL write timed out flushing flow-control reset",
+                    "PL write timed out flushing originated frames",
+                    accepted,
                 )
                 .await?;
-                return Err(TransportError::Mux(MuxError::FlowControl));
+            }
+            if let Some(error) = out.terminal_error {
+                return Err(TransportError::Mux(error));
             }
         }
-        let mut originated = false;
-        for pong in out.pongs {
-            write_all_with_timeout(&mut stream, &pong, "PL write timed out sending pong").await?;
-            originated = true;
+        Ok(())
+    }
+    .await;
+    match exchange {
+        // A journal that refuses this device closes the connection, so a write
+        // can fail before its verdict has been read. Read once more, briefly.
+        // An invalid local request is not the connection's doing.
+        Err(TransportError::Io(error)) if error.kind() != io::ErrorKind::InvalidInput => {
+            return Err(match read_verdict(&mut stream, &mut buf, accepted).await {
+                Some(refusal) => refusal,
+                None => TransportError::Io(error),
+            });
         }
-        for frame in out.emit_frames {
-            write_all_with_timeout(
-                &mut stream,
-                &frame,
-                "PL write timed out sending originated frame",
-            )
-            .await?;
-            originated = true;
-        }
-        if originated {
-            flush_with_timeout(&mut stream, "PL write timed out flushing originated frames")
-                .await?;
-        }
-        if let Some(error) = out.terminal_error {
-            return Err(TransportError::Mux(error));
-        }
+        other => other?,
     }
     // Best-effort clean close.
     let _ = stream.shutdown().await;
@@ -296,28 +344,70 @@ where
     Ok(response)
 }
 
+/// Whether a request stream names TLS refusals.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RefusalNaming {
+    /// The peer proved the pinned journal identity while dialing: an alert
+    /// before its first data is its verdict.
+    BeforeFirstData,
+    /// The peer's identity is not established here; never name a refusal.
+    Never,
+}
+
+/// How long a failed exchange waits for the journal's verdict.
+const VERDICT_READ_TIMEOUT: Duration = Duration::from_secs(1);
+
+/// Read the journal's verdict after an I/O failure, if it has not sent any
+/// data yet.
+async fn read_verdict<S>(stream: &mut S, buf: &mut [u8], accepted: bool) -> Option<TransportError>
+where
+    S: AsyncRead + Unpin,
+{
+    if accepted {
+        return None;
+    }
+    match tokio::time::timeout(VERDICT_READ_TIMEOUT, stream.read(buf)).await {
+        Ok(Err(error)) => classify_tls_refusal(&error),
+        Ok(Ok(_)) | Err(_) => None,
+    }
+}
+
+/// Classify a stream error, naming a TLS refusal only before the peer has
+/// sent anything.
+fn stream_error(error: io::Error, accepted: bool) -> TransportError {
+    if !accepted && let Some(refusal) = classify_tls_refusal(&error) {
+        return refusal;
+    }
+    TransportError::Io(error)
+}
+
 async fn write_all_with_timeout<S>(
     stream: &mut S,
     bytes: &[u8],
     message: &'static str,
+    accepted: bool,
 ) -> Result<(), TransportError>
 where
     S: AsyncWrite + Unpin,
 {
     tokio::time::timeout(WRITE_TIMEOUT, stream.write_all(bytes))
         .await
-        .map_err(|_| TransportError::Io(io::Error::new(io::ErrorKind::TimedOut, message)))??;
-    Ok(())
+        .map_err(|_| TransportError::Io(io::Error::new(io::ErrorKind::TimedOut, message)))?
+        .map_err(|error| stream_error(error, accepted))
 }
 
-async fn flush_with_timeout<S>(stream: &mut S, message: &'static str) -> Result<(), TransportError>
+async fn flush_with_timeout<S>(
+    stream: &mut S,
+    message: &'static str,
+    accepted: bool,
+) -> Result<(), TransportError>
 where
     S: AsyncWrite + Unpin,
 {
     tokio::time::timeout(WRITE_TIMEOUT, stream.flush())
         .await
-        .map_err(|_| TransportError::Io(io::Error::new(io::ErrorKind::TimedOut, message)))??;
-    Ok(())
+        .map_err(|_| TransportError::Io(io::Error::new(io::ErrorKind::TimedOut, message)))?
+        .map_err(|error| stream_error(error, accepted))
 }
 
 #[cfg(test)]
@@ -332,6 +422,102 @@ mod tests {
     use tokio::io::{DuplexStream, ReadBuf};
 
     struct PendingWriteStream;
+
+    /// A peer whose reads follow a script and whose writes all succeed.
+    struct ScriptedPeerStream {
+        reads: std::collections::VecDeque<io::Result<Vec<u8>>>,
+    }
+
+    impl AsyncRead for ScriptedPeerStream {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            match self.reads.pop_front() {
+                Some(Ok(bytes)) => {
+                    buf.put_slice(&bytes);
+                    Poll::Ready(Ok(()))
+                }
+                Some(Err(error)) => Poll::Ready(Err(error)),
+                None => Poll::Pending,
+            }
+        }
+    }
+
+    impl AsyncWrite for ScriptedPeerStream {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            Poll::Ready(Ok(buf.len()))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    fn alert_80() -> io::Error {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            rustls::Error::AlertReceived(rustls::AlertDescription::InternalError),
+        )
+    }
+
+    async fn scripted_request(
+        reads: Vec<io::Result<Vec<u8>>>,
+        naming: RefusalNaming,
+    ) -> Result<HttpResponse, TransportError> {
+        let write_initiated = std::sync::atomic::AtomicBool::new(false);
+        run_request_over_stream_with_options(
+            ScriptedPeerStream {
+                reads: reads.into(),
+            },
+            "GET",
+            "/verdict",
+            &[],
+            b"",
+            spl_core::mux::MAX_ASSEMBLED_BYTES,
+            None,
+            &write_initiated,
+            naming,
+        )
+        .await
+    }
+
+    // Falsified by never marking the peer's first data: an alert after the journal answered
+    // would be named as a refusal of this device.
+    #[tokio::test]
+    async fn a_request_names_a_refusal_only_before_the_peer_answers() {
+        assert!(matches!(
+            scripted_request(vec![Err(alert_80())], RefusalNaming::BeforeFirstData).await,
+            Err(TransportError::TlsRefused)
+        ));
+
+        let ping = Frame::new(0, spl_core::frame::FLAG_PING, vec![0; 8])
+            .encode()
+            .unwrap();
+        assert!(matches!(
+            scripted_request(
+                vec![Ok(ping), Err(alert_80())],
+                RefusalNaming::BeforeFirstData
+            )
+            .await,
+            Err(TransportError::Io(_))
+        ));
+
+        // A caller whose peer is not authenticated never gets a named refusal.
+        assert!(matches!(
+            scripted_request(vec![Err(alert_80())], RefusalNaming::Never).await,
+            Err(TransportError::Io(_))
+        ));
+    }
 
     impl AsyncRead for PendingWriteStream {
         fn poll_read(
@@ -664,6 +850,7 @@ mod tests {
             1024 * 1024,
             Some(&obs),
             &write_initiated,
+            RefusalNaming::Never,
         )
         .await
         .unwrap_err();

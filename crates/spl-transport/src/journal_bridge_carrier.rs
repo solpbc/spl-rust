@@ -6,7 +6,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::io;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::time::Duration;
 
 use spl_core::bridge::FailureCategory;
@@ -25,10 +25,12 @@ use tokio::time::{Instant, MissedTickBehavior};
 use std::sync::atomic::AtomicUsize;
 
 use crate::client::{CarrierIo, CarrierKind};
+use crate::handshake::HandshakeFailure;
 use crate::journal_bridge::{
-    CarrierOpener, JournalBridgeTerminalReason, SharedStatus, lock_status,
+    CarrierOpener, SharedStatus, begin_carrier_attempt, latch_tls_access_denied, lock_status,
+    record_carrier_accepted, record_carrier_failure,
 };
-use crate::{TransportError, received_tls_alert, transport_error_code};
+use crate::{TransportError, classify_tls_refusal, transport_error_code};
 
 const READ_BUF_BYTES: usize = 64 * 1024;
 const COMMAND_QUEUE: usize = 64;
@@ -415,8 +417,8 @@ impl MuxCarrier {
 
     async fn get_or_dial(&self) -> Result<Arc<CarrierHandle>, TransportError> {
         let mut slot = self.slot.lock().await;
-        if lock_status(&self.status).snapshot.terminal_reason.is_some() {
-            return Err(TransportError::TlsAccessDenied);
+        if let Some(reason) = lock_status(&self.status).snapshot.terminal_reason {
+            return Err(reason.error());
         }
         if let Some(handle) = slot.as_ref()
             && handle.alive.load(Ordering::SeqCst)
@@ -432,16 +434,15 @@ impl MuxCarrier {
             redial_hook();
         }
 
-        if lock_status(&self.status).snapshot.terminal_reason.is_some() {
-            return Err(TransportError::TlsAccessDenied);
+        if let Some(reason) = lock_status(&self.status).snapshot.terminal_reason {
+            return Err(reason.error());
         }
 
+        let attempt = begin_carrier_attempt(&self.status);
         let dialed = match self.opener.dial_carrier().await {
             Ok(dialed) => dialed,
             Err(error) => {
-                if matches!(error, TransportError::TlsAccessDenied) {
-                    latch_tls_access_denied(&self.status);
-                }
+                record_carrier_failure(&self.status, attempt, HandshakeFailure::classify(&error));
                 return Err(error);
             }
         };
@@ -454,17 +455,19 @@ impl MuxCarrier {
         let (cancel_tx, cancel_rx) = mpsc::unbounded_channel();
         let alive = Arc::new(AtomicBool::new(true));
         let status_identity = Arc::new(());
+        let acceptance = Arc::new(CarrierAcceptance::default());
         let mut status = lock_status(&self.status);
-        if status.snapshot.terminal_reason.is_some() {
+        if let Some(reason) = status.snapshot.terminal_reason {
             drop(status);
-            return Err(TransportError::TlsAccessDenied);
+            return Err(reason.error());
         }
         let writer = tokio::spawn(writer_task(
             write,
             writer_rx,
             writer_events_tx,
             kind.clone(),
-            CarrierLiveGuard::new(alive.clone(), self.status.clone(), status_identity.clone()),
+            CarrierLiveGuard::new(alive.clone(), self.status.clone(), status_identity.clone())
+                .with_acceptance(acceptance.clone(), attempt),
         ));
         let coordinator = tokio::spawn(coordinator_task(
             read,
@@ -479,7 +482,8 @@ impl MuxCarrier {
             },
             kind,
             self.keepalive,
-            CarrierLiveGuard::new(alive.clone(), self.status.clone(), status_identity.clone()),
+            CarrierLiveGuard::new(alive.clone(), self.status.clone(), status_identity.clone())
+                .with_acceptance(acceptance, attempt),
         ));
         let handle = Arc::new(CarrierHandle {
             commands: commands_tx,
@@ -575,6 +579,8 @@ struct CarrierLiveGuard {
     alive: Arc<AtomicBool>,
     status: SharedStatus,
     status_identity: Arc<()>,
+    acceptance: Arc<CarrierAcceptance>,
+    attempt: u64,
 }
 
 impl CarrierLiveGuard {
@@ -583,7 +589,55 @@ impl CarrierLiveGuard {
             alive,
             status,
             status_identity,
+            acceptance: Arc::new(CarrierAcceptance::default()),
+            attempt: 0,
         }
+    }
+
+    fn with_acceptance(mut self, acceptance: Arc<CarrierAcceptance>, attempt: u64) -> Self {
+        self.acceptance = acceptance;
+        self.attempt = attempt;
+        self
+    }
+
+    /// The journal sent application data, so it accepted this device.
+    fn accepted(&self) {
+        if self.acceptance.resolve(CarrierAcceptance::ACCEPTED) {
+            record_carrier_accepted(&self.status, self.attempt);
+        }
+    }
+
+    /// The carrier ended before the journal accepted it.
+    fn failed_before_acceptance(&self, failure: HandshakeFailure) {
+        if self.acceptance.resolve(CarrierAcceptance::FAILED) {
+            record_carrier_failure(&self.status, self.attempt, failure);
+        }
+    }
+}
+
+/// Whether the journal accepted one dialed carrier.
+///
+/// A TLS 1.3 client finishes its handshake before the journal has checked the
+/// client certificate, so a refusal arrives as an alert on the first read or
+/// write after the dial returned. The first application bytes from the journal
+/// are the proof of acceptance. Resolved once, by whichever of the reader and
+/// writer sees the outcome first.
+#[derive(Default)]
+struct CarrierAcceptance(AtomicU8);
+
+impl CarrierAcceptance {
+    const PENDING: u8 = 0;
+    const ACCEPTED: u8 = 1;
+    const FAILED: u8 = 2;
+
+    fn is_pending(&self) -> bool {
+        self.0.load(Ordering::SeqCst) == Self::PENDING
+    }
+
+    fn resolve(&self, outcome: u8) -> bool {
+        self.0
+            .compare_exchange(Self::PENDING, outcome, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
     }
 }
 
@@ -841,11 +895,13 @@ async fn writer_task(
     while let Some(packet) = rx.recv().await {
         let WriterPacket { bytes, body_leases } = packet;
         if let Err(error) = write.write_all(&bytes).await {
-            stop_reason = classify_carrier_tls_alert(&error, &kind, &carrier_guard.status);
+            stop_reason =
+                classify_carrier_tls_alert(&error, &kind, &carrier_guard, CarrierSide::Writer);
             break;
         }
         if let Err(error) = write.flush().await {
-            stop_reason = classify_carrier_tls_alert(&error, &kind, &carrier_guard.status);
+            stop_reason =
+                classify_carrier_tls_alert(&error, &kind, &carrier_guard, CarrierSide::Writer);
             break;
         }
         #[cfg(test)]
@@ -898,8 +954,12 @@ async fn coordinator_task(
         let step = tokio::select! {
             read_result = read.read(&mut buf) => {
                 match read_result {
-                    Ok(0) => CoordinatorStep::Stop,
+                    Ok(0) => {
+                        carrier_guard.failed_before_acceptance(HandshakeFailure::Unreachable);
+                        CoordinatorStep::Stop
+                    }
                     Ok(n) => {
+                        carrier_guard.accepted();
                         match handle_read(
                             &mut demux,
                             &mut streams,
@@ -917,7 +977,7 @@ async fn coordinator_task(
                             Err(error) => CoordinatorStep::Error(error),
                         }
                     }
-                    Err(error) => classify_carrier_tls_alert(&error, &kind, &carrier_guard.status)
+                    Err(error) => classify_carrier_tls_alert(&error, &kind, &carrier_guard, CarrierSide::Reader)
                         .map_or_else(
                             || CoordinatorStep::Error(writer_error("carrier read failed")),
                             CoordinatorStep::Error,
@@ -1029,33 +1089,32 @@ async fn coordinator_task(
             }
         };
 
-        match step {
+        let failure = match step {
             CoordinatorStep::Continue => {
-                if let Err(error) = flush_pending_deliveries(&mut demux, &mut streams, &mut writer)
-                {
-                    fanout_eof(&mut streams);
-                    log_carrier_teardown(&kind, &transport_error_code(&error));
-                    break;
-                }
-                if let Err(error) = pump_ready(&mut writer, &mut streams, &mut ready) {
-                    fanout_eof(&mut streams);
-                    log_carrier_teardown(&kind, &transport_error_code(&error));
-                    break;
+                match flush_pending_deliveries(&mut demux, &mut streams, &mut writer) {
+                    Ok(()) => pump_ready(&mut writer, &mut streams, &mut ready).err(),
+                    Err(error) => Some(error),
                 }
             }
             CoordinatorStep::Stop => {
                 fanout_eof(&mut streams);
                 break;
             }
-            CoordinatorStep::Error(error) => {
-                if matches!(error, TransportError::TlsCertificateUnknown) {
-                    fanout_certificate_unknown(&mut streams);
-                } else {
-                    fanout_eof(&mut streams);
-                }
-                log_carrier_teardown(&kind, &transport_error_code(&error));
-                break;
+            CoordinatorStep::Error(error) => Some(error),
+        };
+        if let Some(error) = failure {
+            // A carrier failing before the journal answered may have the
+            // journal's verdict waiting unread; let it settle the attempt.
+            let error = read_verdict_before_teardown(&mut read, &mut buf, &kind, &carrier_guard)
+                .await
+                .unwrap_or(error);
+            if matches!(error, TransportError::TlsCertificateUnknown) {
+                fanout_certificate_unknown(&mut streams);
+            } else {
+                fanout_eof(&mut streams);
             }
+            log_carrier_teardown(&kind, &transport_error_code(&error));
+            break;
         }
     }
 
@@ -1080,13 +1139,6 @@ fn mark_carrier_dead(status: &SharedStatus, status_identity: &Arc<()>) {
     }
 }
 
-fn latch_tls_access_denied(status: &SharedStatus) {
-    let mut record = lock_status(status);
-    if record.snapshot.terminal_reason.is_none() {
-        record.snapshot.terminal_reason = Some(JournalBridgeTerminalReason::TlsAccessDenied);
-    }
-}
-
 fn relay_termination_error(kind: &CarrierKind) -> Option<crate::RelayError> {
     match kind {
         CarrierKind::Lan => None,
@@ -1094,19 +1146,71 @@ fn relay_termination_error(kind: &CarrierKind) -> Option<crate::RelayError> {
     }
 }
 
+/// Which side of the carrier saw an I/O failure.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CarrierSide {
+    Reader,
+    Writer,
+}
+
 fn classify_carrier_tls_alert(
     error: &io::Error,
     kind: &CarrierKind,
-    status: &SharedStatus,
+    guard: &CarrierLiveGuard,
+    side: CarrierSide,
 ) -> Option<TransportError> {
-    let error = received_tls_alert(error)?;
-    if relay_termination_error(kind).is_some() {
+    // The journal's verdict comes before its first byte; an alert after that is
+    // not a verdict on this device.
+    if !guard.acceptance.is_pending() {
         return None;
     }
+    let refusal = classify_tls_refusal(error);
+    let Some(error) = refusal.filter(|_| relay_termination_error(kind).is_none()) else {
+        // A failed write does not settle the attempt: the journal's verdict may
+        // still be waiting to be read. The reader decides.
+        if side == CarrierSide::Reader {
+            guard.failed_before_acceptance(HandshakeFailure::Unreachable);
+        }
+        return None;
+    };
     if matches!(error, TransportError::TlsAccessDenied) {
-        latch_tls_access_denied(status);
+        latch_tls_access_denied(&guard.status);
     }
+    guard.failed_before_acceptance(HandshakeFailure::classify(&error));
     Some(error)
+}
+
+/// How long a carrier whose writer failed waits for the journal's verdict.
+const VERDICT_READ_TIMEOUT: Duration = Duration::from_secs(1);
+
+/// A writer failure before the journal answered can hide a refusal that is
+/// already on its way: a journal refuses and then closes. Read once, briefly, so
+/// the attempt is settled by what the journal said rather than by the write.
+async fn read_verdict_before_teardown(
+    read: &mut CarrierRead,
+    buf: &mut [u8],
+    kind: &CarrierKind,
+    guard: &CarrierLiveGuard,
+) -> Option<TransportError> {
+    if !guard.acceptance.is_pending() {
+        return None;
+    }
+    // A relay that closed the tunnel has already said why the carrier ended.
+    if relay_termination_error(kind).is_some() {
+        guard.failed_before_acceptance(HandshakeFailure::Unreachable);
+        return None;
+    }
+    match tokio::time::timeout(VERDICT_READ_TIMEOUT, read.read(buf)).await {
+        Ok(Ok(0)) | Err(_) => {
+            guard.failed_before_acceptance(HandshakeFailure::Unreachable);
+            None
+        }
+        Ok(Ok(_)) => {
+            guard.accepted();
+            None
+        }
+        Ok(Err(error)) => classify_carrier_tls_alert(&error, kind, guard, CarrierSide::Reader),
+    }
 }
 
 fn handle_read(
@@ -1588,6 +1692,8 @@ fn log_frame_violation(violation: FrameViolation) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::handshake::{REFUSAL_LIMIT, REFUSAL_SPACING};
+    use crate::journal_bridge::JournalBridgeTerminalReason;
     use spl_core::frame::{
         FLAG_CLOSE, FLAG_DATA, FLAG_OPEN, FLAG_PING, FLAG_PONG, FLAG_RESET, FLAG_WINDOW,
         FrameDecoder, RECOMMENDED_CHUNK, RESET_CANCEL, RESET_FLOW_CONTROL_ERROR,
@@ -1779,6 +1885,93 @@ mod tests {
         }
     }
 
+    /// A journal that accepts (its first bytes are a ping), then sends `error`
+    /// once the test fires it.
+    struct AcceptedThenAlertStream {
+        pinged: bool,
+        error: rustls::Error,
+        fired: Arc<AtomicBool>,
+        waker: Arc<std::sync::Mutex<Option<Waker>>>,
+    }
+
+    impl AsyncRead for AcceptedThenAlertStream {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            if !self.pinged {
+                self.pinged = true;
+                buf.put_slice(&ping_bytes());
+                return Poll::Ready(Ok(()));
+            }
+            if self.fired.load(Ordering::SeqCst) {
+                return Poll::Ready(Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    self.error.clone(),
+                )));
+            }
+            *self.waker.lock().unwrap() = Some(cx.waker().clone());
+            Poll::Pending
+        }
+    }
+
+    impl AsyncWrite for AcceptedThenAlertStream {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            Poll::Ready(Ok(buf.len()))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    struct AcceptedThenAlertOpener {
+        error: rustls::Error,
+        fired: Arc<AtomicBool>,
+        waker: Arc<std::sync::Mutex<Option<Waker>>>,
+    }
+
+    impl CarrierOpener for AcceptedThenAlertOpener {
+        fn proxy_headers(
+            &self,
+            upstream_headers: &[(String, String)],
+        ) -> Result<Vec<(String, String)>, TransportError> {
+            Ok(upstream_headers.to_vec())
+        }
+
+        fn dial_carrier(
+            &self,
+        ) -> Pin<
+            Box<
+                dyn Future<Output = Result<crate::client::DialedCarrier, TransportError>>
+                    + Send
+                    + '_,
+            >,
+        > {
+            let stream = AcceptedThenAlertStream {
+                pinged: false,
+                error: self.error.clone(),
+                fired: self.fired.clone(),
+                waker: self.waker.clone(),
+            };
+            Box::pin(async move {
+                Ok(crate::client::DialedCarrier::from_test_parts(
+                    Box::new(stream),
+                    CarrierKind::Lan,
+                ))
+            })
+        }
+    }
+
     struct InjectedTlsErrorOpener {
         dials: Arc<AtomicUsize>,
         error: rustls::Error,
@@ -1946,6 +2139,235 @@ mod tests {
                 ))
             })
         }
+    }
+
+    type ErrorFactory = Arc<dyn Fn() -> TransportError + Send + Sync>;
+
+    struct FailingDialOpener {
+        dials: Arc<AtomicUsize>,
+        error: ErrorFactory,
+    }
+
+    impl CarrierOpener for FailingDialOpener {
+        fn proxy_headers(
+            &self,
+            upstream_headers: &[(String, String)],
+        ) -> Result<Vec<(String, String)>, TransportError> {
+            Ok(upstream_headers.to_vec())
+        }
+
+        fn dial_carrier(
+            &self,
+        ) -> Pin<
+            Box<
+                dyn Future<Output = Result<crate::client::DialedCarrier, TransportError>>
+                    + Send
+                    + '_,
+            >,
+        > {
+            self.dials.fetch_add(1, Ordering::SeqCst);
+            let error = (self.error)();
+            Box::pin(async move { Err(error) })
+        }
+    }
+
+    type ReadScript = Arc<dyn Fn() -> VecDeque<io::Result<Vec<u8>>> + Send + Sync>;
+
+    /// A carrier stream whose reads follow a script, then stay pending.
+    struct ScriptedReadStream {
+        reads: VecDeque<io::Result<Vec<u8>>>,
+    }
+
+    impl AsyncRead for ScriptedReadStream {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            match self.reads.pop_front() {
+                Some(Ok(bytes)) => {
+                    buf.put_slice(&bytes);
+                    Poll::Ready(Ok(()))
+                }
+                Some(Err(error)) => Poll::Ready(Err(error)),
+                None => Poll::Pending,
+            }
+        }
+    }
+
+    impl AsyncWrite for ScriptedReadStream {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            Poll::Ready(Ok(buf.len()))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    struct ScriptedReadOpener {
+        script: ReadScript,
+    }
+
+    impl CarrierOpener for ScriptedReadOpener {
+        fn proxy_headers(
+            &self,
+            upstream_headers: &[(String, String)],
+        ) -> Result<Vec<(String, String)>, TransportError> {
+            Ok(upstream_headers.to_vec())
+        }
+
+        fn dial_carrier(
+            &self,
+        ) -> Pin<
+            Box<
+                dyn Future<Output = Result<crate::client::DialedCarrier, TransportError>>
+                    + Send
+                    + '_,
+            >,
+        > {
+            let stream = ScriptedReadStream {
+                reads: (self.script)(),
+            };
+            Box::pin(async move {
+                Ok(crate::client::DialedCarrier::from_test_parts(
+                    Box::new(stream),
+                    CarrierKind::Lan,
+                ))
+            })
+        }
+    }
+
+    /// A journal that refuses and closes while this client is still writing: the write fails at
+    /// once, and the refusal becomes readable only a little later, without waking the reader.
+    /// Only a teardown that reads once more before giving up can see it.
+    struct LateVerdictStream {
+        write_failed_at: Arc<std::sync::Mutex<Option<std::time::Instant>>>,
+    }
+
+    impl AsyncRead for LateVerdictStream {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            _buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            let failed_at = *self.write_failed_at.lock().unwrap();
+            match failed_at {
+                Some(at) if at.elapsed() >= Duration::from_millis(50) => {
+                    Poll::Ready(Err(alert_error(rustls::AlertDescription::InternalError)))
+                }
+                Some(_) => {
+                    let waker = cx.waker().clone();
+                    tokio::spawn(async move {
+                        tokio::time::sleep(Duration::from_millis(60)).await;
+                        waker.wake();
+                    });
+                    Poll::Pending
+                }
+                None => Poll::Pending,
+            }
+        }
+    }
+
+    impl AsyncWrite for LateVerdictStream {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            _buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            self.write_failed_at
+                .lock()
+                .unwrap()
+                .get_or_insert_with(std::time::Instant::now);
+            Poll::Ready(Err(io::Error::from(io::ErrorKind::BrokenPipe)))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    struct LateVerdictOpener;
+
+    impl CarrierOpener for LateVerdictOpener {
+        fn proxy_headers(
+            &self,
+            upstream_headers: &[(String, String)],
+        ) -> Result<Vec<(String, String)>, TransportError> {
+            Ok(upstream_headers.to_vec())
+        }
+
+        fn dial_carrier(
+            &self,
+        ) -> Pin<
+            Box<
+                dyn Future<Output = Result<crate::client::DialedCarrier, TransportError>>
+                    + Send
+                    + '_,
+            >,
+        > {
+            let stream = LateVerdictStream {
+                write_failed_at: Arc::new(std::sync::Mutex::new(None)),
+            };
+            Box::pin(async move {
+                Ok(crate::client::DialedCarrier::from_test_parts(
+                    Box::new(stream),
+                    CarrierKind::Lan,
+                ))
+            })
+        }
+    }
+
+    fn test_mux_carrier(opener: Arc<dyn CarrierOpener>, status: SharedStatus) -> MuxCarrier {
+        MuxCarrier {
+            opener,
+            slot: Mutex::new(None),
+            keepalive: KeepaliveConfig::default(),
+            status,
+            redial_hook: None,
+        }
+    }
+
+    fn alert_error(description: rustls::AlertDescription) -> io::Error {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            rustls::Error::AlertReceived(description),
+        )
+    }
+
+    fn ping_bytes() -> Vec<u8> {
+        Frame::new(0, FLAG_PING, vec![1, 2, 3, 4, 5, 6, 7, 8])
+            .encode()
+            .unwrap()
+    }
+
+    async fn wait_for_status(
+        status: &SharedStatus,
+        predicate: impl Fn(&crate::journal_bridge::JournalBridgeStatus) -> bool,
+    ) -> crate::journal_bridge::JournalBridgeStatus {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let snapshot = lock_status(status).snapshot;
+                if predicate(&snapshot) {
+                    return snapshot;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("status did not reach the expected state")
     }
 
     #[derive(Clone)]
@@ -2161,7 +2583,7 @@ mod tests {
     }
 
     // Protocol: `.proto-ref/session.md`, lines 195, 205. Falsified by broadening
-    // received_tls_alert to every rustls::Error: DecryptError becomes named 46 or latches.
+    // classify_tls_refusal to every rustls::Error: DecryptError becomes named 46 or latches.
     #[tokio::test]
     async fn non_alert_rustls_error_is_not_certificate_unknown() {
         let status = crate::journal_bridge::new_status();
@@ -2607,6 +3029,291 @@ mod tests {
             Some(StreamItem::End(StreamEnd::Eof)) | None => {}
             other => panic!("expected eof/end channel close, got {other:?}"),
         }
+    }
+
+    // Protocol: `.proto-ref/session.md` § 7, "every other code". Falsified by leaving the
+    // terminal check on access denied only: the exhausted bridge keeps dialing.
+    #[tokio::test(start_paused = true)]
+    async fn dial_refusals_stop_the_bridge_at_the_limit() {
+        let status = crate::journal_bridge::new_status();
+        let dials = Arc::new(AtomicUsize::new(0));
+        let carrier = test_mux_carrier(
+            Arc::new(FailingDialOpener {
+                dials: dials.clone(),
+                error: Arc::new(|| TransportError::TlsRefused),
+            }),
+            status.clone(),
+        );
+
+        for counted in 1..=REFUSAL_LIMIT {
+            assert!(matches!(
+                carrier.get_or_dial().await,
+                Err(TransportError::TlsRefused)
+            ));
+            let snapshot = lock_status(&status).snapshot;
+            assert_eq!(snapshot.refusals, counted);
+            assert_eq!(
+                snapshot.last_failure,
+                Some(crate::handshake::HandshakeFailure::TlsRefused)
+            );
+            tokio::time::advance(REFUSAL_SPACING).await;
+        }
+        assert_eq!(
+            lock_status(&status).snapshot.terminal_reason,
+            Some(JournalBridgeTerminalReason::RefusalsExhausted)
+        );
+
+        let dials_at_limit = dials.load(Ordering::SeqCst);
+        assert!(matches!(
+            carrier.open_stream("GET", "/after", &[], 0).await,
+            Err(TransportError::TlsRefused)
+        ));
+        assert_eq!(dials.load(Ordering::SeqCst), dials_at_limit);
+    }
+
+    // Protocol: `.proto-ref/session.md` § 7, "every other code". The journal's own refusal, read
+    // after each dial, stops the bridge at the limit. Falsified by counting only dial errors: a
+    // journal that keeps refusing never stops the bridge.
+    #[tokio::test(start_paused = true)]
+    async fn refusals_read_after_each_dial_stop_the_bridge_at_the_limit() {
+        let status = crate::journal_bridge::new_status();
+        let dials = Arc::new(AtomicUsize::new(0));
+        let counted_dials = dials.clone();
+        let carrier = test_mux_carrier(
+            Arc::new(ScriptedReadOpener {
+                script: Arc::new(move || {
+                    counted_dials.fetch_add(1, Ordering::SeqCst);
+                    VecDeque::from([Err(alert_error(rustls::AlertDescription::InternalError))])
+                }),
+            }),
+            status.clone(),
+        );
+
+        for counted in 1..=REFUSAL_LIMIT {
+            let _ = carrier.open_stream("GET", "/refused", &[], 0).await;
+            let snapshot = wait_for_status(&status, |snapshot| snapshot.refusals == counted).await;
+            assert_eq!(
+                snapshot.last_failure,
+                Some(crate::handshake::HandshakeFailure::TlsRefused)
+            );
+            tokio::time::advance(REFUSAL_SPACING).await;
+        }
+        let snapshot = wait_for_status(&status, |snapshot| !snapshot.carrier_live).await;
+        assert_eq!(
+            snapshot.terminal_reason,
+            Some(JournalBridgeTerminalReason::RefusalsExhausted)
+        );
+
+        let dials_at_limit = dials.load(Ordering::SeqCst);
+        assert!(matches!(
+            carrier.open_stream("GET", "/after", &[], 0).await,
+            Err(TransportError::TlsRefused)
+        ));
+        assert_eq!(dials.load(Ordering::SeqCst), dials_at_limit);
+    }
+
+    // Protocol: `.proto-ref/session.md` § 7. Falsified by folding any of these into the
+    // refusal branch: an offline or briefly unreadable journal would unpair the device.
+    #[tokio::test(start_paused = true)]
+    async fn dial_failures_that_are_not_refusals_never_count() {
+        use crate::handshake::HandshakeFailure;
+        let cases: [(ErrorFactory, HandshakeFailure); 5] = [
+            (
+                Arc::new(|| TransportError::TlsCertificateUnknown),
+                HandshakeFailure::TlsCertificateUnknown,
+            ),
+            (
+                Arc::new(|| TransportError::NoEndpoint),
+                HandshakeFailure::Unreachable,
+            ),
+            (
+                Arc::new(|| TransportError::Io(io::Error::from(io::ErrorKind::TimedOut))),
+                HandshakeFailure::Unreachable,
+            ),
+            (
+                Arc::new(|| TransportError::Tls("inner relay handshake".into())),
+                HandshakeFailure::Unreachable,
+            ),
+            (
+                Arc::new(|| TransportError::Relay(crate::RelayError::HomeOffline)),
+                HandshakeFailure::Unreachable,
+            ),
+        ];
+        for (error, expected) in cases {
+            let status = crate::journal_bridge::new_status();
+            let dials = Arc::new(AtomicUsize::new(0));
+            let carrier = test_mux_carrier(
+                Arc::new(FailingDialOpener {
+                    dials: dials.clone(),
+                    error,
+                }),
+                status.clone(),
+            );
+            for _ in 0..(REFUSAL_LIMIT * 2) {
+                assert!(carrier.get_or_dial().await.is_err());
+                tokio::time::advance(REFUSAL_SPACING).await;
+            }
+            let snapshot = lock_status(&status).snapshot;
+            assert_eq!(snapshot.last_failure, Some(expected));
+            assert_eq!(snapshot.refusals, 0);
+            assert_eq!(snapshot.terminal_reason, None);
+            assert_eq!(dials.load(Ordering::SeqCst), (REFUSAL_LIMIT * 2) as usize);
+        }
+    }
+
+    // Protocol: `.proto-ref/session.md` § 7. A TLS 1.3 refusal arrives after the dial returns.
+    // Falsified by recording only dial errors: an 80 on the first read counts nothing.
+    #[tokio::test]
+    async fn refusal_after_the_dial_counts_before_acceptance() {
+        use crate::handshake::HandshakeFailure;
+        for (description, expected, refusals) in [
+            (
+                rustls::AlertDescription::InternalError,
+                HandshakeFailure::TlsRefused,
+                1,
+            ),
+            (
+                rustls::AlertDescription::CertificateUnknown,
+                HandshakeFailure::TlsCertificateUnknown,
+                0,
+            ),
+        ] {
+            let status = crate::journal_bridge::new_status();
+            let fired = Arc::new(AtomicBool::new(false));
+            let waker = Arc::new(std::sync::Mutex::new(None));
+            let carrier = test_mux_carrier(
+                Arc::new(InjectedTlsErrorOpener {
+                    dials: Arc::new(AtomicUsize::new(0)),
+                    error: rustls::Error::AlertReceived(description),
+                    fired: fired.clone(),
+                    waker: waker.clone(),
+                    kind: CarrierKind::Lan,
+                }),
+                status.clone(),
+            );
+
+            let opened = carrier
+                .open_stream("GET", "/refused", &[], 0)
+                .await
+                .unwrap();
+            let mut rx = opened.response;
+            assert_eq!(lock_status(&status).snapshot.last_failure, None);
+            fire_injected_error(&fired, &waker);
+            assert_stream_eof(&mut rx).await;
+            let snapshot =
+                wait_for_status(&status, |snapshot| snapshot.last_failure.is_some()).await;
+            assert_eq!(snapshot.last_failure, Some(expected), "{description:?}");
+            assert_eq!(snapshot.refusals, refusals, "{description:?}");
+            assert_eq!(snapshot.terminal_reason, None, "{description:?}");
+        }
+    }
+
+    // Protocol: `.proto-ref/session.md` § 7, "only a completed handshake clears the state".
+    // Falsified by never recording acceptance: the earlier refusal survives the live carrier.
+    #[tokio::test]
+    async fn journal_bytes_accept_the_carrier_and_clear_refusals() {
+        let status = crate::journal_bridge::new_status();
+        crate::journal_bridge::record_carrier_failure(
+            &status,
+            0,
+            crate::handshake::HandshakeFailure::TlsRefused,
+        );
+        assert_eq!(lock_status(&status).snapshot.refusals, 1);
+        let carrier = test_mux_carrier(
+            Arc::new(ScriptedReadOpener {
+                script: Arc::new(|| VecDeque::from([Ok(ping_bytes())])),
+            }),
+            status.clone(),
+        );
+
+        let _opened = carrier
+            .open_stream("GET", "/accepted", &[], 0)
+            .await
+            .unwrap();
+        let snapshot = wait_for_status(&status, |snapshot| snapshot.refusals == 0).await;
+        assert_eq!(snapshot.last_failure, None);
+        assert!(snapshot.carrier_live);
+    }
+
+    // The journal's verdict comes before its first byte. Falsified by classifying alerts after
+    // acceptance: 49 would latch the bridge as unpaired, and 46 would reach the open stream as
+    // certificate unknown. Any other alert must not count either.
+    #[tokio::test]
+    async fn an_alert_after_acceptance_is_not_a_verdict() {
+        for description in [
+            rustls::AlertDescription::AccessDenied,
+            rustls::AlertDescription::CertificateUnknown,
+            rustls::AlertDescription::InternalError,
+        ] {
+            let status = crate::journal_bridge::new_status();
+            let fired = Arc::new(AtomicBool::new(false));
+            let waker = Arc::new(std::sync::Mutex::new(None::<Waker>));
+            let carrier = test_mux_carrier(
+                Arc::new(AcceptedThenAlertOpener {
+                    error: rustls::Error::AlertReceived(description),
+                    fired: fired.clone(),
+                    waker: waker.clone(),
+                }),
+                status.clone(),
+            );
+            // A refusal counted earlier; the journal's acceptance clears it.
+            crate::journal_bridge::record_carrier_failure(&status, 0, HandshakeFailure::TlsRefused);
+            assert_eq!(lock_status(&status).snapshot.refusals, 1);
+
+            let opened = carrier
+                .open_stream("GET", "/after-accept", &[], 0)
+                .await
+                .expect("stream opens on a live carrier");
+            let mut rx = opened.response;
+            wait_for_status(&status, |snapshot| {
+                snapshot.carrier_live && snapshot.refusals == 0 && snapshot.last_failure.is_none()
+            })
+            .await;
+
+            fired.store(true, Ordering::SeqCst);
+            if let Some(waker) = waker.lock().unwrap().take() {
+                waker.wake();
+            }
+            let snapshot = wait_for_status(&status, |snapshot| !snapshot.carrier_live).await;
+            let _ = tokio::time::timeout(Duration::from_secs(1), rx.recv()).await;
+            assert_eq!(snapshot.last_failure, None, "{description:?}");
+            assert_eq!(snapshot.refusals, 0, "{description:?}");
+            assert_eq!(snapshot.terminal_reason, None, "{description:?}");
+            assert!(rx.carrier_failure().is_none(), "{description:?}");
+        }
+    }
+
+    // Falsified by letting the writer settle the attempt, or by tearing the carrier down without
+    // reading once more: the journal's refusal waiting behind the failed write is never counted.
+    #[tokio::test]
+    async fn a_failed_write_does_not_hide_the_journals_refusal() {
+        let status = crate::journal_bridge::new_status();
+        let carrier = test_mux_carrier(Arc::new(LateVerdictOpener), status.clone());
+
+        let _ = carrier.open_stream("GET", "/late-verdict", &[], 0).await;
+        let snapshot = wait_for_status(&status, |snapshot| snapshot.last_failure.is_some()).await;
+        assert_eq!(snapshot.last_failure, Some(HandshakeFailure::TlsRefused));
+        assert_eq!(snapshot.refusals, 1);
+    }
+
+    // Falsified by treating a close before any journal byte as acceptance or as a refusal.
+    #[tokio::test]
+    async fn a_close_before_acceptance_is_unreachable() {
+        let status = crate::journal_bridge::new_status();
+        let carrier = test_mux_carrier(
+            Arc::new(ScriptedReadOpener {
+                script: Arc::new(|| VecDeque::from([Ok(Vec::new())])),
+            }),
+            status.clone(),
+        );
+
+        let _ = carrier.open_stream("GET", "/closed", &[], 0).await;
+        let snapshot = wait_for_status(&status, |snapshot| snapshot.last_failure.is_some()).await;
+        assert_eq!(
+            snapshot.last_failure,
+            Some(crate::handshake::HandshakeFailure::Unreachable)
+        );
+        assert_eq!(snapshot.refusals, 0);
     }
 
     #[tokio::test]
@@ -3614,6 +4321,9 @@ mod tests {
             tokio::time::advance(TEST_INTERVAL + TEST_DEADLINE).await;
             tokio::task::yield_now().await;
         }
+        // The journal never answered, so teardown first waits briefly for its verdict.
+        tokio::time::advance(VERDICT_READ_TIMEOUT).await;
+        tokio::task::yield_now().await;
 
         assert!(!alive.load(Ordering::SeqCst));
         assert_stream_eof(&mut rx).await;

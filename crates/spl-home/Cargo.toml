@@ -14,7 +14,7 @@ workspace = true
 spl-core = { workspace = true }
 thiserror = { workspace = true }
 rustls = { workspace = true }
-tokio = { workspace = true, features = ["io-util", "rt", "sync", "macros"] }
+tokio = { workspace = true, features = ["io-util", "rt", "sync", "macros", "time"] }
 tokio-rustls = { workspace = true }
 
 [dev-dependencies]

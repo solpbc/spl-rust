@@ -35,7 +35,7 @@ use tokio_tungstenite::{
 
 use crate::connection::run_request_over_stream;
 use crate::tls::pinned_server_name;
-use crate::{RelayError, TransportError, received_tls_alert};
+use crate::{RelayError, TransportError, classify_dial_refusal};
 
 /// Inner mTLS progress bound. This is not a presence-hold wait; a live relay
 /// path should produce the journal's TLS response well before this.
@@ -398,6 +398,9 @@ pub(crate) async fn dial_pair_relay_ws(
 
 /// Send one HTTP request over an already-established relay WebSocket.
 ///
+/// A journal's refusal of this device is not named here (it reads as an I/O
+/// error); use [`crate::client::TransportClient::request`] for that.
+///
 /// # Errors
 ///
 /// Returns an inner TLS, mux, HTTP, timeout, or typed relay error.
@@ -463,7 +466,7 @@ fn inner_handshake_error(
     if let Some(error) = termination.current_error() {
         return TransportError::Relay(error);
     }
-    received_tls_alert(error)
+    classify_dial_refusal(error, None)
         .unwrap_or_else(|| TransportError::Tls(format!("inner relay handshake: {error}")))
 }
 
@@ -540,6 +543,9 @@ where
 )]
 /// Send one HTTP request through a newly dialed authenticated relay carrier.
 ///
+/// A journal's refusal of this device is not named here (it reads as an I/O
+/// error); use [`crate::client::TransportClient::request`] for that.
+///
 /// # Errors
 ///
 /// Returns a relay-origin, relay-upgrade, inner TLS, mux, or HTTP error.
@@ -594,38 +600,42 @@ mod tests {
         );
     }
 
-    // Falsified by checking the TLS error before the recorded relay close: this assertion then
-    // receives TlsAccessDenied instead of the relay outcome that must retain precedence.
+    // Falsified by checking the TLS error before the recorded relay close: a relay that closed
+    // the tunnel would be reported as a journal certificate refusal.
     #[test]
-    fn recorded_relay_termination_precedes_inner_access_denied() {
+    fn recorded_relay_termination_precedes_a_dial_time_refusal() {
         let termination = RelayTerminationHandle::new();
         termination.record_close_for_test(4401);
         let error = io::Error::new(
             io::ErrorKind::InvalidData,
-            rustls::Error::AlertReceived(rustls::AlertDescription::AccessDenied),
+            rustls::Error::InvalidCertificate(rustls::CertificateError::Other(rustls::OtherError(
+                Arc::new(crate::tls::JournalIdentityMismatch { jid: None }),
+            ))),
         );
 
         assert!(matches!(
             inner_handshake_error(&termination, &error),
             TransportError::Relay(RelayError::Unauthorized)
         ));
+        assert!(matches!(
+            inner_handshake_error(&RelayTerminationHandle::new(), &error),
+            TransportError::UnknownJournal(crate::UnknownJournal {
+                address: None,
+                jid: None
+            })
+        ));
     }
 
-    // AC2(b). Falsified by checking the TLS error before the recorded relay close: this
-    // assertion then receives TlsCertificateUnknown instead of the relay outcome that
-    // must retain precedence.
+    // A dial-time alert is not the journal's verdict, with or without a relay close.
     #[test]
-    fn recorded_relay_termination_precedes_inner_certificate_unknown() {
-        let termination = RelayTerminationHandle::new();
-        termination.record_close_for_test(4401);
+    fn a_dial_time_alert_is_not_named_over_the_relay() {
         let error = io::Error::new(
             io::ErrorKind::InvalidData,
-            rustls::Error::AlertReceived(rustls::AlertDescription::CertificateUnknown),
+            rustls::Error::AlertReceived(rustls::AlertDescription::AccessDenied),
         );
-
         assert!(matches!(
-            inner_handshake_error(&termination, &error),
-            TransportError::Relay(_)
+            inner_handshake_error(&RelayTerminationHandle::new(), &error),
+            TransportError::Tls(_)
         ));
     }
 }

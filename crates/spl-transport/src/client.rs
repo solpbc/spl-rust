@@ -17,7 +17,7 @@ use crate::observe::{
 };
 use crate::relay::{RelayTerminationHandle, dial_relay_carrier};
 use crate::relay_token::{RefreshOutcome, refresh_device_token};
-use crate::{RelayError, TransportError, tls};
+use crate::{RelayError, TransportError, prefer_refusal, tls};
 
 /// Relay transient retry count. Mirrors the LAN connection/handshake retry bound.
 const RELAY_MAX_TRANSIENT_ATTEMPTS: usize = 5;
@@ -204,9 +204,48 @@ pub struct TransportClient {
     pub(crate) token_persist: Option<TokenPersistHook>,
     pub(crate) publication: Option<TokenPublication>,
     pub(crate) relay_ineligible: Arc<AtomicBool>,
+    /// Peers that answered where the paired journal was expected but are not
+    /// it, one per address (`None` for the relay).
+    pub(crate) unknown_journals: Arc<std::sync::Mutex<Vec<crate::UnknownJournal>>>,
 }
 
 impl TransportClient {
+    /// Peers that answered where the paired journal was expected but are not
+    /// it: a different journal holding a saved address, or this journal after
+    /// its CA changed. One entry per address, in the order first seen. An
+    /// address's entry stays until a later dial to that same address reaches
+    /// the paired journal, even while another address or the relay works, so
+    /// an owner can be told.
+    #[must_use]
+    pub fn unknown_journals(&self) -> Vec<crate::UnknownJournal> {
+        self.unknown_journals
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    /// Record one dial's outcome at `address` (`None` for the relay) for
+    /// [`Self::unknown_journals`].
+    pub(crate) fn note_dial(&self, address: Option<&str>, result: Result<(), &TransportError>) {
+        let mut sightings = self
+            .unknown_journals
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match result {
+            Err(TransportError::UnknownJournal(unknown)) => {
+                match sightings
+                    .iter_mut()
+                    .find(|seen| seen.address == unknown.address)
+                {
+                    Some(seen) => seen.clone_from(unknown),
+                    None => sightings.push(unknown.clone()),
+                }
+            }
+            Ok(()) => sightings.retain(|seen| seen.address.as_deref() != address),
+            Err(_) => {}
+        }
+    }
+
     /// Build the transport client and its mutual-TLS configuration.
     ///
     /// # Errors
@@ -370,6 +409,7 @@ impl TransportClient {
             token_persist,
             publication,
             relay_ineligible: Arc::new(AtomicBool::new(false)),
+            unknown_journals: Arc::default(),
         })
     }
 
@@ -380,12 +420,14 @@ impl TransportClient {
     /// [`TransportClient::open_carrier`] or [`TransportClient::request`] for
     /// fence-coordinated access.
     ///
-    /// A newly paired fingerprint can take a moment to reach every journal
-    /// worker because the listener fans out across `SO_REUSEPORT` processes.
-    /// Direct connection and handshake failures therefore retain the bounded
-    /// linear retry before relay fallback, except a received TLS access-denied
-    /// (49) or certificate-unknown (46) alert, which returns immediately
-    /// without another endpoint, retry, or relay fallback.
+    /// Direct connection and handshake failures retain a bounded linear retry
+    /// before relay fallback. A TLS alert received while dialing is not the
+    /// journal's verdict (it checks the client certificate after this dial
+    /// completes) and is retried like any handshake failure. A peer whose
+    /// certificate is not the paired journal's is reported as
+    /// [`TransportError::UnknownJournal`] unless another endpoint gives a more
+    /// specific answer, and is kept in [`Self::unknown_journals`]. The journal's
+    /// own verdict on this device arrives on the carrier, after this returns.
     ///
     /// # Errors
     ///
@@ -437,7 +479,12 @@ impl TransportClient {
         for attempt in 0..MAX_ATTEMPTS {
             for endpoint in &self.credential.endpoints {
                 note_dial_attempt(observer);
-                match dial_tls(self.config.clone(), &endpoint.host, endpoint.port).await {
+                let dialed = dial_tls(self.config.clone(), &endpoint.host, endpoint.port).await;
+                self.note_dial(
+                    Some(&crate::endpoint_address(&endpoint.host, endpoint.port)),
+                    dialed.as_ref().map(|_| ()),
+                );
+                match dialed {
                     Ok(stream) => {
                         note_direct_success(observer);
                         note_selected_path(observer, crate::request::SelectedPath::Direct);
@@ -446,17 +493,15 @@ impl TransportClient {
                             kind: CarrierKind::Lan,
                         });
                     }
-                    Err(
-                        error @ (TransportError::TlsAccessDenied
-                        | TransportError::TlsCertificateUnknown),
-                    ) => {
-                        return Err(CarrierOpenError::Transport(error));
-                    }
-                    Err(error) => last_err = Some(error),
+                    Err(error) => last_err = Some(prefer_refusal(last_err.take(), error)),
                 }
             }
             match &last_err {
-                Some(TransportError::Tls(_) | TransportError::Io(_)) => {
+                Some(
+                    TransportError::Tls(_)
+                    | TransportError::UnknownJournal(_)
+                    | TransportError::Io(_),
+                ) => {
                     tokio::time::sleep(Duration::from_millis(250 * (attempt as u64 + 1))).await;
                 }
                 _ => break,
@@ -466,7 +511,10 @@ impl TransportClient {
         let lan_err = last_err.unwrap_or(TransportError::NoEndpoint);
         let lan_unreachable = matches!(
             lan_err,
-            TransportError::Tls(_) | TransportError::Io(_) | TransportError::NoEndpoint
+            TransportError::Tls(_)
+                | TransportError::UnknownJournal(_)
+                | TransportError::Io(_)
+                | TransportError::NoEndpoint
         );
         if !lan_unreachable {
             return Err(CarrierOpenError::Transport(lan_err));
@@ -668,7 +716,9 @@ impl TransportClient {
             note_dial_attempt(observer);
 
             let token = self.current_token().await;
-            match dial_relay_carrier(self.config.clone(), origin, instance_id, &token).await {
+            let dialed = dial_relay_carrier(self.config.clone(), origin, instance_id, &token).await;
+            self.note_dial(None, dialed.as_ref().map(|_| ()));
+            match dialed {
                 Ok(carrier) => {
                     note_relay_success(observer);
                     note_selected_path(observer, crate::request::SelectedPath::Relay);
@@ -815,6 +865,7 @@ mod tests {
             token_persist: None,
             publication: None,
             relay_ineligible: Arc::new(AtomicBool::new(false)),
+            unknown_journals: Arc::default(),
         }
     }
 
@@ -899,93 +950,14 @@ mod tests {
         }
     }
 
-    // Falsified by restoring the previous generic error assignment in the inner endpoint loop:
-    // the second listener accepts a connection, proving the terminal alert did not stop dialing.
+    // A TLS 1.3 journal checks the client certificate after the client's handshake completes, so
+    // an alert received while dialing comes from a peer that has not proven it is the journal and
+    // is never its verdict. This covers only that such an alert does not end the dial: the healthy
+    // second endpoint is still reached. `a_dial_time_alert_is_an_unclassified_tls_error` covers
+    // its classification.
     #[tokio::test]
-    async fn access_denied_stops_before_later_direct_endpoint() {
-        let (first, first_task) = scripted_alert_listener(49).await;
-        let later = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
-        let later_endpoint = EndpointAddr {
-            host: "127.0.0.1".into(),
-            port: later.local_addr().unwrap().port(),
-        };
-        let (later_accept_tx, mut later_accept_rx) = oneshot::channel();
-        let later_task = tokio::spawn(async move {
-            let (stream, _) = later.accept().await.unwrap();
-            drop(stream);
-            let _ = later_accept_tx.send(());
-        });
-        let client = test_client(vec![first, later_endpoint]);
-
-        assert!(matches!(
-            client.dial_carrier().await,
-            Err(TransportError::TlsAccessDenied)
-        ));
-        first_task.await.unwrap();
-        assert!(
-            tokio::time::timeout(Duration::from_millis(50), &mut later_accept_rx)
-                .await
-                .is_err()
-        );
-        later_task.abort();
-    }
-
-    // Protocol: `.proto-ref/session.md`, lines 191-195. Falsified by restoring the
-    // last_err-overwrite branch in dial_carrier (dropping the 46 short-circuit): the
-    // later LAN listener accepts and the counted relay listener accepts.
-    #[tokio::test]
-    async fn certificate_unknown_stops_before_later_endpoint_and_relay() {
-        let (first, first_task) = scripted_alert_listener(46).await;
-        let later = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
-        let later_endpoint = EndpointAddr {
-            host: "127.0.0.1".into(),
-            port: later.local_addr().unwrap().port(),
-        };
-        let (later_accept_tx, mut later_accept_rx) = oneshot::channel();
-        let later_task = tokio::spawn(async move {
-            let (stream, _) = later.accept().await.unwrap();
-            drop(stream);
-            let _ = later_accept_tx.send(());
-        });
-        let relay = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
-        let relay_origin = format!("http://{}", relay.local_addr().unwrap());
-        let (relay_accept_tx, mut relay_accept_rx) = oneshot::channel();
-        let relay_task = tokio::spawn(async move {
-            let (stream, _) = relay.accept().await.unwrap();
-            drop(stream);
-            let _ = relay_accept_tx.send(());
-        });
-        let client = test_client_with_relay(
-            vec![first, later_endpoint],
-            relay_origin,
-            "test-token".into(),
-        );
-
-        assert!(matches!(
-            client.dial_carrier().await,
-            Err(TransportError::TlsCertificateUnknown)
-        ));
-        first_task.await.unwrap();
-        assert!(
-            tokio::time::timeout(Duration::from_millis(50), &mut later_accept_rx)
-                .await
-                .is_err()
-        );
-        assert!(
-            tokio::time::timeout(Duration::from_millis(50), &mut relay_accept_rx)
-                .await
-                .is_err()
-        );
-        later_task.abort();
-        relay_task.abort();
-    }
-
-    // Falsified by changing the classifier to treat every received alert as terminal: the healthy
-    // second endpoint is never reached. The pre-feature source has no classifier, so this test
-    // can only fail there at compile time; its behavioral falsification targets overbroad changes.
-    #[tokio::test]
-    async fn unclassified_alerts_continue_to_later_endpoint() {
-        for description in [80, 200] {
+    async fn dial_time_alerts_are_not_verdicts() {
+        for description in [49, 46, 80, 200] {
             let (first, first_task) = scripted_alert_listener(description).await;
             let (second, accepted) = healthy_tls_listener().await;
             let client = test_client(vec![first, second]);
@@ -996,87 +968,231 @@ mod tests {
             accepted.await.unwrap();
         }
     }
+
+    // A peer whose certificate does not chain to the pinned CA, such as a journal that
+    // regenerated its CA or another journal at a saved address, is named with its address and
+    // journal ID. Falsified by leaving pin failures as a generic `Tls(String)`.
     #[tokio::test]
-    async fn open_carrier_tls_access_denied_short_circuits() {
-        let (first, first_task) = scripted_alert_listener(49).await;
-        let later = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
-        let later_endpoint = EndpointAddr {
+    async fn a_peer_that_is_not_the_journal_is_an_unknown_journal() {
+        let (endpoint, _accepted) = healthy_tls_listener().await;
+        let config = Arc::new(tls::pairing_config(&[0xAA; 16]).unwrap());
+        match crate::connection::dial_tls(config, &endpoint.host, endpoint.port).await {
+            Err(TransportError::UnknownJournal(unknown)) => {
+                assert_eq!(
+                    unknown.address,
+                    Some(format!("127.0.0.1:{}", endpoint.port))
+                );
+                assert!(unknown.jid.is_some());
+            }
+            Err(other) => panic!("expected an unknown journal, got {other:?}"),
+            Ok(_) => panic!("expected an unknown journal, got a connection"),
+        }
+    }
+
+    // Falsified by classifying dial-time alerts: a peer that has not authenticated could then
+    // unpair the device (49) or advance its refusal count.
+    #[tokio::test]
+    async fn a_dial_time_alert_is_an_unclassified_tls_error() {
+        for description in [49, 46, 80, 48, 200] {
+            let (endpoint, task) = scripted_alert_listener(description).await;
+            let config = Arc::new(tls::trust_all_pairing_config().unwrap());
+            assert!(
+                matches!(
+                    crate::connection::dial_tls(config, &endpoint.host, endpoint.port).await,
+                    Err(TransportError::Tls(_))
+                ),
+                "alert {description}"
+            );
+            task.await.unwrap();
+        }
+    }
+
+    fn test_ca() -> (rcgen::Certificate, KeyPair) {
+        let key = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).unwrap();
+        let mut params = CertificateParams::new(Vec::<String>::new()).unwrap();
+        params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        params.key_usages.push(rcgen::KeyUsagePurpose::KeyCertSign);
+        params
+            .key_usages
+            .push(rcgen::KeyUsagePurpose::DigitalSignature);
+        (params.self_signed(&key).unwrap(), key)
+    }
+
+    /// A server leaf signed by `ca`, valid now unless `expired`.
+    fn test_leaf(
+        ca: &rcgen::Certificate,
+        ca_key: &KeyPair,
+        expired: bool,
+    ) -> (CertificateDer<'static>, PrivateKeyDer<'static>) {
+        let key = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).unwrap();
+        let mut params = CertificateParams::new(vec!["spl.local".into()]).unwrap();
+        params
+            .extended_key_usages
+            .push(rcgen::ExtendedKeyUsagePurpose::ServerAuth);
+        if expired {
+            params.not_before = rcgen::date_time_ymd(2001, 1, 1);
+            params.not_after = rcgen::date_time_ymd(2002, 1, 1);
+        }
+        let leaf = params.signed_by(&key, ca, ca_key).unwrap();
+        (
+            CertificateDer::from(leaf.der().to_vec()),
+            PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key.serialize_der())),
+        )
+    }
+
+    /// A listener presenting `chain` once.
+    async fn chain_listener(
+        chain: Vec<CertificateDer<'static>>,
+        key: PrivateKeyDer<'static>,
+    ) -> EndpointAddr {
+        let config = rustls::ServerConfig::builder_with_provider(Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_no_client_auth()
+        .with_single_cert(chain, key)
+        .unwrap();
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let endpoint = EndpointAddr {
             host: "127.0.0.1".into(),
-            port: later.local_addr().unwrap().port(),
+            port: listener.local_addr().unwrap().port(),
         };
-        let (later_accept_tx, mut later_accept_rx) = oneshot::channel();
-        let later_task = tokio::spawn(async move {
-            let (stream, _) = later.accept().await.unwrap();
-            drop(stream);
-            let _ = later_accept_tx.send(());
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let _ = TlsAcceptor::from(Arc::new(config)).accept(stream).await;
         });
-        let client = test_client(vec![first, later_endpoint]);
+        endpoint
+    }
+
+    // The paired journal's own certificate outside its dates (or a client clock that is off) is a
+    // failure to connect, not another journal. Falsified by attributing every failed binding to
+    // another peer: the owner is told a different journal holds their journal's address.
+    #[tokio::test]
+    async fn the_paired_journals_expired_certificate_is_not_an_unknown_journal() {
+        let (ca, ca_key) = test_ca();
+        let ca_der = CertificateDer::from(ca.der().to_vec());
+        let pin = spl_core::ca::sha256(ca_der.as_ref())[..16].to_vec();
+        let (leaf, key) = test_leaf(&ca, &ca_key, true);
+        let endpoint = chain_listener(vec![leaf, ca_der.clone()], key).await;
+        let mut client = test_client(vec![endpoint.clone()]);
+        client.config = Arc::new(tls::pairing_config(&pin).unwrap());
+        let dialed =
+            crate::connection::dial_tls(client.config.clone(), &endpoint.host, endpoint.port).await;
+        client.note_dial(
+            Some(&crate::endpoint_address(&endpoint.host, endpoint.port)),
+            dialed.as_ref().map(|_| ()),
+        );
+        assert!(
+            matches!(dialed, Err(TransportError::Tls(_))),
+            "{:?}",
+            dialed.err()
+        );
+        assert_eq!(client.unknown_journals(), Vec::new());
+
+        // The same CA with a certificate it never signed is not the paired journal.
+        let (other, other_key) = test_ca();
+        let (foreign_leaf, foreign_key) = test_leaf(&other, &other_key, false);
+        let endpoint = chain_listener(vec![foreign_leaf, ca_der], foreign_key).await;
+        let config = Arc::new(tls::pairing_config(&pin).unwrap());
+        match crate::connection::dial_tls(config, &endpoint.host, endpoint.port).await {
+            Err(TransportError::UnknownJournal(unknown)) => assert_eq!(unknown.jid, None),
+            Err(other) => panic!("expected an unknown journal, got {other:?}"),
+            Ok(_) => panic!("expected an unknown journal, got a connection"),
+        }
+    }
+
+    // Falsified by reading the peer's identity from its leaf rather than its CA: the reported
+    // journal ID is not the one the relay and pairing use.
+    #[tokio::test]
+    async fn an_unknown_journal_is_named_by_its_ca() {
+        let (ca, ca_key) = test_ca();
+        let ca_der = CertificateDer::from(ca.der().to_vec());
+        let expected = spl_core::relay_window::jid_from_spki(
+            &spl_core::ca::extract_spki_der(ca_der.as_ref()).unwrap(),
+        )
+        .unwrap();
+        let (leaf, key) = test_leaf(&ca, &ca_key, false);
+        let endpoint = chain_listener(vec![leaf, ca_der], key).await;
+        let config = Arc::new(tls::pairing_config(&[0xAA; 16]).unwrap());
+        match crate::connection::dial_tls(config, &endpoint.host, endpoint.port).await {
+            Err(TransportError::UnknownJournal(unknown)) => {
+                assert_eq!(unknown.jid, Some(expected));
+            }
+            Err(other) => panic!("expected an unknown journal, got {other:?}"),
+            Ok(_) => panic!("expected an unknown journal, got a connection"),
+        }
+    }
+
+    // Falsified by keeping only the last endpoint's error: the closed second endpoint hides the
+    // first endpoint's unknown journal and the dial reports an outage.
+    #[tokio::test]
+    async fn an_unknown_journal_is_not_hidden_by_a_later_unreachable_endpoint() {
+        let (refusing, _accepted) = healthy_tls_listener().await;
+        let closed = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let closed_endpoint = EndpointAddr {
+            host: "127.0.0.1".into(),
+            port: closed.local_addr().unwrap().port(),
+        };
+        drop(closed);
+        let mut client = test_client(vec![refusing, closed_endpoint]);
+        client.config = Arc::new(tls::pairing_config(&[0xAA; 16]).unwrap());
 
         assert!(matches!(
-            client.open_carrier(None).await,
-            Err(CarrierOpenError::Transport(TransportError::TlsAccessDenied))
+            client.dial_carrier().await,
+            Err(TransportError::UnknownJournal(_))
         ));
-        first_task.await.unwrap();
-        assert!(
-            tokio::time::timeout(Duration::from_millis(50), &mut later_accept_rx)
-                .await
-                .is_err()
-        );
-        later_task.abort();
+        assert_eq!(client.unknown_journals().len(), 1);
     }
 
     #[tokio::test]
-    async fn open_carrier_tls_certificate_unknown_short_circuits() {
-        let (first, first_task) = scripted_alert_listener(46).await;
-        let later = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
-        let later_endpoint = EndpointAddr {
-            host: "127.0.0.1".into(),
-            port: later.local_addr().unwrap().port(),
-        };
-        let (later_accept_tx, mut later_accept_rx) = oneshot::channel();
-        let later_task = tokio::spawn(async move {
-            let (stream, _) = later.accept().await.unwrap();
-            drop(stream);
-            let _ = later_accept_tx.send(());
-        });
-        let relay = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
-        let relay_origin = format!("http://{}", relay.local_addr().unwrap());
-        let (relay_accept_tx, mut relay_accept_rx) = oneshot::channel();
-        let relay_task = tokio::spawn(async move {
-            let (stream, _) = relay.accept().await.unwrap();
-            drop(stream);
-            let _ = relay_accept_tx.send(());
-        });
-        let client = test_client_with_relay(
-            vec![first, later_endpoint],
-            relay_origin,
-            "test-token".into(),
-        );
-
+    async fn a_closed_endpoint_is_not_a_refusal() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        let config = Arc::new(tls::trust_all_pairing_config().unwrap());
         assert!(matches!(
-            client.open_carrier(None).await,
-            Err(CarrierOpenError::Transport(
-                TransportError::TlsCertificateUnknown
-            ))
+            crate::connection::dial_tls(config, "127.0.0.1", port).await,
+            Err(TransportError::Io(_))
         ));
-        first_task.await.unwrap();
-        assert!(
-            tokio::time::timeout(Duration::from_millis(50), &mut later_accept_rx)
-                .await
-                .is_err()
-        );
-        assert!(
-            tokio::time::timeout(Duration::from_millis(50), &mut relay_accept_rx)
-                .await
-                .is_err()
-        );
-        later_task.abort();
-        relay_task.abort();
     }
 
+    // Falsified by trusting dial-time 49 or 46: the client stops before the relay is tried.
     #[tokio::test]
-    async fn open_carrier_unclassified_alerts_continue_to_later_endpoint() {
-        for description in [80, 200] {
+    async fn a_dial_time_alert_does_not_keep_the_client_off_the_relay() {
+        for description in [49, 46] {
+            let (first, first_task) = scripted_alert_listener(description).await;
+            let relay = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+            let relay_origin = format!("http://{}", relay.local_addr().unwrap());
+            let (relay_accept_tx, relay_accept_rx) = oneshot::channel();
+            let relay_task = tokio::spawn(async move {
+                let (stream, _) = relay.accept().await.unwrap();
+                drop(stream);
+                let _ = relay_accept_tx.send(());
+            });
+            let client = test_client_with_relay(vec![first], relay_origin, "test-token".into());
+
+            let result = client.dial_carrier().await;
+            assert!(
+                !matches!(
+                    result,
+                    Err(TransportError::TlsAccessDenied | TransportError::TlsCertificateUnknown)
+                ),
+                "alert {description}"
+            );
+            first_task.await.unwrap();
+            tokio::time::timeout(Duration::from_secs(10), relay_accept_rx)
+                .await
+                .expect("relay reached")
+                .unwrap();
+            relay_task.abort();
+        }
+    }
+
+    // The fenced path does not end on a dial-time alert either; classification is covered above.
+    #[tokio::test]
+    async fn open_carrier_dial_time_alerts_are_not_verdicts() {
+        for description in [49, 46, 80, 200] {
             let (first, first_task) = scripted_alert_listener(description).await;
             let (second, accepted) = healthy_tls_listener().await;
             let client = test_client(vec![first, second]);

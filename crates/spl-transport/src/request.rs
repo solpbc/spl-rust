@@ -13,13 +13,13 @@ use spl_core::mux::MAX_ASSEMBLED_BYTES;
 use crate::client::{
     RefreshAction, RelayPermit, TransportClient, now_secs, relay_fault_is_transient_err,
 };
-use crate::connection::{dial_tls, run_request_over_stream_with_options};
+use crate::connection::{RefusalNaming, dial_tls, run_request_over_stream_with_options};
 use crate::observe::{
     OperationObserver, note_dial_attempt, note_direct_success, note_relay_success,
     note_selected_path,
 };
 use crate::relay::dial_relay_carrier;
-use crate::{RelayError, TransportError};
+use crate::{RelayError, TransportError, prefer_refusal};
 
 const MAX_ATTEMPTS: usize = 5;
 const RELAY_MAX_TRANSIENT_ATTEMPTS: usize = 5;
@@ -85,6 +85,10 @@ pub enum RequestError {
     #[error(transparent)]
     Transport(#[from] TransportError),
     /// Request failed after write was initiated and cannot be safely replayed under [`ReplayPolicy::ForbidAfterWrite`].
+    ///
+    /// A journal's refusal other than access denied or certificate unknown
+    /// arrives here once the request was written; see
+    /// [`RequestError::transport_error`].
     #[error("request failed after write was initiated and cannot be safely replayed: {0}")]
     ReplayUnsafe(TransportError),
     /// Local relay fence disabled. This is a local lifecycle gate denial, never a remote unauthorized error.
@@ -99,6 +103,63 @@ pub enum RequestError {
     /// Token publication indeterminate ([`crate::client::TokenCommit::Indeterminate`]); client is marked relay-ineligible.
     #[error("token publication indeterminate; client relay-ineligible")]
     PublicationIndeterminate,
+}
+
+/// A relay that closed the tunnel keeps precedence over a TLS refusal read
+/// through it, as on the carrier path.
+fn relay_close_first(error: TransportError, relay: Option<RelayError>) -> TransportError {
+    match (&error, relay) {
+        (
+            TransportError::TlsAccessDenied
+            | TransportError::TlsCertificateUnknown
+            | TransportError::TlsRefused,
+            Some(relay),
+        ) => TransportError::Relay(relay),
+        _ => error,
+    }
+}
+
+impl RequestError {
+    /// The transport error behind this request error, whether or not the
+    /// request is safe to replay.
+    ///
+    /// Classify refusals from this, not from [`RequestError::Transport`] alone:
+    /// under [`ReplayPolicy::ForbidAfterWrite`] a counted refusal arrives as
+    /// [`RequestError::ReplayUnsafe`], and a tracker fed only the other variant
+    /// never reaches its limit.
+    #[must_use]
+    pub fn transport_error(&self) -> Option<&TransportError> {
+        match self {
+            Self::Transport(error) | Self::ReplayUnsafe(error) => Some(error),
+            Self::RelayDisabled
+            | Self::RelayRetired
+            | Self::PublicationRejected
+            | Self::PublicationIndeterminate => None,
+        }
+    }
+}
+
+/// End the request on an over-cap response or on the journal's refusal of this
+/// device; hand any other error back to the caller.
+///
+/// Every endpoint and the relay reach the same journal, so its refusal is the
+/// answer. Access denied (49) and certificate unknown (46) come only from the
+/// journal's check of this device's certificate, before it reads anything, so
+/// they are never a replay hazard. Any other refusal alert proves nothing about
+/// whether the journal read the request (a corrupted record after it ran the
+/// request also ends in one), so after a write it keeps the replay guarantee.
+fn end_on_refusal(
+    error: TransportError,
+    write_started: bool,
+) -> Result<TransportError, RequestError> {
+    match error {
+        TransportError::TlsRefused if write_started => Err(RequestError::ReplayUnsafe(error)),
+        TransportError::Mux(spl_core::mux::MuxError::CapExceeded)
+        | TransportError::TlsAccessDenied
+        | TransportError::TlsCertificateUnknown
+        | TransportError::TlsRefused => Err(RequestError::Transport(error)),
+        other => Ok(other),
+    }
 }
 
 fn check_fence(publication: Option<&crate::client::TokenPublication>) -> Result<(), RequestError> {
@@ -119,7 +180,12 @@ impl TransportClient {
     /// transmission has begun under [`ReplayPolicy::ForbidAfterWrite`]. Returns
     /// [`RequestError::RelayDisabled`] or [`RequestError::RelayRetired`] if the local
     /// fence prevents relay access, or [`RequestError::Transport`] for network, TLS,
-    /// HTTP, or mux failures.
+    /// HTTP, or mux failures. A journal's refusal of this device is
+    /// [`TransportError::TlsAccessDenied`], [`TransportError::TlsCertificateUnknown`]
+    /// or [`TransportError::TlsRefused`]; the last arrives as
+    /// [`RequestError::ReplayUnsafe`] once the request was written under
+    /// [`ReplayPolicy::ForbidAfterWrite`]. Use [`RequestError::transport_error`] to
+    /// classify either.
     #[expect(
         clippy::too_many_lines,
         reason = "request handles LAN iteration, fallback, fence checks, and relay retry in one coherent method"
@@ -141,15 +207,15 @@ impl TransportClient {
                 attempts += 1;
                 note_dial_attempt(options.observer);
 
-                match dial_tls(self.config.clone(), &endpoint.host, endpoint.port).await {
-                    Err(error) => match error {
-                        TransportError::TlsAccessDenied | TransportError::TlsCertificateUnknown => {
-                            return Err(RequestError::Transport(error));
-                        }
-                        _ => {
-                            last_lan_err = Some(error);
-                        }
-                    },
+                let dialed = dial_tls(self.config.clone(), &endpoint.host, endpoint.port).await;
+                self.note_dial(
+                    Some(&crate::endpoint_address(&endpoint.host, endpoint.port)),
+                    dialed.as_ref().map(|_| ()),
+                );
+                match dialed {
+                    Err(error) => {
+                        last_lan_err = Some(prefer_refusal(last_lan_err.take(), error));
+                    }
                     Ok(stream) => {
                         let write_initiated = AtomicBool::new(false);
                         match run_request_over_stream_with_options(
@@ -161,6 +227,7 @@ impl TransportClient {
                             options.response_cap,
                             options.observer,
                             &write_initiated,
+                            RefusalNaming::BeforeFirstData,
                         )
                         .await
                         {
@@ -174,20 +241,13 @@ impl TransportClient {
                                 });
                             }
                             Err(error) => {
-                                if matches!(
-                                    error,
-                                    TransportError::Mux(spl_core::mux::MuxError::CapExceeded)
-                                        | TransportError::TlsAccessDenied
-                                        | TransportError::TlsCertificateUnknown
-                                ) {
-                                    return Err(RequestError::Transport(error));
-                                }
-                                if write_initiated.load(Ordering::Acquire)
-                                    && options.replay == ReplayPolicy::ForbidAfterWrite
-                                {
+                                let write_started = write_initiated.load(Ordering::Acquire)
+                                    && options.replay == ReplayPolicy::ForbidAfterWrite;
+                                let error = end_on_refusal(error, write_started)?;
+                                if write_started {
                                     return Err(RequestError::ReplayUnsafe(error));
                                 }
-                                last_lan_err = Some(error);
+                                last_lan_err = Some(prefer_refusal(last_lan_err.take(), error));
                             }
                         }
                     }
@@ -195,7 +255,11 @@ impl TransportClient {
             }
 
             match &last_lan_err {
-                Some(TransportError::Tls(_) | TransportError::Io(_)) => {
+                Some(
+                    TransportError::Tls(_)
+                    | TransportError::UnknownJournal(_)
+                    | TransportError::Io(_),
+                ) => {
                     if attempt + 1 < MAX_ATTEMPTS {
                         tokio::time::sleep(Duration::from_millis(250 * (attempt as u64 + 1))).await;
                     }
@@ -207,7 +271,10 @@ impl TransportClient {
         let lan_err = last_lan_err.unwrap_or(TransportError::NoEndpoint);
         let lan_unreachable = matches!(
             lan_err,
-            TransportError::Tls(_) | TransportError::Io(_) | TransportError::NoEndpoint
+            TransportError::Tls(_)
+                | TransportError::UnknownJournal(_)
+                | TransportError::Io(_)
+                | TransportError::NoEndpoint
         );
         if !lan_unreachable {
             return Err(RequestError::Transport(lan_err));
@@ -268,9 +335,12 @@ impl TransportClient {
             attempts += 1;
             note_dial_attempt(options.observer);
 
-            match dial_relay_carrier(self.config.clone(), origin, instance_id, &token).await {
+            let dialed = dial_relay_carrier(self.config.clone(), origin, instance_id, &token).await;
+            self.note_dial(None, dialed.as_ref().map(|_| ()));
+            match dialed {
                 Ok(carrier) => {
                     let write_initiated = AtomicBool::new(false);
+                    let termination = carrier.termination;
                     match run_request_over_stream_with_options(
                         carrier.stream,
                         method,
@@ -280,6 +350,7 @@ impl TransportClient {
                         options.response_cap,
                         options.observer,
                         &write_initiated,
+                        RefusalNaming::BeforeFirstData,
                     )
                     .await
                     {
@@ -293,15 +364,11 @@ impl TransportClient {
                             });
                         }
                         Err(error) => {
-                            if matches!(
-                                error,
-                                TransportError::Mux(spl_core::mux::MuxError::CapExceeded)
-                            ) {
-                                return Err(RequestError::Transport(error));
-                            }
-                            if write_initiated.load(Ordering::Acquire)
-                                && options.replay == ReplayPolicy::ForbidAfterWrite
-                            {
+                            let error = relay_close_first(error, termination.current_error());
+                            let write_started = write_initiated.load(Ordering::Acquire)
+                                && options.replay == ReplayPolicy::ForbidAfterWrite;
+                            let error = end_on_refusal(error, write_started)?;
+                            if write_started {
                                 return Err(RequestError::ReplayUnsafe(error));
                             }
                             if relay_fault_is_transient_err(&error)
@@ -361,5 +428,50 @@ impl TransportClient {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn transport_error_reads_through_either_variant() {
+        assert!(matches!(
+            RequestError::Transport(TransportError::TlsRefused).transport_error(),
+            Some(TransportError::TlsRefused)
+        ));
+        assert!(matches!(
+            RequestError::ReplayUnsafe(TransportError::TlsRefused).transport_error(),
+            Some(TransportError::TlsRefused)
+        ));
+        assert!(RequestError::RelayDisabled.transport_error().is_none());
+    }
+
+    // Falsified by naming the refusal first: a relay that closed the tunnel would be reported as
+    // the journal refusing this device.
+    #[test]
+    fn a_recorded_relay_close_precedes_a_refusal_read_through_it() {
+        for refusal in [
+            TransportError::TlsAccessDenied,
+            TransportError::TlsCertificateUnknown,
+            TransportError::TlsRefused,
+        ] {
+            assert!(matches!(
+                relay_close_first(refusal, Some(RelayError::Unauthorized)),
+                TransportError::Relay(RelayError::Unauthorized)
+            ));
+        }
+        assert!(matches!(
+            relay_close_first(TransportError::TlsRefused, None),
+            TransportError::TlsRefused
+        ));
+        assert!(matches!(
+            relay_close_first(
+                TransportError::Io(std::io::Error::from(std::io::ErrorKind::BrokenPipe)),
+                Some(RelayError::Abnormal)
+            ),
+            TransportError::Io(_)
+        ));
     }
 }

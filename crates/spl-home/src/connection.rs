@@ -9,6 +9,7 @@ use std::pin::Pin;
 use std::sync::atomic::{AtomicU8, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, Waker};
+use std::time::Duration;
 
 use rustls::ServerConfig;
 use spl_core::frame::RECOMMENDED_CHUNK;
@@ -24,6 +25,29 @@ use crate::{
 const STREAM_LIVE: u8 = 0;
 const STREAM_RESET: u8 = 1;
 const STREAM_GONE: u8 = 2;
+
+/// Longest a refused carrier waits for its dialer to hang up.
+const REFUSAL_LINGER: Duration = Duration::from_secs(2);
+
+/// Close a carrier whose handshake failed so the dialer can read why.
+///
+/// A dialer writes its first request as soon as its side of a TLS 1.3
+/// handshake completes, before this side has checked its certificate. Dropping
+/// a socket that still holds those unread bytes resets the connection, and a
+/// reset can discard the refusal alert before the dialer, or a relay leg
+/// forwarding for it, reads it. So end this side's writes and read until the
+/// dialer hangs up, for at most [`REFUSAL_LINGER`].
+async fn close_after_refusal<S>(mut io: S)
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let _ = tokio::time::timeout(REFUSAL_LINGER, async {
+        let _ = io.shutdown().await;
+        let mut discard = vec![0u8; 16 * 1024];
+        while matches!(io.read(&mut discard).await, Ok(count) if count > 0) {}
+    })
+    .await;
+}
 
 /// Publishes the driver's acceptor tally for a caller on the other side.
 #[derive(Debug, Default)]
@@ -148,6 +172,9 @@ impl StreamStatus {
 impl HomeConnection {
     /// Complete the inner TLS handshake over an arbitrary asynchronous carrier.
     ///
+    /// A refused handshake returns up to 2 s later than the refusal, while the
+    /// carrier lingers so the dialer can read why; bound the call accordingly.
+    ///
     /// # Errors
     ///
     /// Returns [`HomeError::Tls`] when the handshake fails, or a configuration
@@ -169,7 +196,13 @@ impl HomeConnection {
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
         let server = TlsAcceptor::from(Arc::new(server_config));
-        let tls = server.accept(io).await.map_err(|_| HomeError::Tls)?;
+        let tls = match server.accept(io).into_fallible().await {
+            Ok(tls) => tls,
+            Err((_, io)) => {
+                close_after_refusal(io).await;
+                return Err(HomeError::Tls);
+            }
+        };
         let acceptor = MuxAcceptor::new(limits)?;
         let (accept_tx, accept_rx) = mpsc::unbounded_channel();
         let (command_tx, command_rx) = mpsc::unbounded_channel();

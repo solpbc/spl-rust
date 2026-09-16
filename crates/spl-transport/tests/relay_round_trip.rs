@@ -1380,6 +1380,85 @@ async fn home_relay_attachment_forwards_bytes_and_observes_stream_close() {
     relay.abort();
 }
 
+// Protocol: `.proto-ref/session.md` § 7. A home relay client that refuses a device must deliver
+// the refusal through the tunnel. Falsified by dropping the refused carrier at once: the alert is
+// still queued in the unflushed tunnel socket, and the dialer sees the tunnel close with no alert.
+#[tokio::test]
+async fn home_relay_delivers_its_refusal_to_the_dialer() {
+    let relay_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let relay_origin = format!("http://{}", relay_listener.local_addr().unwrap());
+    let (mobile_sender, mobile_receiver) = tokio::sync::oneshot::channel();
+    let relay = tokio::spawn(async move {
+        let (listen_tcp, _) = relay_listener.accept().await.unwrap();
+        let mut listen = accept_async(listen_tcp).await.unwrap();
+        listen
+            .send(Message::Text(
+                r#"{"type":"incoming","tunnel_id":"refused"}"#.into(),
+            ))
+            .await
+            .unwrap();
+        let (tunnel_tcp, _) = relay_listener.accept().await.unwrap();
+        let tunnel = accept_async(tunnel_tcp).await.unwrap();
+        let (relay_side, mobile_side) = tokio::io::duplex(2 * 1024 * 1024);
+        mobile_sender.send(mobile_side).unwrap();
+        let _ = pump_ws(tunnel, relay_side, None).await;
+        let _ = listen.next().await;
+    });
+    let fixture = home_tls_fixture();
+    let mut home = home_config(&fixture);
+    home.client_cert_verifier = Arc::new(RefusingClientVerifier(
+        rustls::CertificateError::ApplicationVerificationFailure,
+    ));
+    let client = HomeRelayClient::new(HomeRelayClientConfig {
+        relay_origin,
+        service_token: ServiceToken::new("test-service-token".into()),
+        home_config: home,
+        app_port: 1,
+        dispatch_read_deadline: Duration::from_secs(1),
+        admission_ceiling: std::num::NonZeroUsize::new(1).unwrap(),
+        jitter: Arc::new(FixedRelayJitter),
+        events: Arc::new(TestRelayEvents),
+    });
+    let running = tokio::spawn({
+        let client = client.clone();
+        async move { client.run().await }
+    });
+    let mobile_io = tokio::time::timeout(Duration::from_secs(1), mobile_receiver)
+        .await
+        .expect("home must open the signaled tunnel")
+        .unwrap();
+    let config = mtls_config(
+        &spl_core::ca::sha256(fixture.ca.as_ref())[..16],
+        fixture.client_chain,
+        fixture.client_key,
+    )
+    .unwrap();
+    let mut mobile = TlsConnector::from(Arc::new(config))
+        .connect(ServerName::try_from("spl.local").unwrap(), mobile_io)
+        .await
+        .unwrap();
+    let mut byte = [0_u8; 1];
+    let verdict = tokio::time::timeout(Duration::from_secs(5), mobile.read(&mut byte))
+        .await
+        .expect("the dialer must hear the refusal");
+    let alert = verdict.as_ref().err().and_then(|error| {
+        error
+            .get_ref()
+            .and_then(|error| error.downcast_ref::<rustls::Error>())
+            .cloned()
+    });
+    assert_eq!(
+        alert,
+        Some(rustls::Error::AlertReceived(
+            rustls::AlertDescription::AccessDenied
+        )),
+        "{verdict:?}"
+    );
+    client.stop().await;
+    running.abort();
+    relay.abort();
+}
+
 #[tokio::test]
 async fn stopped_home_relay_ignores_incoming_without_opening_a_tunnel() {
     let relay_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1802,48 +1881,180 @@ async fn relay_fallbacks_after_lan_unreachable() {
     relay.abort();
 }
 
-// Falsified by restoring generic inner-handshake formatting: this result becomes Tls(_) rather
-// than the terminal variant even though the relay delivers a real TLS access-denied alert.
-#[tokio::test]
-async fn relay_inner_access_denied_is_terminal() {
-    let (pin, acceptor) = tls_pair_with_pin();
-    let now = epoch_secs();
-    let token = mint_jwt(now, now + 10_000);
-    let relay = spawn_combined_relay(acceptor, CombinedWsMode::InnerAlert(49), token.clone()).await;
-    let client = transport_client(relay_credential(pin, 9, relay.origin.clone(), token), None);
+/// A home that finishes its side of TLS 1.3 and then refuses the client certificate.
+#[derive(Debug)]
+struct RefusingClientVerifier(rustls::CertificateError);
 
-    assert!(matches!(
-        Box::pin(client.dial_carrier()).await,
-        Err(TransportError::TlsAccessDenied)
-    ));
-    assert_eq!(relay.state.ws_dials.load(Ordering::SeqCst), 1);
-    relay.abort();
+impl ClientCertVerifier for RefusingClientVerifier {
+    fn root_hint_subjects(&self) -> &[rustls::DistinguishedName] {
+        &[]
+    }
+
+    fn verify_client_cert(
+        &self,
+        _end_entity: &CertificateDer<'_>,
+        _intermediates: &[CertificateDer<'_>],
+        _now: rustls::pki_types::UnixTime,
+    ) -> Result<rustls::server::danger::ClientCertVerified, rustls::Error> {
+        Err(rustls::Error::InvalidCertificate(self.0.clone()))
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        _message: &[u8],
+        _cert: &CertificateDer<'_>,
+        _dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        _message: &[u8],
+        _cert: &CertificateDer<'_>,
+        _dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        rustls::crypto::ring::default_provider()
+            .signature_verification_algorithms
+            .supported_schemes()
+    }
 }
 
-// AC2(a). Protocol: `.proto-ref/session.md`, lines 181-185, 191-195. Falsified by
-// restoring generic inner-handshake formatting: this result becomes Tls(_) rather
-// than TlsCertificateUnknown even though the relay delivers a real TLS 46 alert.
-#[tokio::test]
-async fn relay_inner_certificate_unknown_is_typed() {
-    let (pin, acceptor) = tls_pair_with_pin();
-    let now = epoch_secs();
-    let token = mint_jwt(now, now + 10_000);
-    let relay = spawn_combined_relay(acceptor, CombinedWsMode::InnerAlert(46), token.clone()).await;
-    let client = transport_client(relay_credential(pin, 9, relay.origin.clone(), token), None);
-
-    assert!(matches!(
-        Box::pin(client.dial_carrier()).await,
-        Err(TransportError::TlsCertificateUnknown)
-    ));
-    assert_eq!(relay.state.ws_dials.load(Ordering::SeqCst), 1);
-    relay.abort();
+fn refusing_home_with_pin(error: rustls::CertificateError) -> (Vec<u8>, TlsAcceptor) {
+    let (cert, key) = self_signed();
+    let pin = spl_core::ca::sha256(cert.as_ref())[..16].to_vec();
+    let config =
+        ServerConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_client_cert_verifier(Arc::new(RefusingClientVerifier(error)))
+            .with_single_cert(vec![cert], key)
+            .unwrap();
+    (pin, TlsAcceptor::from(Arc::new(config)))
 }
 
-// Falsified by broadening received_tls_alert beyond descriptions 49 and 46: this result becomes
-// a named variant instead of preserving the existing generic Tls(_).
+// A home reached through the relay that is not the paired journal is named with no address and
+// the journal ID it presented, and the sighting stays on the client. Falsified by leaving a
+// relay pin failure unclassified, or by recording relay sightings under a direct address.
 #[tokio::test]
-async fn relay_inner_unclassified_alert_stays_tls() {
-    for description in [80, 200] {
+#[expect(
+    clippy::large_futures,
+    reason = "the copied transport future keeps its established stack layout; this site goes red if a later refactor shrinks it"
+)]
+async fn relay_request_names_a_home_that_is_not_the_journal() {
+    let (other_cert, other_key) = self_signed();
+    let other_jid = spl_core::relay_window::jid_from_spki(
+        &spl_core::ca::extract_spki_der(other_cert.as_ref()).unwrap(),
+    )
+    .unwrap();
+    let acceptor = TlsAcceptor::from(Arc::new(server_config(other_cert, other_key)));
+    let (paired, _) = self_signed();
+    let pin = spl_core::ca::sha256(paired.as_ref())[..16].to_vec();
+    let now = epoch_secs();
+    let token = mint_jwt(now, now + 10_000);
+    let relay = spawn_combined_relay(acceptor, CombinedWsMode::AcceptAny, token.clone()).await;
+    let client = TransportClient::new_relay_only(
+        relay_only_credential(pin, relay.origin.clone(), token),
+        None,
+    )
+    .unwrap();
+    let expected = spl_transport::UnknownJournal {
+        address: None,
+        jid: Some(other_jid),
+    };
+
+    let err = client
+        .request(
+            "GET",
+            "/test",
+            &[],
+            b"",
+            spl_transport::RequestOptions::default(),
+        )
+        .await
+        .unwrap_err();
+    match err {
+        spl_transport::RequestError::Transport(TransportError::UnknownJournal(unknown)) => {
+            assert_eq!(unknown, expected);
+        }
+        other => panic!("expected an unknown journal, got {other:?}"),
+    }
+    assert_eq!(client.unknown_journals(), vec![expected]);
+}
+
+// Protocol: `.proto-ref/session.md` § 7. A home's refusal read through the relay proves the
+// request was never read, so access denied is reported as the refusal itself, never as a replay
+// hazard. Any other refusal proves nothing about that and keeps the replay guarantee. Falsified by
+// applying the replay check first (access denied returns as `ReplayUnsafe`) or by dropping it for
+// the other refusals.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[expect(
+    clippy::large_futures,
+    reason = "the copied transport future keeps its established stack layout; this site goes red if a later refactor shrinks it"
+)]
+async fn relay_request_reports_a_home_refusal_as_itself() {
+    for (error, expected, body_len) in [
+        (
+            rustls::CertificateError::ApplicationVerificationFailure,
+            "tls_access_denied",
+            0,
+        ),
+        (rustls::CertificateError::UnknownIssuer, "tls_refused", 0),
+        // A refused upload: the home closes while the body is still being written.
+        (
+            rustls::CertificateError::ApplicationVerificationFailure,
+            "tls_access_denied",
+            900 * 1024,
+        ),
+    ] {
+        let (pin, acceptor) = refusing_home_with_pin(error);
+        let now = epoch_secs();
+        let token = mint_jwt(now, now + 10_000);
+        let relay = spawn_combined_relay(acceptor, CombinedWsMode::AcceptAny, token.clone()).await;
+        let mut credential = relay_credential(pin, 9, relay.origin.clone(), token);
+        credential.endpoints.clear();
+        let client = TransportClient::new_relay_only(credential, None).unwrap();
+
+        let body = vec![0x5a; body_len];
+        let method = if body.is_empty() { "GET" } else { "POST" };
+        let err = client
+            .request(
+                method,
+                "/test",
+                &[],
+                &body,
+                spl_transport::RequestOptions::default(),
+            )
+            .await
+            .unwrap_err();
+        let code = match (&err, expected) {
+            (spl_transport::RequestError::ReplayUnsafe(error), "tls_refused")
+            | (spl_transport::RequestError::Transport(error), "tls_access_denied") => {
+                Some(transport_error_code(error))
+            }
+            _ => None,
+        };
+        assert_eq!(
+            code.as_deref(),
+            Some(expected),
+            "{body_len}-byte body: {err:?}"
+        );
+        assert_eq!(relay.state.ws_dials.load(Ordering::SeqCst), 1);
+        relay.abort();
+    }
+}
+
+// The relay pipe carries the inner handshake unauthenticated until the journal has proven its
+// certificate, and a TLS 1.3 journal's verdict on ours arrives only after the dial. An alert read
+// during the inner dial is therefore not a verdict. Falsified by trusting it: 49 would stop the
+// device as unpaired and any other code would count as a refusal.
+#[tokio::test]
+async fn relay_inner_dial_time_alerts_are_not_verdicts() {
+    for description in [49, 46, 80, 200] {
         let (pin, acceptor) = tls_pair_with_pin();
         let now = epoch_secs();
         let token = mint_jwt(now, now + 10_000);

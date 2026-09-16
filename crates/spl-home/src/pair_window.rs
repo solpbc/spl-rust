@@ -164,6 +164,8 @@ impl PairWindow {
     ///
     /// Refusals happen before the handshake so carrier bytes cannot distinguish
     /// local refusal causes, preserving the oracle-safety requirement in line 85.
+    /// A handshake that fails after admission returns up to 2 s later, as in
+    /// [`HomeConnection::accept`](crate::HomeConnection::accept).
     ///
     /// # Errors
     ///

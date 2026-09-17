@@ -103,7 +103,7 @@ fn protocol_mirror_has_exact_pinned_contents() -> Result<(), Box<dyn Error>> {
         ),
         (
             "session.md",
-            "eaaff1ef0e2c6df200aa2c1778dc4669573f8bd9f77c69863e5b6fcecafdd83f",
+            "8f8afa29f1dd1de63654475a79dacd407e343178241c08772f6d1fb62396819a",
         ),
         (
             "tokens.md",

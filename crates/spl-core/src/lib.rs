@@ -51,6 +51,7 @@ pub mod crockford;
 pub mod frame;
 pub mod http;
 pub mod jwt;
+pub mod mark;
 pub mod mux;
 pub mod pairlink;
 pub mod relay;

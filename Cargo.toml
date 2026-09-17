@@ -42,11 +42,17 @@ spl-home = { path = "crates/spl-home", version = "0.1.0" }
 # correctness-and-review-surface choice first (one audited provider across every
 # consumer, no aws-lc-rs C toolchain in the graph); the smaller binary is a
 # consequence, not the reason.
+# argon2 backs the journal-mark derivation (`spl-core::mark`), matching the
+# version `solstone-journal` already runs server-side; pure Rust, no C build
+# script, so it does not disturb spl-core's cross-target `cargo check` purity
+# proof.
+argon2 = "0.5.3"
 base64 = { version = "0.22", default-features = false, features = ["std"] }
 ed25519-dalek = { version = "2.1", default-features = false, features = ["pkcs8"] }
 futures-util = { version = "0.3", default-features = false, features = ["sink"] }
 getrandom = "0.2"
 hkdf = "0.12"
+indexmap = { version = "2.14", features = ["serde"] }
 jsonwebtoken = { version = "11", default-features = false, features = ["rust_crypto"] }
 p256 = { version = "0.13.2", default-features = false, features = ["arithmetic", "pkcs8", "alloc"] }
 ppp = "2.3"

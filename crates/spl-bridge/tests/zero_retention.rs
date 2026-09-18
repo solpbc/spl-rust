@@ -28,7 +28,8 @@ use spl_bridge::pop_auth::{
 };
 use spl_bridge::registry::Registry;
 use spl_bridge::{
-    DEFAULT_ADMISSION_DEADLINE, run_client_listener, run_control_listener, server_tls_config,
+    DEFAULT_ADMISSION_DEADLINE, TokioControlConnector, run_client_listener, run_control_listener,
+    server_tls_config,
 };
 use spl_core::frame::{FLAG_OPEN, FrameDecoder};
 use spl_home::{MuxAcceptor, MuxEvent, MuxLimits};
@@ -87,11 +88,16 @@ async fn fragmented_reserved_client_hello_and_pipelined_tail_reach_control_uncha
     let control_address = control_listener.local_addr().unwrap();
     let client_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let client_address = client_listener.local_addr().unwrap();
+    let (_, shutdown_rx) = tokio::sync::watch::channel(false);
     let client_task = tokio::spawn(run_client_listener(
         client_listener,
         Registry::default(),
         control_address,
+        None,
         Duration::from_secs(1),
+        TokioControlConnector,
+        TokioControlConnector,
+        shutdown_rx,
     ));
 
     let hello = fragment_client_hello(&client_hello(RESERVED_CONTROL_SNI), 0x51a7_2c3d);
@@ -142,11 +148,16 @@ async fn reserved_name_bypasses_a_maliciously_seeded_registry_entry() {
     let control_address = control_listener.local_addr().unwrap();
     let client_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let client_address = client_listener.local_addr().unwrap();
+    let (_, shutdown_rx) = tokio::sync::watch::channel(false);
     let client_task = tokio::spawn(run_client_listener(
         client_listener,
         registry,
         control_address,
+        None,
         Duration::from_secs(1),
+        TokioControlConnector,
+        TokioControlConnector,
+        shutdown_rx,
     ));
 
     let expected = client_hello(RESERVED_CONTROL_SNI);
@@ -197,6 +208,10 @@ async fn reserved_sni_completes_real_pop_registration_through_the_public_listene
 }
 
 #[tokio::test(flavor = "current_thread")]
+#[expect(
+    clippy::too_many_lines,
+    reason = "integration test exercises full pipeline from listener to scratch retention scan"
+)]
 async fn listener_splice_keeps_payload_out_of_logs_and_scratch_files() {
     let logs = LogBuffer(Arc::new(Mutex::new(Vec::new())));
     let subscriber = tracing_subscriber::fmt()
@@ -224,18 +239,25 @@ async fn listener_splice_keeps_payload_out_of_logs_and_scratch_files() {
     let control_address = control_listener.local_addr().unwrap();
     let client_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let client_address = client_listener.local_addr().unwrap();
+    let (_, shutdown_rx1) = tokio::sync::watch::channel(false);
+    let (_, shutdown_rx2) = tokio::sync::watch::channel(false);
     let control_task = tokio::spawn(run_control_listener(
         control_listener,
         tls_config,
         registry.clone(),
         authenticator,
         DEFAULT_ADMISSION_DEADLINE,
+        shutdown_rx1,
     ));
     let client_task = tokio::spawn(run_client_listener(
         client_listener,
         registry.clone(),
         control_address,
+        None,
         Duration::from_secs(1),
+        TokioControlConnector,
+        TokioControlConnector,
+        shutdown_rx2,
     ));
 
     let issued_at = u64::try_from(unix_seconds()).unwrap();
@@ -488,18 +510,25 @@ async fn start_bridge(
     let client_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let client_address = client_listener.local_addr().unwrap();
     let authenticator = PopAuthenticator::new(Arc::new(verifier), String::from(BRIDGE_ID));
+    let (_, shutdown_rx1) = tokio::sync::watch::channel(false);
+    let (_, shutdown_rx2) = tokio::sync::watch::channel(false);
     let task = tokio::spawn(run_control_listener(
         control_listener,
         tls_config,
         registry.clone(),
         authenticator,
         admission_deadline,
+        shutdown_rx1,
     ));
     let client_task = tokio::spawn(run_client_listener(
         client_listener,
         registry,
         control_address,
+        None,
         admission_deadline,
+        TokioControlConnector,
+        TokioControlConnector,
+        shutdown_rx2,
     ));
     (client_address, certificate, task, client_task)
 }

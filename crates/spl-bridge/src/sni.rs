@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (c) 2026 sol pbc
 
-//! Bounded, non-consuming SNI extraction from a TLS `ClientHello`.
+//! Bounded, non-consuming SNI and ALPN extraction from a TLS `ClientHello`.
 
 use std::time::Duration;
 
@@ -13,6 +13,7 @@ const INCOMPLETE_RETRY_DELAY: Duration = Duration::from_millis(10);
 const TLS_HANDSHAKE: u8 = 0x16;
 const CLIENT_HELLO: u8 = 0x01;
 const SERVER_NAME_EXTENSION: u16 = 0;
+const ALPN_EXTENSION: u16 = 16;
 const HOST_NAME: u8 = 0;
 
 /// Default limit for waiting on a complete client TLS `ClientHello`.
@@ -21,6 +22,15 @@ const HOST_NAME: u8 = 0;
 /// or slowloris connection before the listener has enough information to route
 /// it.
 pub const DEFAULT_READ_DEADLINE: Duration = Duration::from_secs(5);
+
+/// Parsed routing metadata extracted from a client TLS `ClientHello`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClientHelloRouting {
+    /// The extracted SNI hostname.
+    pub hostname: String,
+    /// Whether the ALPN extension includes the `acme-tls/1` protocol.
+    pub acme_tls_alpn: bool,
+}
 
 /// Bounds applied while reassembling a TLS `ClientHello` across TLS records.
 ///
@@ -42,7 +52,7 @@ const CLIENT_HELLO_LIMITS: ClientHelloLimits = ClientHelloLimits {
     encoded_wire_bytes: 196_608,
 };
 
-/// Errors returned while extracting a TLS SNI hostname.
+/// Errors returned while extracting TLS routing information.
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum SniError {
     /// The `ClientHello` did not become complete before the supplied deadline.
@@ -59,24 +69,27 @@ pub enum SniError {
     Io,
 }
 
-/// Extract the first `host_name` SNI value from a TLS `ClientHello` without consuming it.
+/// Extract the first `host_name` SNI value and `acme-tls/1` ALPN presence from a TLS `ClientHello` without consuming it.
 ///
 /// The listener can subsequently splice the untouched `ClientHello` to either
-/// the selected journal tunnel or the internal control listener. `deadline`
-/// applies to the whole peek-and-parse operation rather than to each
+/// the selected journal tunnel, the internal control listener, or the local ACME target.
+/// `deadline` applies to the whole peek-and-parse operation rather than to each
 /// individual socket readiness wait.
 ///
 /// # Errors
 ///
 /// Returns an error when the `ClientHello` is malformed, has no SNI value, does
 /// not complete before `deadline`, or the socket cannot be peeked.
-pub async fn extract_sni(stream: &TcpStream, deadline: Duration) -> Result<String, SniError> {
+pub async fn extract_sni(
+    stream: &TcpStream,
+    deadline: Duration,
+) -> Result<ClientHelloRouting, SniError> {
     tokio::time::timeout(deadline, extract_sni_inner(stream))
         .await
         .map_err(|_| SniError::Timeout)?
 }
 
-async fn extract_sni_inner(stream: &TcpStream) -> Result<String, SniError> {
+async fn extract_sni_inner(stream: &TcpStream) -> Result<ClientHelloRouting, SniError> {
     let mut capacity = INITIAL_PEEK_BYTES;
     loop {
         let mut bytes = vec![0u8; capacity];
@@ -86,7 +99,7 @@ async fn extract_sni_inner(stream: &TcpStream) -> Result<String, SniError> {
         }
 
         match parse_client_hello(&bytes[..received])? {
-            ParseOutcome::Complete(hostname) => return Ok(hostname),
+            ParseOutcome::Complete(routing) => return Ok(routing),
             ParseOutcome::Incomplete if capacity == CLIENT_HELLO_LIMITS.encoded_wire_bytes => {
                 return Err(SniError::MalformedClientHello);
             }
@@ -104,8 +117,9 @@ async fn extract_sni_inner(stream: &TcpStream) -> Result<String, SniError> {
     }
 }
 
+#[derive(Debug)]
 enum ParseOutcome {
-    Complete(String),
+    Complete(ClientHelloRouting),
     Incomplete,
 }
 
@@ -194,7 +208,7 @@ fn parse_client_hello_with_limits(
     }
 }
 
-fn parse_client_hello_body(body: &[u8]) -> Result<String, SniError> {
+fn parse_client_hello_body(body: &[u8]) -> Result<ClientHelloRouting, SniError> {
     let mut cursor = Cursor::new(body);
     cursor.skip(2)?;
     cursor.skip(32)?;
@@ -212,15 +226,33 @@ fn parse_client_hello_body(body: &[u8]) -> Result<String, SniError> {
 
     let mut extensions = Cursor::new(extensions);
     let mut hostname = None;
+    let mut seen_sni = false;
+    let mut seen_alpn = false;
+    let mut acme_tls_alpn = false;
+
     while !extensions.is_empty() {
         let extension_type = extensions.u16()?;
         let extension_length = extensions.u16()?;
         let extension_data = extensions.take(usize::from(extension_length))?;
-        if extension_type == SERVER_NAME_EXTENSION && hostname.is_none() {
+        if extension_type == SERVER_NAME_EXTENSION {
+            if seen_sni {
+                return Err(SniError::MalformedClientHello);
+            }
+            seen_sni = true;
             hostname = Some(parse_server_name(extension_data)?);
+        } else if extension_type == ALPN_EXTENSION {
+            if seen_alpn {
+                return Err(SniError::MalformedClientHello);
+            }
+            seen_alpn = true;
+            acme_tls_alpn = parse_alpn_for_acme(extension_data)?;
         }
     }
-    hostname.ok_or(SniError::NoServerName)
+    let hostname = hostname.ok_or(SniError::NoServerName)?;
+    Ok(ClientHelloRouting {
+        hostname,
+        acme_tls_alpn,
+    })
 }
 
 fn parse_server_name(data: &[u8]) -> Result<String, SniError> {
@@ -249,6 +281,26 @@ fn parse_server_name(data: &[u8]) -> Result<String, SniError> {
         }
     }
     hostname.ok_or(SniError::NoServerName)
+}
+
+fn parse_alpn_for_acme(data: &[u8]) -> Result<bool, SniError> {
+    let mut cursor = Cursor::new(data);
+    let alpn_list_length = cursor.u16()?;
+    let protocols = cursor.take(usize::from(alpn_list_length))?;
+    if !cursor.is_empty() {
+        return Err(SniError::MalformedClientHello);
+    }
+
+    let mut protocols = Cursor::new(protocols);
+    let mut has_acme = false;
+    while !protocols.is_empty() {
+        let length = usize::from(protocols.u8()?);
+        let proto = protocols.take(length)?;
+        if proto == b"acme-tls/1" {
+            has_acme = true;
+        }
+    }
+    Ok(has_acme)
 }
 
 struct Cursor<'a> {
@@ -321,6 +373,10 @@ mod tests {
     }
 
     fn client_hello(hostname: &str, grease: bool) -> Vec<u8> {
+        client_hello_with_alpn(hostname, grease, &[])
+    }
+
+    fn client_hello_with_alpn(hostname: &str, grease: bool, alpns: &[&[u8]]) -> Vec<u8> {
         let mut extensions = Vec::new();
         if grease {
             extension(&mut extensions, 0x0a0a, &[]);
@@ -333,6 +389,17 @@ mod tests {
         push_u16(&mut server_name, names.len().try_into().unwrap());
         server_name.extend_from_slice(&names);
         extension(&mut extensions, SERVER_NAME_EXTENSION, &server_name);
+        if !alpns.is_empty() {
+            let mut alpn_data = Vec::new();
+            let mut total_protos = Vec::new();
+            for alpn in alpns {
+                total_protos.push(alpn.len() as u8);
+                total_protos.extend_from_slice(alpn);
+            }
+            push_u16(&mut alpn_data, total_protos.len() as u16);
+            alpn_data.extend_from_slice(&total_protos);
+            extension(&mut extensions, ALPN_EXTENSION, &alpn_data);
+        }
         if grease {
             let mut groups = Vec::new();
             push_u16(&mut groups, 4);
@@ -421,8 +488,107 @@ mod tests {
             tokio::spawn(async move { extract_sni(&server, DEFAULT_READ_DEADLINE).await });
 
         client.write_all(&hello).await.unwrap();
-        assert_eq!(extraction.await.unwrap().unwrap(), "mcp.journal.test");
+        assert_eq!(
+            extraction.await.unwrap().unwrap(),
+            ClientHelloRouting {
+                hostname: String::from("mcp.journal.test"),
+                acme_tls_alpn: false,
+            }
+        );
         assert!(started.elapsed() < Duration::from_millis(250));
+    }
+
+    #[tokio::test]
+    async fn extracts_sni_and_acme_alpn() {
+        let (mut client, server) = tcp_pair().await;
+        let hello =
+            client_hello_with_alpn("bridge.solstone.me", false, &[b"http/1.1", b"acme-tls/1"]);
+        let extraction =
+            tokio::spawn(async move { extract_sni(&server, DEFAULT_READ_DEADLINE).await });
+
+        client.write_all(&hello).await.unwrap();
+        assert_eq!(
+            extraction.await.unwrap().unwrap(),
+            ClientHelloRouting {
+                hostname: String::from("bridge.solstone.me"),
+                acme_tls_alpn: true,
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn rejects_duplicate_sni_extensions() {
+        let mut extensions = Vec::new();
+        let mut names = Vec::new();
+        names.push(HOST_NAME);
+        push_u16(&mut names, 4);
+        names.extend_from_slice(b"test");
+        let mut server_name = Vec::new();
+        push_u16(&mut server_name, names.len().try_into().unwrap());
+        server_name.extend_from_slice(&names);
+        extension(&mut extensions, SERVER_NAME_EXTENSION, &server_name);
+        extension(&mut extensions, SERVER_NAME_EXTENSION, &server_name);
+
+        let mut body = Vec::new();
+        body.extend([0x03, 0x03]);
+        body.extend([0x55; 32]);
+        body.push(0);
+        push_u16(&mut body, 2);
+        body.extend([0x13, 0x01]);
+        body.extend([1, 0]);
+        push_u16(&mut body, extensions.len().try_into().unwrap());
+        body.extend_from_slice(&extensions);
+
+        let mut handshake = vec![CLIENT_HELLO];
+        push_u24(&mut handshake, body.len());
+        handshake.extend_from_slice(&body);
+        let mut record = vec![TLS_HANDSHAKE, 0x03, 0x01];
+        push_u16(&mut record, handshake.len().try_into().unwrap());
+        record.extend_from_slice(&handshake);
+
+        assert_eq!(
+            parse_client_hello(&record).unwrap_err(),
+            SniError::MalformedClientHello
+        );
+    }
+
+    #[tokio::test]
+    async fn rejects_duplicate_alpn_extensions() {
+        let mut extensions = Vec::new();
+        let mut names = Vec::new();
+        names.push(HOST_NAME);
+        push_u16(&mut names, 4);
+        names.extend_from_slice(b"test");
+        let mut server_name = Vec::new();
+        push_u16(&mut server_name, names.len().try_into().unwrap());
+        server_name.extend_from_slice(&names);
+        extension(&mut extensions, SERVER_NAME_EXTENSION, &server_name);
+
+        let alpn_data = vec![0, 3, 2, b'h', b'2'];
+        extension(&mut extensions, ALPN_EXTENSION, &alpn_data);
+        extension(&mut extensions, ALPN_EXTENSION, &alpn_data);
+
+        let mut body = Vec::new();
+        body.extend([0x03, 0x03]);
+        body.extend([0x55; 32]);
+        body.push(0);
+        push_u16(&mut body, 2);
+        body.extend([0x13, 0x01]);
+        body.extend([1, 0]);
+        push_u16(&mut body, extensions.len().try_into().unwrap());
+        body.extend_from_slice(&extensions);
+
+        let mut handshake = vec![CLIENT_HELLO];
+        push_u24(&mut handshake, body.len());
+        handshake.extend_from_slice(&body);
+        let mut record = vec![TLS_HANDSHAKE, 0x03, 0x01];
+        push_u16(&mut record, handshake.len().try_into().unwrap());
+        record.extend_from_slice(&handshake);
+
+        assert_eq!(
+            parse_client_hello(&record).unwrap_err(),
+            SniError::MalformedClientHello
+        );
     }
 
     #[tokio::test]
@@ -436,7 +602,13 @@ mod tests {
         client.write_all(&hello[..split]).await.unwrap();
         tokio::time::sleep(Duration::from_millis(20)).await;
         client.write_all(&hello[split..]).await.unwrap();
-        assert_eq!(extraction.await.unwrap().unwrap(), "mcp.journal.test");
+        assert_eq!(
+            extraction.await.unwrap().unwrap(),
+            ClientHelloRouting {
+                hostname: String::from("mcp.journal.test"),
+                acme_tls_alpn: false,
+            }
+        );
     }
 
     #[tokio::test]
@@ -447,7 +619,13 @@ mod tests {
             tokio::spawn(async move { extract_sni(&server, DEFAULT_READ_DEADLINE).await });
 
         client.write_all(&hello).await.unwrap();
-        assert_eq!(extraction.await.unwrap().unwrap(), "grease.journal.test");
+        assert_eq!(
+            extraction.await.unwrap().unwrap(),
+            ClientHelloRouting {
+                hostname: String::from("grease.journal.test"),
+                acme_tls_alpn: false,
+            }
+        );
     }
 
     #[tokio::test]
@@ -458,7 +636,13 @@ mod tests {
             tokio::spawn(async move { extract_sni(&server, DEFAULT_READ_DEADLINE).await });
 
         client.write_all(&hello).await.unwrap();
-        assert_eq!(extraction.await.unwrap().unwrap(), "record.journal.test");
+        assert_eq!(
+            extraction.await.unwrap().unwrap(),
+            ClientHelloRouting {
+                hostname: String::from("record.journal.test"),
+                acme_tls_alpn: false,
+            }
+        );
     }
 
     #[test]
@@ -499,7 +683,7 @@ mod tests {
         assert_eq!(records.len(), CLIENT_HELLO_LIMITS.encoded_wire_bytes);
         assert!(matches!(
             parse_client_hello(&records),
-            Ok(ParseOutcome::Complete(actual)) if actual == hostname
+            Ok(ParseOutcome::Complete(actual)) if actual.hostname == hostname && !actual.acme_tls_alpn
         ));
     }
 

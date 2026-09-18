@@ -1,0 +1,69 @@
+#!/usr/bin/env bash
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (c) 2026 sol pbc
+
+set -euo pipefail
+
+LOCK_FILE="${RENEW_LOCK_FILE:-/var/run/spl-bridge-renew.lock}"
+exec 200>"$LOCK_FILE"
+flock -n 200 || {
+    echo "spl-bridge-renew is already running; skipping concurrent run" >&2
+    exit 1
+}
+
+GENERATIONS_DIR="${GENERATIONS_DIR:-/var/lib/spl-bridge/generations}"
+LEGO="${LEGO:-lego}"
+ACTIVATE="${ACTIVATE:-spl-bridge-activate}"
+VERIFY_ADDR="${VERIFY_ADDR:-127.0.0.1:443}"
+RELOAD_CMD="${RELOAD_CMD:-systemctl reload spl-bridge}"
+LEGO_DIR="${LEGO_DIR:-/var/lib/spl-bridge/lego}"
+DOMAIN="bridge.solstone.me"
+ACME_PORT="${ACME_PORT:-127.0.0.1:5001}"
+EMAIL="${EMAIL:-EMAIL}"
+ACTIVATE_ARGS=(${ACTIVATE_ARGS:-})
+if [ -n "${ACTIVATE_ROOTS:-}" ]; then
+    ACTIVATE_ARGS+=(--control-tls-roots "$ACTIVATE_ROOTS")
+fi
+
+RUN_LEGO=1
+
+if [ -e "${GENERATIONS_DIR}/pending" ]; then
+    set +e
+    "$ACTIVATE" \
+        --generations-dir "$GENERATIONS_DIR" \
+        --verify-addr "$VERIFY_ADDR" \
+        --reload-cmd "$RELOAD_CMD" \
+        "${ACTIVATE_ARGS[@]}" \
+        --retry-pending
+    ACTIVATE_STATUS=$?
+    set -e
+
+    if [ "$ACTIVATE_STATUS" -eq 0 ]; then
+        exit 0
+    elif [ "$ACTIVATE_STATUS" -eq 2 ]; then
+        RUN_LEGO=1
+    else
+        exit "$ACTIVATE_STATUS"
+    fi
+fi
+
+if [ "$RUN_LEGO" -eq 1 ]; then
+    "$LEGO" \
+        --email "$EMAIL" \
+        --domains "$DOMAIN" \
+        --tls \
+        --tls.port "$ACME_PORT" \
+        --path "$LEGO_DIR" \
+        renew --days 30
+
+    ISSUED_CERT="${ISSUED_CERT:-${LEGO_DIR}/certificates/${DOMAIN}.crt}"
+    ISSUED_KEY="${ISSUED_KEY:-${LEGO_DIR}/certificates/${DOMAIN}.key}"
+
+    "$ACTIVATE" \
+        --issued-cert "$ISSUED_CERT" \
+        --issued-key "$ISSUED_KEY" \
+        --generations-dir "$GENERATIONS_DIR" \
+        --verify-addr "$VERIFY_ADDR" \
+        --reload-cmd "$RELOAD_CMD" \
+        "${ACTIVATE_ARGS[@]}"
+fi

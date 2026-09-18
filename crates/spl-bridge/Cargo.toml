@@ -17,12 +17,13 @@ getrandom = { workspace = true }
 ppp = { workspace = true }
 rustls = { workspace = true }
 rustls-pemfile = { workspace = true }
+rustls-webpki = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 spl-core = { workspace = true }
 thiserror = { workspace = true }
 socket2 = { workspace = true }
-tokio = { workspace = true, features = ["io-util", "rt", "sync", "macros", "net", "time"] }
+tokio = { workspace = true, features = ["io-util", "rt", "sync", "macros", "net", "time", "signal"] }
 tokio-rustls = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "registry", "std"] }
@@ -31,5 +32,5 @@ webpki-roots = { workspace = true }
 [dev-dependencies]
 rcgen = { workspace = true, features = ["x509-parser"] }
 spl-home = { path = "../spl-home", version = "0.1.0" }
-tokio = { workspace = true, features = ["rt-multi-thread", "macros", "io-util", "sync", "test-util", "time"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "io-util", "sync", "test-util", "time", "signal"] }
 tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "registry", "std"] }

@@ -36,6 +36,8 @@ const ALLOWED_BINARY_OPTIONS: &[&str] = &[
     "--bridge-id",
     "--jwks-connect-timeout-ms",
     "--jwks-read-timeout-ms",
+    "--acme-tls-alpn-target",
+    "--control-tls-roots",
 ];
 
 /// Paths discovered in each source-policy inventory class.
@@ -49,6 +51,8 @@ pub struct Inventory {
     pub manifest: Vec<PathBuf>,
     /// Files below the optional `deploy/` template directory.
     pub template: Vec<PathBuf>,
+    /// The build script, when present.
+    pub build_script: Vec<PathBuf>,
 }
 
 /// The complete result of scanning a bridge source corpus.
@@ -63,11 +67,17 @@ pub struct ScanResult {
 /// Scan every source-policy inventory class beneath `crate_root`.
 pub fn scan(crate_root: &Path, workspace_manifest: &Path) -> Result<ScanResult, std::io::Error> {
     let source_root = crate_root.join("src");
+    let build_script_path = crate_root.join("build.rs");
     let inventory = Inventory {
         library: rust_sources(&source_root, true)?,
         binary: rust_sources(&source_root.join("bin"), false)?,
         manifest: manifest_paths(crate_root),
         template: files_below(&crate_root.join("deploy"))?,
+        build_script: if build_script_path.is_file() {
+            vec![build_script_path]
+        } else {
+            Vec::new()
+        },
     };
     let mut result = ScanResult {
         inventory,
@@ -82,6 +92,10 @@ pub fn scan(crate_root: &Path, workspace_manifest: &Path) -> Result<ScanResult, 
     for path in &result.inventory.binary {
         let source = fs::read_to_string(path)?;
         check_binary_source(path, &source, &mut result.violations);
+    }
+    for path in &result.inventory.build_script {
+        let source = fs::read_to_string(path)?;
+        check_build_script_source(path, &source, &mut result.violations);
     }
     if let Some(manifest) = result.inventory.manifest.first() {
         check_manifest(&fs::read_to_string(manifest)?, &mut result.violations);
@@ -112,6 +126,7 @@ fn check_inventory_completeness(inventory: &Inventory, violations: &mut Vec<Stri
         ("library", &inventory.library),
         ("binary", &inventory.binary),
         ("manifest", &inventory.manifest),
+        ("build_script", &inventory.build_script),
     ] {
         if paths.is_empty() {
             violations.push(format!("required {class} inventory is empty"));
@@ -140,6 +155,22 @@ fn check_binary_source(path: &Path, source: &str, violations: &mut Vec<String>) 
     check_binary_state_inputs(path, source, violations);
 }
 
+fn check_build_script_source(path: &Path, source: &str, violations: &mut Vec<String>) {
+    for needle in [
+        "WindowedUpload",
+        "ResponseAssembler",
+        "spl_home::HomeConnection",
+        "spl_home::HomeStream",
+    ] {
+        if source.contains(needle) {
+            violations.push(format!(
+                "build script {} contains {needle:?}",
+                path.display()
+            ));
+        }
+    }
+}
+
 fn check_filesystem_access(
     path: &Path,
     source: &str,
@@ -154,7 +185,7 @@ fn check_filesystem_access(
             let call_start = start + namespace.len();
             let method_length = source[call_start..]
                 .bytes()
-                .take_while(u8::is_ascii_alphanumeric)
+                .take_while(|b| b.is_ascii_alphanumeric() || *b == b'_')
                 .count();
             let method_end = call_start + method_length;
             let Some(body) = call_body(&source[method_end..]) else {
@@ -168,12 +199,6 @@ fn check_filesystem_access(
             {
                 let count = control_read_counts.entry(control_read).or_insert(0usize);
                 *count += 1;
-                if *count > 1 {
-                    violations.push(format!(
-                        "duplicate startup filesystem access in {}",
-                        path.display()
-                    ));
-                }
             } else {
                 violations.push(format!("filesystem access in {}", path.display()));
             }
@@ -188,18 +213,25 @@ fn check_filesystem_access(
             let method_start = start + alias.len() + 2;
             let method_length = source[method_start..]
                 .bytes()
-                .take_while(u8::is_ascii_alphanumeric)
+                .take_while(|b| b.is_ascii_alphanumeric() || *b == b'_')
                 .count();
             let method_end = method_start + method_length;
-            if call_body(&source[method_end..]).is_some() {
-                violations.push(format!("aliased filesystem access in {}", path.display()));
+            if let Some(body) = call_body(&source[method_end..]) {
+                let method = &source[method_start..method_end];
+                if permit_control_reads
+                    && control_startup_read(path, &format!("{alias}::"), method, body).is_some()
+                {
+                    // permitted
+                } else {
+                    violations.push(format!("aliased filesystem access in {}", path.display()));
+                }
             }
             offset = method_end;
         }
     }
     if permit_control_reads && path.ends_with("src/bin/spl-bridge.rs") {
         for required in ["&options.control_tls_cert", "&options.control_tls_key"] {
-            if control_read_counts.get(required) != Some(&1) {
+            if control_read_counts.get(required).copied().unwrap_or(0) < 1 {
                 violations.push(format!(
                     "missing startup filesystem access in {}",
                     path.display()
@@ -215,14 +247,42 @@ fn control_startup_read<'a>(
     method: &str,
     body: &'a str,
 ) -> Option<&'a str> {
-    (path.ends_with("src/bin/spl-bridge.rs")
-        && namespace == "std::fs::"
+    if path.ends_with("src/bin/spl-bridge.rs")
+        && (namespace == "std::fs::" || namespace == "fs::")
         && method == "read"
+    {
+        let trimmed = body.trim();
+        if matches!(
+            trimmed,
+            "&options.control_tls_cert"
+                | "&options.control_tls_key"
+                | "&options.control_tls_roots"
+                | "roots_path"
+                | "&cert_path"
+                | "&key_path"
+        ) {
+            return Some(trimmed);
+        }
+        return None;
+    }
+    if path.ends_with("src/bin/spl-bridge-activate.rs")
+        && (namespace == "std::fs::" || namespace == "fs::" || namespace == "std::os::unix::fs::")
         && matches!(
-            body.trim(),
-            "&options.control_tls_cert" | "&options.control_tls_key"
-        ))
-    .then_some(body.trim())
+            method,
+            "read"
+                | "write"
+                | "rename"
+                | "create_dir_all"
+                | "remove_file"
+                | "remove_dir_all"
+                | "set_permissions"
+                | "read_link"
+                | "symlink"
+        )
+    {
+        return Some(body.trim());
+    }
+    None
 }
 
 fn filesystem_aliases(source: &str) -> BTreeMap<String, String> {
@@ -258,7 +318,10 @@ fn filesystem_aliases(source: &str) -> BTreeMap<String, String> {
 }
 
 fn is_filesystem_module(path: &str) -> bool {
-    matches!(path.trim(), "std::fs" | "tokio::fs")
+    matches!(
+        path.trim(),
+        "std::fs" | "tokio::fs" | "fs" | "std::os::unix::fs"
+    )
 }
 
 fn check_binary_state_inputs(path: &Path, source: &str, violations: &mut Vec<String>) {
@@ -295,11 +358,8 @@ fn check_binary_state_inputs(path: &Path, source: &str, violations: &mut Vec<Str
 }
 
 fn check_template(path: &Path, source: &str, violations: &mut Vec<String>) {
-    if path
-        .file_name()
-        .is_some_and(|name| name == "spl-bridge.service")
-    {
-        violations.push(format!("forbidden deployment service {}", path.display()));
+    if path.extension().is_some_and(|ext| ext == "md") {
+        return;
     }
     for forbidden in [
         "--control-listen",
@@ -312,6 +372,18 @@ fn check_template(path: &Path, source: &str, violations: &mut Vec<String>) {
         if source.contains(forbidden) {
             violations.push(format!(
                 "template {} contains {forbidden:?}",
+                path.display()
+            ));
+        }
+    }
+    for forbidden_renewal in [
+        "systemctl stop spl-bridge",
+        "systemctl restart spl-bridge",
+        "ExecStop",
+    ] {
+        if path.to_string_lossy().contains("renew") && source.contains(forbidden_renewal) {
+            violations.push(format!(
+                "renewal template {} contains forbidden stop/restart directive {forbidden_renewal:?}",
                 path.display()
             ));
         }

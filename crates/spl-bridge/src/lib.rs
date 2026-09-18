@@ -25,6 +25,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Semaphore;
 use tokio_rustls::TlsAcceptor;
 
+pub mod control_cert;
 pub mod frame_dialer;
 mod lease;
 pub mod pop_auth;
@@ -32,6 +33,11 @@ pub mod proxy_protocol;
 pub mod registry;
 mod routed;
 pub mod sni;
+
+pub use control_cert::{
+    CertMaterialLoader, ClockFn, ControlCertError, ControlCertResolver, RESERVED_CONTROL_SNI,
+    ReloadCoordinator, UnixTime, control_server_tls_config, validate_control_certified_key,
+};
 
 /// Errors returned while configuring or operating the public bridge listeners.
 #[derive(Debug, Error)]
@@ -98,9 +104,15 @@ pub fn server_tls_config(
 /// Absolute time allowed for one journal control connection's admission.
 pub const DEFAULT_ADMISSION_DEADLINE: Duration = Duration::from_secs(10);
 
+/// Initial backoff delay after an accept failure.
+pub const INITIAL_ACCEPT_BACKOFF: Duration = Duration::from_millis(50);
+/// Maximum backoff delay cap after repeated accept failures.
+pub const MAX_ACCEPT_BACKOFF: Duration = Duration::from_secs(5);
+/// Maximum duration allowed for the bridge drain lifecycle before aborting connections.
+pub const DRAIN_BUDGET: Duration = Duration::from_secs(30);
+
 const MAX_SNI_ADMISSION_SLOTS: usize = 256;
 const CONTROL_SPLICE_CONNECT_DEADLINE: Duration = Duration::from_secs(3);
-const RESERVED_CONTROL_SNI: &str = "bridge.solstone.me";
 
 /// Absolute time a routed client waits for its journal's first response byte.
 ///
@@ -114,18 +126,6 @@ const RESERVED_CONTROL_SNI: &str = "bridge.solstone.me";
 /// never mistaken for an absent one.
 pub const ROUTED_FIRST_RESPONSE_DEADLINE: Duration = Duration::from_secs(10);
 
-/// 🔴 A journal's carrier is idle between lease renewals, and a NAT or load
-/// balancer on the path drops an idle flow mapping **silently** — no RST, no
-/// ICMP. Without a keepalive the bridge then writes a renewal challenge into a
-/// black hole while both ends still report ESTABLISHED, and it learns nothing
-/// until the lease expires. Measured 2026-09-02 on the field-journal
-/// deployment: `backoff:9`, ten retransmissions, 605 seconds with no bytes
-/// received, against a peer process that was alive the whole time.
-///
-/// ⚠ The journal side carries the same keepalive and is the load-bearing one —
-/// only traffic originated from inside a NAT refreshes that NAT's mapping.
-/// This half is what lets the *bridge* notice a dead carrier and retire the
-/// journal, rather than waiting out the lease.
 const CLIENT_KEEPALIVE_IDLE: Duration = Duration::from_secs(30);
 const CLIENT_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(10);
 const CLIENT_KEEPALIVE_RETRIES: u32 = 3;
@@ -144,55 +144,122 @@ fn hold_accepted_flow_open(stream: &TcpStream) {
     }
 }
 
-#[derive(Clone, Copy)]
-pub(crate) enum BridgeLogEvent {
+/// Fixed operational log events emitted by the bridge relay.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BridgeLogEvent {
+    /// Control listener successfully bound and started.
     ControlListenerStarted,
+    /// Control listener failed to accept an incoming TCP stream.
     ControlListenerAcceptFailed,
+    /// Control TLS handshake with journal rejected.
     ControlTlsHandshakeRejected,
+    /// Control certificate failed startup validation.
+    ControlCertificateStartupFailed,
+    /// Control certificate reload failed; keeping prior certificate.
+    ControlCertificateReloadFailed,
+    /// Journal `PoP` token rejected.
     JournalRegistrationTokenRejected,
+    /// JWKS unavailable during journal registration.
     JournalRegistrationJwksUnavailable,
+    /// Nonce outstanding capacity exceeded during registration.
     JournalRegistrationNonceOutstandingCapacity,
+    /// Nonce spent capacity exceeded during registration.
     JournalRegistrationNonceSpentCapacity,
+    /// Nonce generation failed during registration.
     JournalRegistrationNonceGenerationFailed,
+    /// Framing or proof rejected during registration.
     JournalRegistrationFramingOrProofRejected,
+    /// Registration admission deadline timed out.
     JournalRegistrationRejectedAdmissionTimeout,
+    /// Registration registry failure.
     JournalRegistrationRegistryFailed,
+    /// Journal successfully registered in memory.
     JournalRegistered,
+    /// Journal evicted from registry.
     JournalEvicted,
+    /// Registration admission deadline expired.
     JournalRegistrationAdmissionTimedOut,
+    /// Retryable lease renewal attempt failed.
     JournalLeaseRenewalRetryableAttemptFailed,
+    /// Lease renewal terminal poisoned error.
     JournalLeaseRenewalTerminalPoisoned,
+    /// Challenge frame undeliverable during renewal.
     JournalLeaseRenewalChallengeUndeliverable,
+    /// Challenge written during renewal.
     JournalLeaseRenewalChallengeWritten,
+    /// Response timed out during renewal.
     JournalLeaseRenewalResponseTimedOut,
+    /// Nonce outstanding capacity exceeded during renewal.
     JournalLeaseRenewalNonceOutstandingCapacity,
+    /// Nonce spent capacity exceeded during renewal.
     JournalLeaseRenewalNonceSpentCapacity,
+    /// Journal lease successfully renewed.
     JournalLeaseRenewed,
+    /// Journal lease expired by wall clock.
     JournalLeaseExpiredWallClock,
+    /// Client listener started.
     ClientListenerStarted,
+    /// Client listener failed to accept stream.
     ClientListenerAcceptFailed,
+    /// Client TCP keepalive could not be configured.
     ClientKeepaliveNotConfigured,
-    ClientRejectedBeforeRouting,
+    /// Client rejected due to admission capacity.
+    ClientRejectedCapacity,
+    /// Client rejected due to malformed `ClientHello`.
+    ClientRejectedInvalidClientHello,
+    /// Client rejected due to invalid host name.
+    ClientRejectedInvalidHostname,
+    /// Forwarding to ACME TLS-ALPN target failed.
+    ClientAcmeForwardFailed,
+    /// Configured ACME target address rejected.
+    AcmeTargetRejected,
+    /// Shutdown signal received; starting drain.
+    BridgeShutdownReceived,
+    /// Drain lifecycle timed out; aborting active connections.
+    BridgeDrainTimedOut,
+    /// Client rejected because journal is not registered.
     ClientRejectedWithoutJournalRegistration,
+    /// Client rejected because journal stream open failed.
     ClientRejectedJournalStreamOpen,
+    /// Building PROXY v1 header failed.
     ClientRejectedProxyHeaderBuild,
+    /// Writing PROXY v1 header failed.
     ClientRejectedProxyHeaderWrite,
+    /// Client rejected because journal is unresponsive.
     ClientRejectedJournalUnresponsive,
+    /// Journal retired because unresponsive.
     JournalRetiredUnresponsive,
+    /// Client connection routed to journal.
     ClientRoutedToJournal,
+    /// Client splice closed normally.
     ClientSpliceClosed,
+    /// Client splice closed with I/O error.
     ClientSpliceClosedWithIoError,
+    /// Control splice dial failed.
     ControlSpliceDialFailed,
+    /// Control splice dial timed out.
     ControlSpliceDialTimedOut,
+    /// Control splice connected.
     ControlSpliceConnected,
 }
 
 impl BridgeLogEvent {
-    pub(crate) fn emit(self) {
+    /// Emit this event using structured logging with fixed string literals.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "exhaustive mapping of log events to string literals"
+    )]
+    pub fn emit(self) {
         match self {
             Self::ControlListenerStarted => tracing::info!("control listener started"),
             Self::ControlListenerAcceptFailed => tracing::warn!("control listener accept failed"),
             Self::ControlTlsHandshakeRejected => tracing::warn!("control TLS handshake rejected"),
+            Self::ControlCertificateStartupFailed => {
+                tracing::warn!("control certificate startup validation failed");
+            }
+            Self::ControlCertificateReloadFailed => {
+                tracing::warn!("control certificate reload failed; keeping prior certificate");
+            }
             Self::JournalRegistrationTokenRejected => {
                 tracing::warn!("journal registration rejected: token rejection");
             }
@@ -252,7 +319,27 @@ impl BridgeLogEvent {
             Self::ClientKeepaliveNotConfigured => {
                 tracing::warn!("accepted connection could not be given a keepalive");
             }
-            Self::ClientRejectedBeforeRouting => tracing::warn!("client rejected before routing"),
+            Self::ClientRejectedCapacity => {
+                tracing::warn!("client rejected: admission capacity exceeded");
+            }
+            Self::ClientRejectedInvalidClientHello => {
+                tracing::warn!("client rejected: invalid client hello");
+            }
+            Self::ClientRejectedInvalidHostname => {
+                tracing::warn!("client rejected: invalid hostname");
+            }
+            Self::ClientAcmeForwardFailed => {
+                tracing::warn!("client acme forward failed");
+            }
+            Self::AcmeTargetRejected => {
+                tracing::warn!("acme target address rejected: must be loopback");
+            }
+            Self::BridgeShutdownReceived => {
+                tracing::info!("bridge shutdown signal received; starting drain");
+            }
+            Self::BridgeDrainTimedOut => {
+                tracing::warn!("bridge drain timed out; aborting active connections");
+            }
             Self::ClientRejectedWithoutJournalRegistration => {
                 tracing::warn!("client rejected without journal registration");
             }
@@ -283,12 +370,36 @@ impl BridgeLogEvent {
     }
 }
 
-trait ControlConnector: Clone + Send + Sync + 'static {
+/// Abstract provider for listener accept loops.
+pub trait AcceptProvider {
+    /// Accept one incoming stream and remote address.
+    fn accept(&mut self) -> impl Future<Output = io::Result<(TcpStream, SocketAddr)>> + Send;
+}
+
+/// Real TCP listener implementation of [`AcceptProvider`].
+pub struct TcpListenerAcceptor(pub TcpListener);
+
+impl AcceptProvider for TcpListenerAcceptor {
+    async fn accept(&mut self) -> io::Result<(TcpStream, SocketAddr)> {
+        self.0.accept().await
+    }
+}
+
+impl AcceptProvider for TcpListener {
+    async fn accept(&mut self) -> io::Result<(TcpStream, SocketAddr)> {
+        TcpListener::accept(self).await
+    }
+}
+
+/// Abstract TCP connector for control splices and ACME targets.
+pub trait ControlConnector: Clone + Send + Sync + 'static {
+    /// Connect to `target` asynchronously.
     fn connect(&self, target: SocketAddr) -> impl Future<Output = io::Result<TcpStream>> + Send;
 }
 
+/// Real TCP stream connector implementing [`ControlConnector`].
 #[derive(Clone, Copy)]
-struct TokioControlConnector;
+pub struct TokioControlConnector;
 
 impl ControlConnector for TokioControlConnector {
     async fn connect(&self, target: SocketAddr) -> io::Result<TcpStream> {
@@ -296,38 +407,77 @@ impl ControlConnector for TokioControlConnector {
     }
 }
 
-/// Accept journal control connections indefinitely on `listener`.
-///
-/// Every registration is handled in its own task so a slow peer cannot block
-/// later journal registrations.
-pub async fn run_control_listener(
-    listener: TcpListener,
+/// Helper for sleep backoff interruptible by shutdown token.
+async fn accept_backoff_sleep(
+    backoff: &mut Duration,
+    shutdown_rx: &mut tokio::sync::watch::Receiver<bool>,
+) -> bool {
+    let sleep_fut = tokio::time::sleep(*backoff);
+    tokio::pin!(sleep_fut);
+    let stop = tokio::select! {
+        () = &mut sleep_fut => false,
+        res = shutdown_rx.changed() => {
+            res.is_ok() && *shutdown_rx.borrow()
+        }
+    };
+    *backoff = (*backoff * 2).min(MAX_ACCEPT_BACKOFF);
+    stop || *shutdown_rx.borrow()
+}
+
+/// Accept journal control connections on `acceptor`.
+pub async fn run_control_listener<A>(
+    mut acceptor: A,
     tls_config: Arc<ServerConfig>,
     registry: registry::Registry,
     authenticator: pop_auth::PopAuthenticator,
     admission_deadline: Duration,
-) {
+    mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
+) where
+    A: AcceptProvider + Send + 'static,
+{
+    let mut join_set = tokio::task::JoinSet::new();
     BridgeLogEvent::ControlListenerStarted.emit();
+    let mut backoff = INITIAL_ACCEPT_BACKOFF;
     loop {
-        let Ok((stream, _peer)) = listener.accept().await else {
-            BridgeLogEvent::ControlListenerAcceptFailed.emit();
-            continue;
+        while join_set.try_join_next().is_some() {}
+
+        let (stream, _peer) = tokio::select! {
+            accept_result = acceptor.accept() => {
+                if let Ok(pair) = accept_result {
+                    backoff = INITIAL_ACCEPT_BACKOFF;
+                    pair
+                } else {
+                    BridgeLogEvent::ControlListenerAcceptFailed.emit();
+                    if accept_backoff_sleep(&mut backoff, &mut shutdown_rx).await {
+                        break;
+                    }
+                    continue;
+                }
+            }
+            res = shutdown_rx.changed() => {
+                if res.is_ok() && *shutdown_rx.borrow() {
+                    break;
+                }
+                continue;
+            }
         };
+
         let deadline = tokio::time::Instant::now() + admission_deadline;
-        let acceptor = TlsAcceptor::from(Arc::clone(&tls_config));
+        let acceptor_tls = TlsAcceptor::from(Arc::clone(&tls_config));
         let registry = registry.clone();
         let authenticator = authenticator.clone();
-        tokio::spawn(async move {
-            if tokio::time::timeout_at(deadline, async move {
-                let Ok(mut tls_stream) = acceptor.accept(stream).await else {
+
+        join_set.spawn(async move {
+            let registration_result = tokio::time::timeout_at(deadline, async move {
+                let Ok(mut tls_stream) = acceptor_tls.accept(stream).await else {
                     BridgeLogEvent::ControlTlsHandshakeRejected.emit();
-                    return;
+                    return None;
                 };
                 let registration = match authenticator.authenticate(&mut tls_stream).await {
                     Ok(registration) => registration,
                     Err(error) => {
                         pop_admission_event(&error).emit();
-                        return;
+                        return None;
                     }
                 };
                 let hostname = registration.hostname().to_owned();
@@ -346,21 +496,37 @@ pub async fn run_control_listener(
                     Ok(journal) => journal,
                     Err(error) => {
                         registry_admission_event(&error).emit();
-                        return;
+                        return None;
                     }
                 };
                 BridgeLogEvent::JournalRegistered.emit();
-                tokio::spawn(async move {
+                Some(journal)
+            })
+            .await;
+
+            match registration_result {
+                Ok(Some(journal)) => {
                     journal.wait_until_gone().await;
                     BridgeLogEvent::JournalEvicted.emit();
-                });
-            })
-            .await
-            .is_err()
-            {
-                BridgeLogEvent::JournalRegistrationAdmissionTimedOut.emit();
+                }
+                Ok(None) => {}
+                Err(_) => {
+                    BridgeLogEvent::JournalRegistrationAdmissionTimedOut.emit();
+                }
             }
         });
+    }
+
+    let drain_completed = tokio::time::timeout(DRAIN_BUDGET, async {
+        while join_set.join_next().await.is_some() {}
+    })
+    .await
+    .is_ok();
+
+    if !drain_completed {
+        join_set.abort_all();
+        while join_set.join_next().await.is_some() {}
+        BridgeLogEvent::BridgeDrainTimedOut.emit();
     }
 }
 
@@ -406,90 +572,145 @@ fn registry_admission_event(error: &registry::RegistryError) -> BridgeLogEvent {
     }
 }
 
-/// Accept raw client TLS connections indefinitely on `listener`.
-///
-/// Client TLS remains opaque: this listener peeks only far enough to route by
-/// SNI. Registered journal hostnames receive a PROXY v1 header before bytes are
-/// spliced; the reserved control hostname is spliced directly to the internal
-/// control listener without a PROXY header.
-pub async fn run_client_listener(
-    listener: TcpListener,
+/// Accept raw client TLS connections on `acceptor`.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "listener parameters include connectors, targets, deadlines, and shutdown watch"
+)]
+pub async fn run_client_listener<A, C, AC>(
+    mut acceptor: A,
     registry: registry::Registry,
     control_dial_target: SocketAddr,
+    acme_target: Option<SocketAddr>,
     sni_deadline: Duration,
-) {
-    run_client_listener_with_connector(
-        listener,
-        registry,
-        control_dial_target,
-        sni_deadline,
-        TokioControlConnector,
-    )
-    .await;
-}
-
-async fn run_client_listener_with_connector<C>(
-    listener: TcpListener,
-    registry: registry::Registry,
-    control_dial_target: SocketAddr,
-    sni_deadline: Duration,
-    connector: C,
+    control_connector: C,
+    acme_connector: AC,
+    mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
 ) where
+    A: AcceptProvider + Send + 'static,
     C: ControlConnector,
+    AC: ControlConnector,
 {
+    let mut join_set = tokio::task::JoinSet::new();
     BridgeLogEvent::ClientListenerStarted.emit();
     let sni_admission = Arc::new(Semaphore::new(MAX_SNI_ADMISSION_SLOTS));
+    let mut backoff = INITIAL_ACCEPT_BACKOFF;
     loop {
-        let Ok((stream, peer)) = listener.accept().await else {
-            BridgeLogEvent::ClientListenerAcceptFailed.emit();
-            continue;
+        while join_set.try_join_next().is_some() {}
+
+        let (stream, peer) = tokio::select! {
+            accept_result = acceptor.accept() => {
+                if let Ok(pair) = accept_result {
+                    backoff = INITIAL_ACCEPT_BACKOFF;
+                    pair
+                } else {
+                    BridgeLogEvent::ClientListenerAcceptFailed.emit();
+                    if accept_backoff_sleep(&mut backoff, &mut shutdown_rx).await {
+                        break;
+                    }
+                    continue;
+                }
+            }
+            res = shutdown_rx.changed() => {
+                if res.is_ok() && *shutdown_rx.borrow() {
+                    break;
+                }
+                continue;
+            }
         };
+
         hold_accepted_flow_open(&stream);
         let registry = registry.clone();
         let sni_admission = Arc::clone(&sni_admission);
-        let connector = connector.clone();
-        tokio::spawn(async move {
+        let control_connector = control_connector.clone();
+        let acme_connector = acme_connector.clone();
+
+        join_set.spawn(async move {
             handle_client(
                 stream,
                 peer,
                 registry,
                 control_dial_target,
+                acme_target,
                 sni_deadline,
                 sni_admission,
-                connector,
+                control_connector,
+                acme_connector,
             )
             .await;
         });
     }
+
+    let drain_completed = tokio::time::timeout(DRAIN_BUDGET, async {
+        while join_set.join_next().await.is_some() {}
+    })
+    .await
+    .is_ok();
+
+    if !drain_completed {
+        join_set.abort_all();
+        while join_set.join_next().await.is_some() {}
+        BridgeLogEvent::BridgeDrainTimedOut.emit();
+    }
 }
 
-async fn handle_client<C>(
+/// Route one client TLS connection.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "client handler parameters include connectors, targets, deadlines, and permit"
+)]
+pub async fn handle_client<C, AC>(
     mut client: TcpStream,
     _peer: SocketAddr,
     registry: registry::Registry,
     control_dial_target: SocketAddr,
+    acme_target: Option<SocketAddr>,
     sni_deadline: Duration,
     sni_admission: Arc<Semaphore>,
-    connector: C,
+    control_connector: C,
+    acme_connector: AC,
 ) where
     C: ControlConnector,
+    AC: ControlConnector,
 {
-    let hostname = {
+    let routing = {
         let Ok(_permit) = sni_admission.try_acquire_owned() else {
-            BridgeLogEvent::ClientRejectedBeforeRouting.emit();
+            BridgeLogEvent::ClientRejectedCapacity.emit();
             return;
         };
-        let Ok(hostname) = sni::extract_sni(&client, sni_deadline).await else {
-            BridgeLogEvent::ClientRejectedBeforeRouting.emit();
+        let Ok(routing) = sni::extract_sni(&client, sni_deadline).await else {
+            BridgeLogEvent::ClientRejectedInvalidClientHello.emit();
             return;
         };
-        hostname
+        routing
     };
 
-    if hostname == RESERVED_CONTROL_SNI {
+    if let Some(target) = acme_target
+        && routing.hostname == RESERVED_CONTROL_SNI
+        && routing.acme_tls_alpn
+    {
+        let Ok(Ok(mut acme)) = tokio::time::timeout(
+            CONTROL_SPLICE_CONNECT_DEADLINE,
+            acme_connector.connect(target),
+        )
+        .await
+        else {
+            BridgeLogEvent::ClientAcmeForwardFailed.emit();
+            return;
+        };
+        if tokio::io::copy_bidirectional(&mut client, &mut acme)
+            .await
+            .is_err()
+        {
+            BridgeLogEvent::ClientAcmeForwardFailed.emit();
+        }
+        return;
+    }
+
+    if routing.hostname == RESERVED_CONTROL_SNI {
         let mut control = match tokio::time::timeout(
             CONTROL_SPLICE_CONNECT_DEADLINE,
-            connector.connect(control_dial_target),
+            control_connector.connect(control_dial_target),
         )
         .await
         {
@@ -508,11 +729,11 @@ async fn handle_client<C>(
         return;
     }
 
-    if !pop_auth::valid_hostname(&hostname) {
-        BridgeLogEvent::ClientRejectedBeforeRouting.emit();
+    if !pop_auth::valid_hostname(&routing.hostname) {
+        BridgeLogEvent::ClientRejectedInvalidHostname.emit();
         return;
     }
-    let Some(journal) = registry.lookup(&hostname).await else {
+    let Some(journal) = registry.lookup(&routing.hostname).await else {
         BridgeLogEvent::ClientRejectedWithoutJournalRegistration.emit();
         return;
     };
@@ -543,16 +764,13 @@ async fn handle_client<C>(
         &mut stream,
         &flag,
         &registry,
-        &hostname,
+        &routing.hostname,
         &journal,
     )
     .await;
 }
 
 /// Splice a routed client, closing it if the journal never answers.
-///
-/// The deadline is armed only until the journal's first byte, so an ordinary
-/// long-running tool call is unaffected once its TLS handshake has begun.
 async fn splice_until_journal_answers_or_deadline<S>(
     client: &mut TcpStream,
     stream: &mut S,
@@ -707,9 +925,11 @@ mod tests {
             SocketAddr::from(([127, 0, 0, 1], 0)),
             registry::Registry::default(),
             SocketAddr::from(([127, 0, 0, 1], 0)),
+            None,
             Duration::from_secs(1),
             Arc::clone(&permits),
             NeverReadyControlConnector(Arc::clone(&connect_entered)),
+            TokioControlConnector,
         ));
         entered_wait.await;
         assert_eq!(permits.available_permits(), 1);
@@ -722,6 +942,14 @@ mod tests {
 
     #[tokio::test]
     async fn sni_admission_gate_rejects_the_connection_after_256_slots() -> Result<(), io::Error> {
+        let logs = LogBuffer(Arc::new(Mutex::new(Vec::new())));
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .without_time()
+            .with_writer(logs.clone())
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+
         let listener = TcpListener::bind("127.0.0.1:0").await?;
         let address = listener.local_addr()?;
         let mut clients = Vec::new();
@@ -738,9 +966,11 @@ mod tests {
                 SocketAddr::from(([127, 0, 0, 1], 0)),
                 registry::Registry::default(),
                 SocketAddr::from(([127, 0, 0, 1], 0)),
+                None,
                 Duration::from_mins(1),
                 Arc::clone(&permits),
                 NeverReadyControlConnector(Arc::new(Notify::new())),
+                TokioControlConnector,
             )));
         }
         assert!(
@@ -760,9 +990,11 @@ mod tests {
             SocketAddr::from(([127, 0, 0, 1], 0)),
             registry::Registry::default(),
             SocketAddr::from(([127, 0, 0, 1], 0)),
+            None,
             Duration::from_mins(1),
             Arc::clone(&permits),
             NeverReadyControlConnector(Arc::new(Notify::new())),
+            TokioControlConnector,
         )
         .await;
         let mut rejected_client = clients
@@ -773,6 +1005,68 @@ mod tests {
         for task in pending {
             task.abort();
         }
+
+        let output = String::from_utf8(logs.0.lock().unwrap().clone()).unwrap();
+        assert!(output.contains("client rejected: admission capacity exceeded"));
+        assert!(!output.contains("invalid client hello"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn handle_client_diagnostics_malformed_hello_and_invalid_hostname()
+    -> Result<(), io::Error> {
+        let logs = LogBuffer(Arc::new(Mutex::new(Vec::new())));
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .without_time()
+            .with_writer(logs.clone())
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let permits = Arc::new(Semaphore::new(10));
+
+        // 1. Malformed bytes -> client rejected: invalid client hello
+        let (mut client1, server1) = tcp_pair().await?;
+        client1.write_all(b"malformed-bytes").await?;
+        drop(client1);
+        handle_client(
+            server1,
+            SocketAddr::from(([127, 0, 0, 1], 0)),
+            registry::Registry::default(),
+            SocketAddr::from(([127, 0, 0, 1], 0)),
+            None,
+            Duration::from_millis(50),
+            Arc::clone(&permits),
+            TokioControlConnector,
+            TokioControlConnector,
+        )
+        .await;
+
+        let output1 = String::from_utf8(logs.0.lock().unwrap().clone()).unwrap();
+        assert!(output1.contains("client rejected: invalid client hello"));
+
+        // 2. Invalid hostname -> client rejected: invalid hostname
+        logs.0.lock().unwrap().clear();
+        let (mut client2, server2) = tcp_pair().await?;
+        client2
+            .write_all(&client_hello_for("not-a-valid-hostname!"))
+            .await?;
+        drop(client2);
+        handle_client(
+            server2,
+            SocketAddr::from(([127, 0, 0, 1], 0)),
+            registry::Registry::default(),
+            SocketAddr::from(([127, 0, 0, 1], 0)),
+            None,
+            Duration::from_millis(50),
+            Arc::clone(&permits),
+            TokioControlConnector,
+            TokioControlConnector,
+        )
+        .await;
+
+        let output2 = String::from_utf8(logs.0.lock().unwrap().clone()).unwrap();
+        assert!(output2.contains("client rejected: invalid hostname"));
         Ok(())
     }
 
@@ -814,15 +1108,14 @@ mod tests {
             SocketAddr::from(([127, 0, 0, 1], 0)),
             registry,
             SocketAddr::from(([127, 0, 0, 1], 0)),
+            None,
             Duration::from_secs(1),
             Arc::new(Semaphore::new(MAX_SNI_ADMISSION_SLOTS)),
             NeverReadyControlConnector(Arc::new(Notify::new())),
+            TokioControlConnector,
         ))
     }
 
-    /// A registered journal whose host slept keeps its carrier socket open, so
-    /// carrier EOF never arrives. The routed client must still be closed, and
-    /// the stale registration must stop answering later clients.
     #[tokio::test(start_paused = true)]
     async fn a_silent_registered_journal_loses_the_client_and_its_registration()
     -> Result<(), io::Error> {
@@ -845,8 +1138,6 @@ mod tests {
         Ok(())
     }
 
-    /// One answered byte disarms the deadline, so an ordinary long-running
-    /// tool call is never cut short once its handshake has begun.
     #[tokio::test(start_paused = true)]
     async fn an_answering_journal_keeps_a_client_past_the_deadline() -> Result<(), io::Error> {
         let (registry, _journal, mut peer, _control) = registry_with_silent_journal().await?;
@@ -973,6 +1264,15 @@ mod tests {
             BridgeLogEvent::JournalLeaseRenewalNonceSpentCapacity,
             BridgeLogEvent::JournalLeaseRenewed,
             BridgeLogEvent::JournalLeaseExpiredWallClock,
+            BridgeLogEvent::ControlCertificateStartupFailed,
+            BridgeLogEvent::ControlCertificateReloadFailed,
+            BridgeLogEvent::ClientRejectedCapacity,
+            BridgeLogEvent::ClientRejectedInvalidClientHello,
+            BridgeLogEvent::ClientRejectedInvalidHostname,
+            BridgeLogEvent::ClientAcmeForwardFailed,
+            BridgeLogEvent::AcmeTargetRejected,
+            BridgeLogEvent::BridgeShutdownReceived,
+            BridgeLogEvent::BridgeDrainTimedOut,
         ] {
             event.emit();
         }

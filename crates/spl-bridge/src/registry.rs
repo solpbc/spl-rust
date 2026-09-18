@@ -197,6 +197,24 @@ impl Registry {
         });
     }
 
+    /// Drain boundary: retire and invoke bounded shutdown for all currently registered journals.
+    ///
+    /// The registry-internal background tasks (watcher, displaced shutdown, lease supervisor)
+    /// and `FrameDialer` carrier tasks (`read_carrier`, `write_carrier`, `run_connection`) self-terminate
+    /// when the underlying journal dialer reaches `ConnectionState::Gone`. This method initiates
+    /// that graceful termination across all active registrations without requiring direct `JoinSet`
+    /// tracking of internal dialer or supervisor tasks.
+    pub async fn shutdown_all(&self) {
+        let entries: Vec<Arc<RegisteredJournal>> = {
+            let mut lock = self.inner.entries.write().await;
+            lock.drain().map(|(_, journal)| journal).collect()
+        };
+        for journal in entries {
+            journal.retire();
+            journal.shutdown_bounded().await;
+        }
+    }
+
     async fn remove_if_current(&self, hostname: &str, generation: u64) {
         let mut entries = self.inner.entries.write().await;
         if entries

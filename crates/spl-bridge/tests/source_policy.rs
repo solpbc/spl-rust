@@ -188,6 +188,21 @@ fn forbidden_service_template_is_inventoried_then_rejected() -> Result<(), Box<d
     Ok(())
 }
 
+#[test]
+fn markdown_runbook_containing_user_paths_is_not_rejected() -> Result<(), Box<dyn Error>> {
+    let (corpus, snapshot) = copied_real_corpus()?;
+    let runbook = corpus.crate_root.join("deploy/RUNBOOK.md");
+    fs::write(
+        &runbook,
+        "# Runbook\n\nExample user directory: `/home/operator/config`\n",
+    )?;
+    let result = support::scan(&corpus.crate_root, &corpus.workspace_manifest)?;
+    snapshot.assert_unchanged()?;
+    assert!(result.inventory.template.contains(&runbook));
+    assert!(result.violations.is_empty());
+    Ok(())
+}
+
 fn real_paths() -> Result<(PathBuf, PathBuf), io::Error> {
     let crate_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let workspace_manifest = crate_root
@@ -262,6 +277,10 @@ impl CorpusCopy {
         if deploy.exists() {
             copy_directory(&deploy, &copied_crate_root.join("deploy"))?;
         }
+        let build_rs = crate_root.join("build.rs");
+        if build_rs.exists() {
+            fs::copy(&build_rs, copied_crate_root.join("build.rs"))?;
+        }
         fs::copy(
             crate_root.join("Cargo.toml"),
             copied_crate_root.join("Cargo.toml"),
@@ -322,6 +341,7 @@ impl TreeSnapshot {
         paths.extend(result.inventory.binary);
         paths.extend(result.inventory.manifest);
         paths.extend(result.inventory.template);
+        paths.extend(result.inventory.build_script);
         paths.push(workspace_manifest.to_owned());
         paths.sort();
         let fingerprint = fingerprint(&paths)?;

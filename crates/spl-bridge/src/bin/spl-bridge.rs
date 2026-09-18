@@ -3,15 +3,21 @@
 
 //! Standalone public SNI-passthrough MCP relay.
 
+use std::io::Write;
 use std::net::SocketAddr;
 use std::process::ExitCode;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use rustls::RootCertStore;
+use spl_bridge::control_cert::{
+    CertMaterialLoader, ControlCertResolver, ReloadCoordinator, control_server_tls_config,
+    validate_control_certified_key,
+};
 use spl_bridge::pop_auth::{JwksTimeouts, JwksTokenVerifier, PopAuthenticator};
 use spl_bridge::{
-    pem_certificate_chain, pem_private_key, run_client_listener, run_control_listener,
-    server_tls_config,
+    BridgeLogEvent, TokioControlConnector, pem_certificate_chain, pem_private_key,
+    run_client_listener, run_control_listener,
 };
 use tokio::net::TcpListener;
 
@@ -25,6 +31,8 @@ struct Options {
     bridge_id: String,
     jwks_connect_timeout: Duration,
     jwks_read_timeout: Duration,
+    acme_tls_alpn_target: Option<SocketAddr>,
+    control_tls_roots: Option<String>,
 }
 
 /// Publish the bridge's fixed operational vocabulary to stderr.
@@ -38,35 +46,129 @@ struct Options {
 fn install_operational_logging() {
     let subscriber = tracing_subscriber::fmt()
         .with_ansi(false)
+        .with_writer(std::io::stderr)
         .with_max_level(tracing::Level::INFO)
         .finish();
     let _ = tracing::subscriber::set_global_default(subscriber);
 }
 
-#[tokio::main(flavor = "current_thread")]
-async fn main() -> ExitCode {
-    install_operational_logging();
-    if let Ok(()) = run().await {
-        ExitCode::SUCCESS
-    } else {
-        eprintln!("spl-bridge failed");
-        ExitCode::FAILURE
+fn check_version_flag() -> bool {
+    std::env::args_os().skip(1).any(|arg| arg == "--version")
+}
+
+enum RunError {
+    AlreadyEmitted,
+    Generic(String),
+}
+
+impl From<String> for RunError {
+    fn from(s: String) -> Self {
+        RunError::Generic(s)
     }
 }
 
-async fn run() -> Result<(), String> {
+#[tokio::main(flavor = "current_thread")]
+async fn main() -> ExitCode {
+    if check_version_flag() {
+        let version = concat!(
+            "spl-bridge ",
+            env!("CARGO_PKG_VERSION"),
+            " (",
+            env!("SPL_BRIDGE_BUILD_ID"),
+            ")\n"
+        );
+        let _ = std::io::stdout().write_all(version.as_bytes());
+        return ExitCode::SUCCESS;
+    }
+
+    install_operational_logging();
+    match run().await {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(RunError::AlreadyEmitted) => ExitCode::FAILURE,
+        Err(RunError::Generic(_error)) => {
+            eprintln!("spl-bridge failed");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+#[expect(
+    clippy::too_many_lines,
+    reason = "bridge startup, validation, and signal lifecycle supervisor"
+)]
+async fn run() -> Result<(), RunError> {
     let options = parse_options(std::env::args().skip(1))?;
+
+    if let Some(acme_target) = options.acme_tls_alpn_target
+        && !acme_target.ip().is_loopback()
+    {
+        BridgeLogEvent::AcmeTargetRejected.emit();
+        return Err(RunError::AlreadyEmitted);
+    }
+
     let certificate_pem = std::fs::read(&options.control_tls_cert)
         .map_err(|_| String::from("could not read --control-tls-cert"))?;
     let private_key_pem = std::fs::read(&options.control_tls_key)
         .map_err(|_| String::from("could not read --control-tls-key"))?;
-    let tls_config = server_tls_config(
-        pem_certificate_chain(&certificate_pem)
-            .map_err(|_| String::from("could not parse --control-tls-cert"))?,
-        pem_private_key(&private_key_pem)
-            .map_err(|_| String::from("could not parse --control-tls-key"))?,
-    )
-    .map_err(|_| String::from("could not build control TLS configuration"))?;
+
+    let roots = if let Some(roots_path) = &options.control_tls_roots {
+        let roots_pem = std::fs::read(roots_path)
+            .map_err(|_| String::from("could not read --control-tls-roots"))?;
+        let roots_ders = pem_certificate_chain(&roots_pem)
+            .map_err(|_| String::from("could not parse --control-tls-roots"))?;
+        let mut store = RootCertStore::empty();
+        for cert in roots_ders {
+            store
+                .add(cert)
+                .map_err(|_| String::from("could not build root cert store"))?;
+        }
+        store
+    } else {
+        webpki_roots::TLS_SERVER_ROOTS
+            .iter()
+            .cloned()
+            .collect::<RootCertStore>()
+    };
+
+    let cert_chain = pem_certificate_chain(&certificate_pem)
+        .map_err(|_| String::from("could not parse --control-tls-cert"))?;
+    let private_key = pem_private_key(&private_key_pem)
+        .map_err(|_| String::from("could not parse --control-tls-key"))?;
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+
+    let initial_key = validate_control_certified_key(&cert_chain, &private_key, &roots, now)
+        .map_err(|_| {
+            BridgeLogEvent::ControlCertificateStartupFailed.emit();
+            RunError::AlreadyEmitted
+        })?;
+
+    let resolver = Arc::new(ControlCertResolver::new(initial_key));
+    let tls_config = control_server_tls_config(Arc::clone(&resolver))
+        .map_err(|_| String::from("could not build control TLS configuration"))?;
+
+    let cert_path = options.control_tls_cert.clone();
+    let key_path = options.control_tls_key.clone();
+    let loader: CertMaterialLoader = Arc::new(move || {
+        let cert = std::fs::read(&cert_path)?;
+        let key = std::fs::read(&key_path)?;
+        Ok((cert, key))
+    });
+    let clock = Arc::new(|| {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs()
+    });
+    let reload_coordinator = Arc::new(ReloadCoordinator::new(
+        Arc::clone(&resolver),
+        roots,
+        clock,
+        loader,
+    ));
+
     let verifier = JwksTokenVerifier::with_timeouts(
         &options.jwks_url,
         JwksTimeouts {
@@ -76,6 +178,7 @@ async fn run() -> Result<(), String> {
         options.bridge_id.clone(),
     )
     .map_err(|_| String::from("invalid --jwks-url"))?;
+
     let control_listener = TcpListener::bind("127.0.0.1:0")
         .await
         .map_err(|_| String::from("could not bind internal control listener"))?;
@@ -88,22 +191,92 @@ async fn run() -> Result<(), String> {
 
     let registry = spl_bridge::registry::Registry::default();
     let authenticator = PopAuthenticator::new(Arc::new(verifier), options.bridge_id);
-    tokio::join!(
-        run_control_listener(
-            control_listener,
-            Arc::new(tls_config),
-            registry.clone(),
-            authenticator,
-            spl_bridge::DEFAULT_ADMISSION_DEADLINE,
-        ),
-        run_client_listener(
-            client_listener,
-            registry,
-            control_dial_target,
-            spl_bridge::sni::DEFAULT_READ_DEADLINE,
-        ),
-    );
+
+    let (shutdown_tx, shutdown_rx_control) = tokio::sync::watch::channel(false);
+    let shutdown_rx_client = shutdown_tx.subscribe();
+
+    let control_handle = tokio::spawn(run_control_listener(
+        control_listener,
+        Arc::new(tls_config),
+        registry.clone(),
+        authenticator,
+        spl_bridge::DEFAULT_ADMISSION_DEADLINE,
+        shutdown_rx_control,
+    ));
+
+    let client_handle = tokio::spawn(run_client_listener(
+        client_listener,
+        registry.clone(),
+        control_dial_target,
+        options.acme_tls_alpn_target,
+        spl_bridge::sni::DEFAULT_READ_DEADLINE,
+        TokioControlConnector,
+        TokioControlConnector,
+        shutdown_rx_client,
+    ));
+
+    let signal_task = handle_unix_signals(shutdown_tx.clone(), reload_coordinator);
+    signal_task.await;
+
+    // Drain sequence
+    let _ = shutdown_tx.send_replace(true);
+    registry.shutdown_all().await;
+    let _ = tokio::join!(control_handle, client_handle);
+
     Ok(())
+}
+
+// SIGHUP/SIGTERM/SIGINT are Unix signals; production is the host-checked Linux bridge.
+#[cfg(unix)]
+async fn handle_unix_signals(
+    shutdown_tx: tokio::sync::watch::Sender<bool>,
+    reload_coordinator: Arc<ReloadCoordinator>,
+) {
+    use tokio::signal::unix::{SignalKind, signal};
+    let Ok(mut hup) = signal(SignalKind::hangup()) else {
+        return;
+    };
+    let Ok(mut term) = signal(SignalKind::terminate()) else {
+        return;
+    };
+    let Ok(mut int) = signal(SignalKind::interrupt()) else {
+        return;
+    };
+
+    let mut reload_tasks = tokio::task::JoinSet::new();
+
+    loop {
+        while reload_tasks.try_join_next().is_some() {}
+
+        tokio::select! {
+            _ = hup.recv() => {
+                let coordinator = Arc::clone(&reload_coordinator);
+                reload_tasks.spawn(async move {
+                    coordinator.request_reload().await;
+                });
+            }
+            _ = term.recv() => {
+                BridgeLogEvent::BridgeShutdownReceived.emit();
+                let _ = shutdown_tx.send_replace(true);
+                break;
+            }
+            _ = int.recv() => {
+                BridgeLogEvent::BridgeShutdownReceived.emit();
+                let _ = shutdown_tx.send_replace(true);
+                break;
+            }
+        }
+    }
+
+    reload_tasks.abort_all();
+}
+
+#[cfg(not(unix))]
+async fn handle_unix_signals(
+    _shutdown_tx: tokio::sync::watch::Sender<bool>,
+    _reload_coordinator: Arc<ReloadCoordinator>,
+) {
+    std::future::pending::<()>().await;
 }
 
 fn parse_options(arguments: impl Iterator<Item = String>) -> Result<Options, String> {
@@ -114,9 +287,14 @@ fn parse_options(arguments: impl Iterator<Item = String>) -> Result<Options, Str
     let mut bridge_id = None;
     let mut jwks_connect_timeout = DEFAULT_JWKS_TIMEOUT_MS;
     let mut jwks_read_timeout = DEFAULT_JWKS_TIMEOUT_MS;
+    let mut acme_tls_alpn_target = None;
+    let mut control_tls_roots = None;
     let mut arguments = arguments;
 
     while let Some(flag) = arguments.next() {
+        if flag == "--version" {
+            continue;
+        }
         let value = arguments
             .next()
             .ok_or_else(|| format!("missing value for {flag}"))?;
@@ -131,6 +309,10 @@ fn parse_options(arguments: impl Iterator<Item = String>) -> Result<Options, Str
             }
             "--jwks-connect-timeout-ms" => jwks_connect_timeout = parse_timeout(&value, &flag)?,
             "--jwks-read-timeout-ms" => jwks_read_timeout = parse_timeout(&value, &flag)?,
+            "--acme-tls-alpn-target" => {
+                acme_tls_alpn_target = Some(parse_address(&value, &flag)?);
+            }
+            "--control-tls-roots" => control_tls_roots = Some(value),
             _ => return Err(format!("unknown option {flag}")),
         }
     }
@@ -143,6 +325,8 @@ fn parse_options(arguments: impl Iterator<Item = String>) -> Result<Options, Str
         bridge_id: bridge_id.ok_or(String::from("--bridge-id is required"))?,
         jwks_connect_timeout: Duration::from_millis(jwks_connect_timeout),
         jwks_read_timeout: Duration::from_millis(jwks_read_timeout),
+        acme_tls_alpn_target,
+        control_tls_roots,
     })
 }
 
@@ -246,5 +430,35 @@ mod tests {
                 .map(String::from),
         );
         assert!(matches!(result, Err(error) if error == "unknown option --control-listen"));
+    }
+
+    #[test]
+    fn parses_optional_acme_target_and_roots() {
+        let options = parse_options(
+            [
+                "--client-listen",
+                "127.0.0.1:443",
+                "--control-tls-cert",
+                "cert.pem",
+                "--control-tls-key",
+                "key.pem",
+                "--jwks-url",
+                "https://jwks.test/keys",
+                "--bridge-id",
+                "bridge",
+                "--acme-tls-alpn-target",
+                "127.0.0.1:5001",
+                "--control-tls-roots",
+                "roots.pem",
+            ]
+            .into_iter()
+            .map(String::from),
+        )
+        .unwrap();
+        assert_eq!(
+            options.acme_tls_alpn_target,
+            Some("127.0.0.1:5001".parse().unwrap())
+        );
+        assert_eq!(options.control_tls_roots, Some(String::from("roots.pem")));
     }
 }

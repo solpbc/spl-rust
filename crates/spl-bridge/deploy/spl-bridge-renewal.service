@@ -3,16 +3,33 @@
 
 [Unit]
 Description=SPL Bridge ACME Certificate Renewal
-After=network-online.target
+After=network-online.target spl-bridge.service
 Wants=network-online.target
+Requires=spl-bridge.service
 
 [Service]
 Type=oneshot
-User=USER
-Group=GROUP
+User=root
+Group=spl-bridge
+UMask=0027
+EnvironmentFile=/etc/spl-bridge/renewal.env
 ExecStart=/usr/local/bin/spl-bridge-renew
 Restart=on-failure
 RestartSec=6h
+RuntimeDirectory=spl-bridge-renew
+RuntimeDirectoryMode=0750
+NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=true
 PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+CapabilityBoundingSet=
+ReadWritePaths=/etc/spl-bridge/tls-generations /etc/spl-bridge/acme-production /run/spl-bridge-renew

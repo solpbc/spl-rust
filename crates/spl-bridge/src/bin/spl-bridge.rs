@@ -195,7 +195,7 @@ async fn run() -> Result<(), RunError> {
     let (shutdown_tx, shutdown_rx_control) = tokio::sync::watch::channel(false);
     let shutdown_rx_client = shutdown_tx.subscribe();
 
-    let control_handle = tokio::spawn(run_control_listener(
+    let mut control_handle = tokio::spawn(run_control_listener(
         control_listener,
         Arc::new(tls_config),
         registry.clone(),
@@ -204,7 +204,7 @@ async fn run() -> Result<(), RunError> {
         shutdown_rx_control,
     ));
 
-    let client_handle = tokio::spawn(run_client_listener(
+    let mut client_handle = tokio::spawn(run_client_listener(
         client_listener,
         registry.clone(),
         control_dial_target,
@@ -218,10 +218,25 @@ async fn run() -> Result<(), RunError> {
     let signal_task = handle_unix_signals(shutdown_tx.clone(), reload_coordinator);
     signal_task.await;
 
-    // Drain sequence
+    // One fleet-wide drain budget covers registry retirement and both listener
+    // task sets. Per-journal shutdown runs concurrently inside shutdown_all.
     let _ = shutdown_tx.send_replace(true);
-    registry.shutdown_all().await;
-    let _ = tokio::join!(control_handle, client_handle);
+    let drain = async {
+        let registry_shutdown = registry.shutdown_all();
+        let listener_shutdown = async {
+            let _ = tokio::join!(&mut control_handle, &mut client_handle);
+        };
+        tokio::join!(registry_shutdown, listener_shutdown);
+    };
+    if tokio::time::timeout(spl_bridge::DRAIN_BUDGET, drain)
+        .await
+        .is_err()
+    {
+        control_handle.abort();
+        client_handle.abort();
+        let _ = tokio::join!(control_handle, client_handle);
+        BridgeLogEvent::BridgeDrainTimedOut.emit();
+    }
 
     Ok(())
 }

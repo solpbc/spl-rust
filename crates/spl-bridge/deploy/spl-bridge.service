@@ -8,15 +8,15 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-User=USER
-Group=GROUP
+User=spl-bridge
+Group=spl-bridge
 ExecStart=/usr/local/bin/spl-bridge \
     --client-listen 0.0.0.0:443 \
-    --control-tls-cert CERTIFICATE \
-    --control-tls-key PRIVATE_KEY \
-    --jwks-url JWKS_URL \
-    --bridge-id BRIDGE_ID \
-    --acme-tls-alpn-target 127.0.0.1:5001
+    --control-tls-cert /etc/spl-bridge/tls-generations/active/cert.pem \
+    --control-tls-key /etc/spl-bridge/tls-generations/active/key.pem \
+    --jwks-url https://services.solstone.app/.well-known/jwks.json \
+    --bridge-id mcp-bridge-v1 \
+    --acme-tls-alpn-target 127.0.0.1:8443
 ExecReload=/bin/kill -HUP $MAINPID
 KillSignal=SIGTERM
 KillMode=mixed

@@ -4,23 +4,24 @@
 
 set -euo pipefail
 
-LOCK_FILE="${RENEW_LOCK_FILE:-/var/run/spl-bridge-renew.lock}"
+LOCK_FILE="${RENEW_LOCK_FILE:-/run/spl-bridge-renew/renew.lock}"
 exec 200>"$LOCK_FILE"
 flock -n 200 || {
     echo "spl-bridge-renew is already running; skipping concurrent run" >&2
     exit 1
 }
 
-GENERATIONS_DIR="${GENERATIONS_DIR:-/var/lib/spl-bridge/generations}"
+GENERATIONS_DIR="${GENERATIONS_DIR:-/etc/spl-bridge/tls-generations}"
 LEGO="${LEGO:-lego}"
 ACTIVATE="${ACTIVATE:-spl-bridge-activate}"
 VERIFY_ADDR="${VERIFY_ADDR:-127.0.0.1:443}"
 RELOAD_CMD="${RELOAD_CMD:-systemctl reload spl-bridge}"
-LEGO_DIR="${LEGO_DIR:-/var/lib/spl-bridge/lego}"
+LEGO_DIR="${LEGO_DIR:-/etc/spl-bridge/acme-production}"
 DOMAIN="bridge.solstone.me"
-ACME_PORT="${ACME_PORT:-127.0.0.1:5001}"
-EMAIL="${EMAIL:-EMAIL}"
-ACTIVATE_ARGS=(${ACTIVATE_ARGS:-})
+ACME_PORT="${ACME_PORT:-127.0.0.1:8443}"
+: "${EMAIL:?EMAIL must be configured in /etc/spl-bridge/renewal.env}"
+RENEW_HOOK="${RENEW_HOOK:-/usr/local/libexec/spl-bridge-renew-hook}"
+ACTIVATE_ARGS=()
 if [ -n "${ACTIVATE_ROOTS:-}" ]; then
     ACTIVATE_ARGS+=(--control-tls-roots "$ACTIVATE_ROOTS")
 fi
@@ -54,16 +55,5 @@ if [ "$RUN_LEGO" -eq 1 ]; then
         --tls \
         --tls.port "$ACME_PORT" \
         --path "$LEGO_DIR" \
-        renew --days 30
-
-    ISSUED_CERT="${ISSUED_CERT:-${LEGO_DIR}/certificates/${DOMAIN}.crt}"
-    ISSUED_KEY="${ISSUED_KEY:-${LEGO_DIR}/certificates/${DOMAIN}.key}"
-
-    "$ACTIVATE" \
-        --issued-cert "$ISSUED_CERT" \
-        --issued-key "$ISSUED_KEY" \
-        --generations-dir "$GENERATIONS_DIR" \
-        --verify-addr "$VERIFY_ADDR" \
-        --reload-cmd "$RELOAD_CMD" \
-        "${ACTIVATE_ARGS[@]}"
+        renew --days 30 --renew-hook "$RENEW_HOOK"
 fi

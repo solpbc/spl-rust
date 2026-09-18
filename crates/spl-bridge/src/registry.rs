@@ -209,10 +209,14 @@ impl Registry {
             let mut lock = self.inner.entries.write().await;
             lock.drain().map(|(_, journal)| journal).collect()
         };
+        let mut shutdowns = tokio::task::JoinSet::new();
         for journal in entries {
-            journal.retire();
-            journal.shutdown_bounded().await;
+            shutdowns.spawn(async move {
+                journal.retire();
+                journal.shutdown_bounded().await;
+            });
         }
+        while shutdowns.join_next().await.is_some() {}
     }
 
     async fn remove_if_current(&self, hostname: &str, generation: u64) {

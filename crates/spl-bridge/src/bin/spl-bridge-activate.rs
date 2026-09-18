@@ -14,7 +14,7 @@ use std::fs;
 use std::io::Write;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
-use std::process::{Command, ExitCode};
+use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -244,7 +244,7 @@ async fn run_activate(options: ActivateOptions) -> ExitCode {
     }
 
     // Run reload command
-    if run_reload(reload_cmd).is_err()
+    if run_reload(reload_cmd).await.is_err()
         || verify_generation(verify_addr, &roots, &expected_leaf)
             .await
             .is_err()
@@ -263,7 +263,7 @@ async fn run_activate(options: ActivateOptions) -> ExitCode {
                 prior.clone()
             };
             let _ = atomic_symlink_switch(generations_dir, &prior_path, "active");
-            let rollback_reload = run_reload(reload_cmd);
+            let rollback_reload = run_reload(reload_cmd).await;
             let rollback_verify = if let Some(leaf) = &prior_leaf {
                 verify_generation(verify_addr, &roots, leaf).await
             } else {
@@ -375,7 +375,7 @@ async fn retry_pending_flow(
         return ExitCode::from(3);
     }
 
-    if run_reload(reload_cmd).is_err()
+    if run_reload(reload_cmd).await.is_err()
         || verify_generation(verify_addr, roots, &expected_leaf)
             .await
             .is_err()
@@ -387,7 +387,7 @@ async fn retry_pending_flow(
                 prior.clone()
             };
             let _ = atomic_symlink_switch(generations_dir, &prior_path, "active");
-            let rollback_reload = run_reload(reload_cmd);
+            let rollback_reload = run_reload(reload_cmd).await;
             let rollback_verify = if let Some(leaf) = &prior_leaf {
                 verify_generation(verify_addr, roots, leaf).await
             } else {
@@ -438,7 +438,7 @@ fn write_generation_files(
 
     #[cfg(unix)]
     {
-        let perms = std::os::unix::fs::PermissionsExt::from_mode(0o600);
+        let perms = std::os::unix::fs::PermissionsExt::from_mode(0o640);
         let _ = fs::set_permissions(&key_file_path, perms);
     }
 
@@ -465,11 +465,16 @@ fn atomic_symlink_switch(
     Ok(())
 }
 
-fn run_reload(reload_cmd: &str) -> Result<(), ()> {
-    let status = Command::new("sh")
+async fn run_reload(reload_cmd: &str) -> Result<(), ()> {
+    let mut child = tokio::process::Command::new("sh")
         .arg("-c")
         .arg(reload_cmd)
-        .status()
+        .kill_on_drop(true)
+        .spawn()
+        .map_err(|_| ())?;
+    let status = tokio::time::timeout(VERIFY_DEADLINE, child.wait())
+        .await
+        .map_err(|_| ())?
         .map_err(|_| ())?;
 
     if status.success() { Ok(()) } else { Err(()) }

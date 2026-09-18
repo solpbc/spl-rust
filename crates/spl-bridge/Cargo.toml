@@ -23,7 +23,7 @@ serde_json = { workspace = true }
 spl-core = { workspace = true }
 thiserror = { workspace = true }
 socket2 = { workspace = true }
-tokio = { workspace = true, features = ["io-util", "rt", "sync", "macros", "net", "time", "signal"] }
+tokio = { workspace = true, features = ["io-util", "rt", "sync", "macros", "net", "time", "signal", "process"] }
 tokio-rustls = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "registry", "std"] }

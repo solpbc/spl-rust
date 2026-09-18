@@ -1,0 +1,31 @@
+#!/usr/bin/env bash
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (c) 2026 sol pbc
+
+set -euo pipefail
+
+ACTIVATE="${ACTIVATE:-spl-bridge-activate}"
+GENERATIONS_DIR="${GENERATIONS_DIR:-/etc/spl-bridge/tls-generations}"
+VERIFY_ADDR="${VERIFY_ADDR:-127.0.0.1:443}"
+RELOAD_CMD="${RELOAD_CMD:-systemctl reload spl-bridge}"
+
+# lego v4 uses LEGO_CERT_*; v5 renamed these to LEGO_HOOK_CERT_*.
+ISSUED_CERT="${LEGO_HOOK_CERT_PATH:-${LEGO_CERT_PATH:-}}"
+ISSUED_KEY="${LEGO_HOOK_CERT_KEY_PATH:-${LEGO_CERT_KEY_PATH:-}}"
+if [[ -z "$ISSUED_CERT" || -z "$ISSUED_KEY" ]]; then
+    echo "spl-bridge renewal hook received no certificate paths" >&2
+    exit 1
+fi
+
+ACTIVATE_ARGS=()
+if [[ -n "${ACTIVATE_ROOTS:-}" ]]; then
+    ACTIVATE_ARGS+=(--control-tls-roots "$ACTIVATE_ROOTS")
+fi
+
+exec "$ACTIVATE" \
+    --issued-cert "$ISSUED_CERT" \
+    --issued-key "$ISSUED_KEY" \
+    --generations-dir "$GENERATIONS_DIR" \
+    --verify-addr "$VERIFY_ADDR" \
+    --reload-cmd "$RELOAD_CMD" \
+    "${ACTIVATE_ARGS[@]}"

@@ -37,8 +37,8 @@ install -o root -g root -m 0755 crates/spl-bridge/deploy/spl-bridge-renew-hook /
 2. Bootstrap the atomic generation tree from the certificate the old service already presents. `true` is intentional: the old unit has no reload action yet, while the verification handshake proves the staged generation is byte-for-byte the live leaf.
 
 ```bash
-install -d -o root -g spl-bridge -m 0750 /etc/spl-bridge/tls-generations
-sudo -u root -g spl-bridge spl-bridge-activate \
+install -d -o root -g spl-bridge -m 2750 /etc/spl-bridge/tls-generations
+spl-bridge-activate \
     --issued-cert /etc/spl-bridge/tls/fullchain.pem \
     --issued-key /etc/spl-bridge/tls/privkey.pem \
     --generations-dir /etc/spl-bridge/tls-generations \
@@ -95,7 +95,7 @@ Success proves that public port 443 routed the reserved-name `acme-tls/1` challe
 Manually activate only already-issued production material:
 
 ```bash
-sudo -u root -g spl-bridge spl-bridge-activate \
+spl-bridge-activate \
     --issued-cert /etc/spl-bridge/acme-production/certificates/bridge.solstone.me.crt \
     --issued-key /etc/spl-bridge/acme-production/certificates/bridge.solstone.me.key \
     --generations-dir /etc/spl-bridge/tls-generations \

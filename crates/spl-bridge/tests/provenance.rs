@@ -304,6 +304,8 @@ fn ac13_systemd_assets_exist_and_contain_hardening_directives() {
 
     let runbook = std::fs::read_to_string(deploy_dir.join("RUNBOOK.md")).unwrap();
     assert!(runbook.contains("SPL Bridge Operations Runbook"));
+    assert!(runbook.contains("-m 2750 /etc/spl-bridge/tls-generations"));
+    assert!(!runbook.contains("sudo -u root -g spl-bridge spl-bridge-activate"));
     assert!(runbook.contains("acme-staging-v02.api.letsencrypt.org"));
 }
 

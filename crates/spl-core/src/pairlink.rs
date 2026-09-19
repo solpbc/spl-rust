@@ -15,9 +15,11 @@
 //!
 //! Byte layout follows the vendored SPL pairing protocol and is shared by every
 //! consumer implementation. Port 0 means
-//! [`DEFAULT_DIRECT_PORT`](crate::DEFAULT_DIRECT_PORT). Direct addresses are
-//! limited to RFC 1918, 169.254/16, 100.64/10, and 127/8 (loopback is admitted);
-//! one disallowed address refuses the whole link. V05 accepts one through four
+//! [`DEFAULT_DIRECT_PORT`](crate::DEFAULT_DIRECT_PORT). A direct address is
+//! refused only if it is the unspecified network (first octet `0`) or
+//! multicast/reserved (first octet `>= 224`, which also covers the broadcast
+//! address); every other IPv4 address, private or public, is admitted. One
+//! disallowed address refuses the whole link. V05 accepts one through four
 //! raw candidates and coalesces duplicates in first-occurrence order. The CA
 //! fingerprint is the 16-byte SHA-256-of-CA-cert-DER prefix the TLS layer pins.
 

@@ -127,14 +127,6 @@ const ADDR_TYPE_IPV4: u8 = 0x01;
 const NONCE_LEN: usize = 16;
 const CA_FP_LEN: usize = 16;
 const MAX_DIRECT_CANDIDATES: u8 = 4;
-const ALLOWED_DIRECT_IPV4_RANGES: [(u32, u32); 6] = [
-    (0x0a00_0000, 0x0aff_ffff), // 10/8
-    (0xac10_0000, 0xac1f_ffff), // 172.16/12
-    (0xc0a8_0000, 0xc0a8_ffff), // 192.168/16
-    (0xa9fe_0000, 0xa9fe_ffff), // 169.254/16
-    (0x6440_0000, 0x647f_ffff), // 100.64/10
-    (0x7f00_0000, 0x7fff_ffff), // 127/8
-];
 const RELAY_CA_FP_TAG_SPKI_SHA256: u8 = 0x01;
 const RELAY_WINDOW_BASE_LEN: usize = 27;
 
@@ -174,11 +166,17 @@ pub(crate) fn uuid_string(raw: &[u8]) -> String {
     clippy::trivially_copy_pass_by_ref,
     reason = "borrowing keeps address admission consistent with parsed wire slices"
 )]
+// Not restricted to private/CGNAT/loopback ranges: a direct pair link's trust
+// anchor is the embedded CA-fingerprint pin, checked at TLS handshake time,
+// not the network locality of the address it dials. A public IPv4 is exactly
+// as valid a direct-pairing candidate as a private one. The only remaining
+// exclusions are structural: the unspecified network (this-host/this-network,
+// `0.0.0.0/8`) is never a dial target, and the top of the space
+// (`224.0.0.0/3`, multicast plus the reserved class-E block, which also
+// covers the broadcast address) is never a unicast home address. Removed
+// 2026-09-18 (founder + CSO ruling, `req_xhwmvxvn`).
 fn is_allowed_direct_ipv4(octets: &[u8; 4]) -> bool {
-    let address = u32::from_be_bytes(*octets);
-    ALLOWED_DIRECT_IPV4_RANGES
-        .iter()
-        .any(|(lo, hi)| (*lo..=*hi).contains(&address))
+    octets[0] != 0 && octets[0] < 224
 }
 
 fn normalize_port(raw: u16) -> u16 {
@@ -477,7 +475,11 @@ mod tests {
     }
 
     #[test]
-    fn addresses_immediately_outside_allowed_ranges_are_rejected() {
+    fn public_and_formerly_restricted_ipv4_are_admitted() {
+        // No LAN-only restriction: every one of these was rejected before
+        // 2026-09-18 (either outside the old private/CGNAT/loopback allow-list
+        // entirely, or just past one of its boundaries). All are valid direct
+        // dial targets now.
         for address in [
             [9, 255, 255, 255],
             [11, 0, 0, 0],
@@ -491,14 +493,31 @@ mod tests {
             [100, 128, 0, 0],
             [126, 255, 255, 255],
             [128, 0, 0, 0],
-            [0, 0, 0, 0],
-            [255, 255, 255, 255],
-            [224, 0, 0, 1],
             [192, 0, 2, 42],
             [198, 51, 100, 20],
             [203, 0, 113, 5],
             [198, 18, 0, 1],
             [8, 8, 8, 8],
+            [223, 255, 255, 255],
+        ] {
+            assert!(
+                is_allowed_direct_ipv4(&address),
+                "{} should be admitted",
+                ipv4_string(&address)
+            );
+        }
+    }
+
+    #[test]
+    fn only_the_unspecified_network_and_multicast_reserved_are_rejected() {
+        for address in [
+            [0, 0, 0, 0],
+            [0, 255, 255, 255],
+            [224, 0, 0, 0],
+            [224, 0, 0, 1],
+            [239, 255, 255, 255],
+            [240, 0, 0, 0],
+            [255, 255, 255, 255],
         ] {
             assert!(
                 !is_allowed_direct_ipv4(&address),
@@ -553,12 +572,24 @@ mod tests {
     }
 
     #[test]
-    fn v04_rejects_disallowed_direct_ipv4_with_address_only() {
+    fn v04_admits_public_direct_ipv4_with_address_only() {
         let blob = build_v04([192, 0, 2, 42], 7657);
+        assert_eq!(
+            direct(parse_blob(&blob).unwrap()).candidates,
+            vec![Endpoint {
+                host: "192.0.2.42".into(),
+                port: 7657,
+            }]
+        );
+    }
+
+    #[test]
+    fn v04_rejects_multicast_direct_ipv4_with_address_only() {
+        let blob = build_v04([224, 0, 0, 1], 7657);
         assert_eq!(
             parse_blob(&blob).unwrap_err(),
             PairLinkError::DisallowedDirectIpv4 {
-                address: "192.0.2.42".into(),
+                address: "224.0.0.1".into(),
             }
         );
     }
@@ -605,7 +636,7 @@ mod tests {
     fn v05_rejects_disallowed_member_in_every_position() {
         let allowed_a = [10, 0, 0, 1];
         let allowed_b = [192, 168, 1, 2];
-        let disallowed = [192, 0, 2, 42];
+        let disallowed = [224, 0, 0, 1];
         for addresses in [
             [disallowed, allowed_a, allowed_b],
             [allowed_a, disallowed, allowed_b],
@@ -616,10 +647,40 @@ mod tests {
             assert_eq!(
                 result.unwrap_err(),
                 PairLinkError::DisallowedDirectIpv4 {
-                    address: "192.0.2.42".into(),
+                    address: "224.0.0.1".into(),
                 }
             );
         }
+    }
+
+    #[test]
+    fn v05_admits_mixed_private_link_local_and_public_candidates() {
+        // No LAN-only restriction: the whole candidate set admits regardless
+        // of which candidates are private, link-local, or public.
+        let pl = direct(
+            parse_blob(&build_v05(
+                &[[192, 168, 0, 10], [192, 0, 2, 20], [169, 254, 0, 30]],
+                7657,
+            ))
+            .unwrap(),
+        );
+        assert_eq!(
+            pl.candidates,
+            vec![
+                Endpoint {
+                    host: "192.168.0.10".into(),
+                    port: 7657,
+                },
+                Endpoint {
+                    host: "192.0.2.20".into(),
+                    port: 7657,
+                },
+                Endpoint {
+                    host: "169.254.0.30".into(),
+                    port: 7657,
+                },
+            ]
+        );
     }
 
     #[test]
@@ -718,11 +779,11 @@ mod tests {
 
     #[test]
     fn duplicate_candidates_do_not_hide_a_disallowed_member() {
-        let blob = build_v05(&[[10, 0, 0, 1], [10, 0, 0, 1], [192, 0, 2, 42]], 7657);
+        let blob = build_v05(&[[10, 0, 0, 1], [10, 0, 0, 1], [224, 0, 0, 1]], 7657);
         assert_eq!(
             parse_blob(&blob).unwrap_err(),
             PairLinkError::DisallowedDirectIpv4 {
-                address: "192.0.2.42".into(),
+                address: "224.0.0.1".into(),
             }
         );
     }

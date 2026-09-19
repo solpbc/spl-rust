@@ -662,7 +662,7 @@ mod tests {
     async fn direct_pair_link_refusal_has_zero_prepare_and_write_counts() {
         let seam = FakeDirectPairingSeam::new(vec![], successful_send());
         let counters = seam.counters();
-        let link = direct_v05_link(&[[10, 0, 0, 1], [192, 0, 2, 42]]);
+        let link = direct_v05_link(&[[10, 0, 0, 1], [224, 0, 0, 1]]);
         let additional_fields = serde_json::Map::new();
 
         let error = pair_from_link_with_seam(&link, "test-device", seam, &additional_fields)

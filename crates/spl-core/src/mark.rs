@@ -5,8 +5,7 @@
 //!
 //! Ported verbatim from `solstone-journal`'s `solstone-core-sol-link::mark`
 //! (same assets, same derivation, same fixed vectors) so every Rust client —
-//! not only the journal itself — can compute a jid's mark offline. See
-//! `vpx/design-system/unknown-journal.md` in the `extro` repo for why this
+//! not only the journal itself — can compute a jid's mark offline. Why it
 //! moved here: the mark is a pure function of a jid, [`crate::relay_window`]
 //! already derives a jid from a peer certificate for the same identity-display
 //! purpose, and a duplicated asset table across several clients is a known

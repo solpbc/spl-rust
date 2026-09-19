@@ -175,8 +175,8 @@ pub(crate) fn uuid_string(raw: &[u8]) -> String {
 // exclusions are structural: the unspecified network (this-host/this-network,
 // `0.0.0.0/8`) is never a dial target, and the top of the space
 // (`224.0.0.0/3`, multicast plus the reserved class-E block, which also
-// covers the broadcast address) is never a unicast home address. Removed
-// 2026-09-18 (founder + CSO ruling, `req_xhwmvxvn`).
+// covers the broadcast address) is never a unicast home address. The
+// private/LAN-only restriction was removed 2026-09-18.
 fn is_allowed_direct_ipv4(octets: &[u8; 4]) -> bool {
     octets[0] != 0 && octets[0] < 224
 }

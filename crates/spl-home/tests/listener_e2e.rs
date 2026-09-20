@@ -36,8 +36,8 @@ use spl_core::frame::{
 use spl_core::mux::INITIAL_WINDOW;
 use spl_core::pairlink::RelayPairLink;
 use spl_home::{
-    DEFAULT_DECODER_BUFFER_BYTES, HomeConfig, HomeConnection, MuxLimits, PairSecret, PairWindow,
-    PairWindowConfig, PairWindowRefusal,
+    CarrierClose, DEFAULT_DECODER_BUFFER_BYTES, HomeConfig, HomeConnection, MuxLimits, PairSecret,
+    PairWindow, PairWindowConfig, PairWindowRefusal,
 };
 use spl_transport::TransportError;
 use spl_transport::relay_pairing::pair_over_carrier;
@@ -1058,4 +1058,126 @@ fn tls13_session_tickets_remain_enabled_by_default() {
         .server_config()
         .unwrap();
     assert_eq!(server.send_tls13_tickets, 2);
+}
+
+/// The record has to answer two questions after a carrier is gone: did this
+/// side answer anything, and why did it stop. Both investigations that asked
+/// for this had to infer them.
+#[tokio::test]
+async fn a_carrier_records_what_it_answered_and_that_the_peer_closed_cleanly() {
+    let fixture = fixture();
+    let (dialer_io, home_io) = tokio::io::duplex(256 * 1024);
+    let home = tokio::spawn(HomeConnection::accept(
+        home_io,
+        config(&fixture, verifier(fixture.ca.clone())),
+    ));
+    let connector = TlsConnector::from(Arc::new(client_config(&fixture)));
+    let mut dialer = connector
+        .connect(ServerName::try_from("spl.local").unwrap(), dialer_io)
+        .await
+        .unwrap();
+    let mut connection = home.await.unwrap().unwrap();
+
+    // Nothing asked yet: not "silent for its whole age".
+    let before = connection.carrier_counts();
+    assert_eq!(before.pings_answered, 0);
+    assert_eq!(before.current_gap_ms, None);
+    assert_eq!(before.close, CarrierClose::Open);
+
+    let mut decoder = FrameDecoder::new();
+    for nonce in [[1u8; 8], [2u8; 8], [3u8; 8]] {
+        dialer
+            .write_all(&wire(Frame::control_ping(nonce)))
+            .await
+            .unwrap();
+        loop {
+            let frames = read_frames(&mut dialer, &mut decoder).await;
+            if frames
+                .iter()
+                .any(|frame| frame.stream_id == 0 && frame.flags == FLAG_PONG)
+            {
+                break;
+            }
+        }
+    }
+
+    let answered = connection.carrier_counts();
+    assert_eq!(answered.pings_answered, 3);
+    assert!(answered.current_gap_ms.is_some());
+
+    // A clean close is a TLS close_notify, not a vanished socket. Draining to
+    // Err is the only join signal this type offers, and reading the reason
+    // before it would report Open.
+    dialer.shutdown().await.unwrap();
+    while connection.accept_stream().await.is_ok() {}
+
+    let ended = connection.carrier_counts();
+    assert_eq!(ended.pings_answered, 3);
+    assert_eq!(
+        ended.close,
+        CarrierClose::PeerEof { truncated: false },
+        "a clean hangup must be distinguishable from a truncated one and from a read failure"
+    );
+    assert!(!ended.close.is_abnormal());
+}
+
+/// A peer that stops mid-frame is not the same event as one that hangs up, and
+/// the whole point of the reason is telling them apart.
+#[tokio::test]
+async fn a_peer_that_stops_mid_frame_is_recorded_as_truncated() {
+    let fixture = fixture();
+    let (dialer_io, home_io) = tokio::io::duplex(256 * 1024);
+    let home = tokio::spawn(HomeConnection::accept(
+        home_io,
+        config(&fixture, verifier(fixture.ca.clone())),
+    ));
+    let connector = TlsConnector::from(Arc::new(client_config(&fixture)));
+    let mut dialer = connector
+        .connect(ServerName::try_from("spl.local").unwrap(), dialer_io)
+        .await
+        .unwrap();
+    let mut connection = home.await.unwrap().unwrap();
+
+    let framed = wire(Frame::control_ping([4u8; 8]));
+    dialer.write_all(&framed[..framed.len() - 3]).await.unwrap();
+    dialer.flush().await.unwrap();
+    tokio::task::yield_now().await;
+    dialer.shutdown().await.unwrap();
+    while connection.accept_stream().await.is_ok() {}
+
+    let ended = connection.carrier_counts();
+    assert_eq!(
+        ended.close,
+        CarrierClose::PeerEof { truncated: true },
+        "a partial frame left buffered at EOF is a truncated close"
+    );
+    assert!(ended.close.is_abnormal());
+    assert_eq!(ended.pings_answered, 0, "a partial PING is never answered");
+}
+
+/// A peer that simply vanishes is not the same as one that closes, and the
+/// difference is not cosmetic: rustls treats a transport that ends without
+/// `close_notify` as a truncation, so it surfaces as a read failure rather
+/// than an EOF. Pinned because the natural expectation is the other one.
+#[tokio::test]
+async fn a_peer_that_vanishes_without_close_notify_is_a_read_failure_not_an_eof() {
+    let fixture = fixture();
+    let (dialer_io, home_io) = tokio::io::duplex(256 * 1024);
+    let home = tokio::spawn(HomeConnection::accept(
+        home_io,
+        config(&fixture, verifier(fixture.ca.clone())),
+    ));
+    let connector = TlsConnector::from(Arc::new(client_config(&fixture)));
+    let dialer = connector
+        .connect(ServerName::try_from("spl.local").unwrap(), dialer_io)
+        .await
+        .unwrap();
+    let mut connection = home.await.unwrap().unwrap();
+
+    drop(dialer);
+    while connection.accept_stream().await.is_ok() {}
+
+    let ended = connection.carrier_counts();
+    assert_eq!(ended.close, CarrierClose::PeerReadFailed);
+    assert!(ended.close.is_abnormal());
 }

@@ -35,6 +35,128 @@ pub struct MuxAcceptor {
 
 /// Per-stream refusals one carrier has issued, by class.
 ///
+/// Why a carrier's driver stopped.
+///
+/// Named for what the driver can actually tell apart where it stops, not one
+/// variant per exit: several exits share a cause that is not separable there,
+/// and splitting them would invent precision this record does not have.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CarrierClose {
+    /// The driver is still running.
+    Open,
+    /// The peer closed the carrier with a TLS `close_notify`.
+    ///
+    /// A peer that simply vanishes does not reach here: rustls treats a
+    /// transport that ends without `close_notify` as a truncation, so it
+    /// surfaces as [`Self::PeerReadFailed`].
+    PeerEof {
+        /// A partial frame was still buffered at EOF, so the peer stopped
+        /// mid-frame rather than on a frame boundary.
+        truncated: bool,
+    },
+    /// Reading from the carrier failed.
+    PeerReadFailed,
+    /// The acceptor refused peer input fatally: a protocol violation, a
+    /// flow-control ceiling, or a local accounting failure. Not separable at
+    /// the point the driver stops, so not separated here.
+    AcceptorRefused,
+    /// Writing to the carrier failed, at encode, write or flush.
+    WriteFailed,
+    /// The local owner dropped this connection while the driver ran. The
+    /// opposite diagnosis from a dead socket.
+    OwnerGone,
+    /// The local owner asked for closure.
+    LocalClose,
+}
+
+impl CarrierClose {
+    /// Wire form, for publishing across a shared atomic.
+    #[must_use]
+    pub fn code(self) -> u8 {
+        match self {
+            Self::Open => 0,
+            Self::PeerEof { truncated: false } => 1,
+            Self::PeerEof { truncated: true } => 2,
+            Self::PeerReadFailed => 3,
+            Self::AcceptorRefused => 4,
+            Self::WriteFailed => 5,
+            Self::OwnerGone => 6,
+            Self::LocalClose => 7,
+        }
+    }
+
+    /// Inverse of [`Self::code`]; an unknown code reads as [`Self::Open`].
+    #[must_use]
+    pub fn from_code(code: u8) -> Self {
+        match code {
+            1 => Self::PeerEof { truncated: false },
+            2 => Self::PeerEof { truncated: true },
+            3 => Self::PeerReadFailed,
+            4 => Self::AcceptorRefused,
+            5 => Self::WriteFailed,
+            6 => Self::OwnerGone,
+            7 => Self::LocalClose,
+            _ => Self::Open,
+        }
+    }
+
+    /// Whether this carrier ended in a way worth an operator's attention.
+    #[must_use]
+    pub fn is_abnormal(self) -> bool {
+        matches!(
+            self,
+            Self::PeerEof { truncated: true }
+                | Self::PeerReadFailed
+                | Self::AcceptorRefused
+                | Self::WriteFailed
+        )
+    }
+}
+
+/// What a carrier answered, and how it ended.
+///
+/// `pings_answered` records what this side **replied to**, never what it was
+/// **asked**. The only arrival the driver observes is one it answers in the
+/// same `feed`, and the starvation case is bytes left unread in the socket,
+/// which a task that is not being polled cannot see. So a peer that stopped
+/// pinging reads the same here as a driver that stopped answering, and
+/// [`Self::close`] is what separates them in practice.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CarrierCounts {
+    /// Control frames answered, counted after the answer was flushed.
+    pub pings_answered: u64,
+    /// Time since the last answer. `None` when nothing was ever answered, so a
+    /// carrier nobody pings is not reported as one silent for its whole age.
+    pub current_gap_ms: Option<u64>,
+    /// The longest such interval seen, including the one open at read time.
+    pub longest_gap_ms: Option<u64>,
+    /// Why the driver stopped, or [`CarrierClose::Open`] while it runs.
+    pub close: CarrierClose,
+}
+
+/// The gaps a reader should report, from the carrier's recorded state.
+///
+/// Computed against a live `now` rather than maintained at answer time: a
+/// watermark only advances when the next answer happens, so during a stall it
+/// reads pre-stall exactly when someone is asking about the stall.
+///
+/// Saturating on purpose. A torn read across the two recorded values may only
+/// over-report; for a gauge whose job is to not hide a stall, that polarity is
+/// the requirement rather than an implementation detail.
+#[must_use]
+pub fn carrier_gaps(
+    pings_answered: u64,
+    now_elapsed_ms: u64,
+    last_answer_elapsed_ms: u64,
+    longest_completed_gap_ms: u64,
+) -> (Option<u64>, Option<u64>) {
+    if pings_answered == 0 {
+        return (None, None);
+    }
+    let current = now_elapsed_ms.saturating_sub(last_answer_elapsed_ms);
+    (Some(current), Some(longest_completed_gap_ms.max(current)))
+}
+
 /// A per-stream refusal resets the offending stream and deliberately leaves the
 /// carrier up, so nothing about it reaches either peer as an error. A peer that
 /// holds the concurrent-stream cap and is refused its next open therefore fails
@@ -1150,5 +1272,73 @@ mod tests {
     )]
     fn feed_frame_result(acceptor: &mut MuxAcceptor, frame: Frame) -> Result<MuxOutput, HomeError> {
         acceptor.feed(&frame.encode().unwrap())
+    }
+}
+
+#[cfg(test)]
+mod carrier_record_tests {
+    use super::{CarrierClose, carrier_gaps};
+
+    #[test]
+    fn a_carrier_that_never_answered_reports_no_gap_rather_than_its_age() {
+        // Relay-path carriers never ping at all, so this is a whole population,
+        // not an edge case. Reporting the carrier's age here would put every one
+        // of them past any threshold and make the signal useless.
+        assert_eq!(carrier_gaps(0, 900_000, 0, 0), (None, None));
+    }
+
+    #[test]
+    fn the_gap_is_measured_against_now_not_against_the_last_answer() {
+        // The whole point: a watermark only advances when the next answer
+        // happens, so during a stall it reads pre-stall exactly when someone is
+        // asking about the stall.
+        let (current, longest) = carrier_gaps(4, 30_000, 2_000, 500);
+        assert_eq!(current, Some(28_000));
+        assert_eq!(
+            longest,
+            Some(28_000),
+            "the open gap outranks every closed one"
+        );
+    }
+
+    #[test]
+    fn a_completed_high_water_survives_a_later_prompt_answer() {
+        let (current, longest) = carrier_gaps(9, 10_100, 10_000, 7_400);
+        assert_eq!(current, Some(100));
+        assert_eq!(longest, Some(7_400));
+    }
+
+    #[test]
+    fn a_torn_read_over_reports_and_never_wraps() {
+        // last_answer ahead of now is only reachable by racing two relaxed
+        // reads. It must not surface as a ~584-million-year gap.
+        let (current, longest) = carrier_gaps(3, 1_000, 4_000, 2_500);
+        assert_eq!(current, Some(0));
+        assert_eq!(longest, Some(2_500));
+    }
+
+    #[test]
+    fn close_codes_round_trip_and_unknown_reads_as_open() {
+        for reason in [
+            CarrierClose::Open,
+            CarrierClose::PeerEof { truncated: false },
+            CarrierClose::PeerEof { truncated: true },
+            CarrierClose::PeerReadFailed,
+            CarrierClose::AcceptorRefused,
+            CarrierClose::WriteFailed,
+            CarrierClose::OwnerGone,
+            CarrierClose::LocalClose,
+        ] {
+            assert_eq!(CarrierClose::from_code(reason.code()), reason);
+        }
+        assert_eq!(CarrierClose::from_code(200), CarrierClose::Open);
+    }
+
+    #[test]
+    fn a_clean_peer_eof_is_not_abnormal_but_a_truncated_one_is() {
+        assert!(!CarrierClose::PeerEof { truncated: false }.is_abnormal());
+        assert!(!CarrierClose::LocalClose.is_abnormal());
+        assert!(CarrierClose::PeerEof { truncated: true }.is_abnormal());
+        assert!(CarrierClose::PeerReadFailed.is_abnormal());
     }
 }

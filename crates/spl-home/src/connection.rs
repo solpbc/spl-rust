@@ -12,14 +12,15 @@ use std::task::{Context, Poll, Waker};
 use std::time::Duration;
 
 use rustls::ServerConfig;
-use spl_core::frame::RECOMMENDED_CHUNK;
+use spl_core::frame::{FLAG_PONG, RECOMMENDED_CHUNK};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::sync::mpsc;
+use tokio::time::Instant;
 use tokio_rustls::TlsAcceptor;
 
 use crate::{
-    HomeConfig, HomeError, MAX_STAGED_WRITE_BYTES_PER_STREAM, MuxAcceptor, MuxEvent, MuxLimits,
-    MuxOutput, RefusalCounts, ResetReason,
+    CarrierClose, CarrierCounts, HomeConfig, HomeError, MAX_STAGED_WRITE_BYTES_PER_STREAM,
+    MuxAcceptor, MuxEvent, MuxLimits, MuxOutput, RefusalCounts, ResetReason, carrier_gaps,
 };
 
 const STREAM_LIVE: u8 = 0;
@@ -47,6 +48,84 @@ where
         while matches!(io.read(&mut discard).await, Ok(count) if count > 0) {}
     })
     .await;
+}
+
+/// Publishes what the driver answered and how it stopped.
+///
+/// Unlike [`RefusalTally`], which mirrors acceptor-owned state, this is the
+/// driver's own: there is nothing to copy, and the reader computes the gap
+/// live rather than reading a watermark the driver could only have advanced
+/// by answering — which is the thing it stops doing under starvation.
+#[derive(Debug)]
+struct CarrierTally {
+    started: Instant,
+    pings_answered: AtomicU64,
+    last_answer_elapsed_ms: AtomicU64,
+    longest_completed_gap_ms: AtomicU64,
+    close: AtomicU8,
+}
+
+impl CarrierTally {
+    fn new() -> Self {
+        Self {
+            started: Instant::now(),
+            pings_answered: AtomicU64::new(0),
+            last_answer_elapsed_ms: AtomicU64::new(0),
+            longest_completed_gap_ms: AtomicU64::new(0),
+            close: AtomicU8::new(CarrierClose::Open.code()),
+        }
+    }
+
+    /// Record `answered` control answers that have reached the wire.
+    ///
+    /// Writes the completed high-water **before** the new last-answer instant,
+    /// so a reader racing this sees the older last-answer against the newer
+    /// high-water and over-reports rather than under-reports.
+    fn record_answers(&self, answered: u64) {
+        if answered == 0 {
+            return;
+        }
+        let now_ms = Self::millis(self.started.elapsed());
+        let previous = self.last_answer_elapsed_ms.load(Ordering::Relaxed);
+        if self.pings_answered.load(Ordering::Relaxed) > 0 {
+            let completed = now_ms.saturating_sub(previous);
+            self.longest_completed_gap_ms
+                .fetch_max(completed, Ordering::Relaxed);
+        }
+        self.last_answer_elapsed_ms.store(now_ms, Ordering::Relaxed);
+        self.pings_answered.fetch_add(answered, Ordering::Relaxed);
+    }
+
+    /// First writer wins: the reason the driver stopped for, not a later
+    /// consequence of having stopped.
+    fn close(&self, reason: CarrierClose) {
+        let _ = self.close.compare_exchange(
+            CarrierClose::Open.code(),
+            reason.code(),
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        );
+    }
+
+    fn snapshot(&self) -> CarrierCounts {
+        let pings_answered = self.pings_answered.load(Ordering::Relaxed);
+        let (current_gap_ms, longest_gap_ms) = carrier_gaps(
+            pings_answered,
+            Self::millis(self.started.elapsed()),
+            self.last_answer_elapsed_ms.load(Ordering::Relaxed),
+            self.longest_completed_gap_ms.load(Ordering::Relaxed),
+        );
+        CarrierCounts {
+            pings_answered,
+            current_gap_ms,
+            longest_gap_ms,
+            close: CarrierClose::from_code(self.close.load(Ordering::Relaxed)),
+        }
+    }
+
+    fn millis(duration: Duration) -> u64 {
+        u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+    }
 }
 
 /// Publishes the driver's acceptor tally for a caller on the other side.
@@ -83,6 +162,7 @@ pub struct HomeConnection {
     accepts: mpsc::UnboundedReceiver<HomeStream>,
     commands: mpsc::UnboundedSender<DriverCommand>,
     refusals: Arc<RefusalTally>,
+    carrier: Arc<CarrierTally>,
 }
 
 /// A byte-stream handle for one peer-opened SPL logical stream.
@@ -207,6 +287,7 @@ impl HomeConnection {
         let (accept_tx, accept_rx) = mpsc::unbounded_channel();
         let (command_tx, command_rx) = mpsc::unbounded_channel();
         let refusals = Arc::new(RefusalTally::default());
+        let carrier = Arc::new(CarrierTally::new());
         tokio::spawn(run_driver(
             tls,
             acceptor,
@@ -214,11 +295,13 @@ impl HomeConnection {
             command_tx.clone(),
             command_rx,
             Arc::clone(&refusals),
+            Arc::clone(&carrier),
         ));
         Ok(Self {
             accepts: accept_rx,
             commands: command_tx,
             refusals,
+            carrier,
         })
     }
 
@@ -231,6 +314,21 @@ impl HomeConnection {
     #[must_use]
     pub fn refusals(&self) -> RefusalCounts {
         self.refusals.snapshot()
+    }
+
+    /// What this carrier answered, and why its driver stopped.
+    ///
+    /// Read it when a carrier ends. The gap is computed against the clock at
+    /// the moment you ask, so it is meaningful while the driver is stalled as
+    /// well as after it has stopped.
+    ///
+    /// [`CarrierClose::Open`] means the driver has not stopped **yet**, not
+    /// that it ended cleanly. A caller that has asked for closure should drain
+    /// [`Self::accept_stream`] to `Err` first: that channel closes when the
+    /// driver returns, so it is the only join signal this type offers.
+    #[must_use]
+    pub fn carrier_counts(&self) -> CarrierCounts {
+        self.carrier.snapshot()
     }
 
     /// Wait for the next peer-opened stream.
@@ -467,6 +565,7 @@ async fn run_driver<S>(
     command_tx: mpsc::UnboundedSender<DriverCommand>,
     mut commands: mpsc::UnboundedReceiver<DriverCommand>,
     refusals: Arc<RefusalTally>,
+    carrier: Arc<CarrierTally>,
 ) where
     S: AsyncRead + AsyncWrite + Unpin,
 {
@@ -484,20 +583,35 @@ async fn run_driver<S>(
         tokio::select! {
             biased;
             read = reader.read(&mut buffer) => {
-                let Ok(read) = read else { break; };
+                let Ok(read) = read else {
+                    carrier.close(CarrierClose::PeerReadFailed);
+                    break;
+                };
                 if read == 0 {
                     let output = acceptor.finish_eof();
+                    let truncated = output
+                        .events
+                        .iter()
+                        .any(|event| matches!(event, MuxEvent::PeerGone { truncated: true }));
+                    carrier.close(CarrierClose::PeerEof { truncated });
                     mark_writable_streams(&output, &pending, &mut ready);
-                    deliver_output(output, &mut streams, &accepts, &command_tx, &mut writer).await;
+                    deliver_output(output, &mut streams, &accepts, &command_tx, &mut writer, &carrier).await;
                     break;
                 }
-                let Ok(output) = acceptor.feed(&buffer[..read]) else { break; };
+                let Ok(output) = acceptor.feed(&buffer[..read]) else {
+                    carrier.close(CarrierClose::AcceptorRefused);
+                    break;
+                };
                 mark_writable_streams(&output, &pending, &mut ready);
-                if !deliver_output(output, &mut streams, &accepts, &command_tx, &mut writer).await {
+                if !deliver_output(output, &mut streams, &accepts, &command_tx, &mut writer, &carrier).await {
+                    carrier.close(CarrierClose::WriteFailed);
                     break;
                 }
             }
             command = commands.recv() => {
+                // Unreachable in practice: run_driver owns a command_tx for its
+                // whole body, so this channel cannot close under it. Left as a
+                // total match rather than given a reason it could never carry.
                 let Some(command) = command else { break; };
                 match command {
                     DriverCommand::Write { stream_id, bytes } => {
@@ -508,10 +622,16 @@ async fn run_driver<S>(
                         let output = match acceptor.consume(stream_id, bytes) {
                             Ok(output) => output,
                             Err(HomeError::Closed) => continue,
-                            Err(_) => break,
+                            Err(_) => {
+                                carrier.close(CarrierClose::AcceptorRefused);
+                                break;
+                            }
                         };
                         mark_writable_streams(&output, &pending, &mut ready);
-                        if !deliver_output(output, &mut streams, &accepts, &command_tx, &mut writer).await { break; }
+                        if !deliver_output(output, &mut streams, &accepts, &command_tx, &mut writer, &carrier).await {
+                            carrier.close(CarrierClose::WriteFailed);
+                            break;
+                        }
                     }
                     DriverCommand::Close { stream_id } => {
                         closing.insert(stream_id);
@@ -527,10 +647,16 @@ async fn run_driver<S>(
                         );
                         match acceptor.reset(stream_id, ResetReason::Cancel) {
                             Ok(output) => {
-                                if !deliver_output(output, &mut streams, &accepts, &command_tx, &mut writer).await { break; }
+                                if !deliver_output(output, &mut streams, &accepts, &command_tx, &mut writer, &carrier).await {
+                                    carrier.close(CarrierClose::WriteFailed);
+                                    break;
+                                }
                             }
                             Err(HomeError::Closed) => {}
-                            Err(_) => break,
+                            Err(_) => {
+                                carrier.close(CarrierClose::AcceptorRefused);
+                                break;
+                            }
                         }
                     }
                     DriverCommand::Reset { stream_id, reason } => {
@@ -543,14 +669,23 @@ async fn run_driver<S>(
                         );
                         match acceptor.reset(stream_id, reason) {
                             Ok(output) => {
-                                if !deliver_output(output, &mut streams, &accepts, &command_tx, &mut writer).await { break; }
+                                if !deliver_output(output, &mut streams, &accepts, &command_tx, &mut writer, &carrier).await {
+                                    carrier.close(CarrierClose::WriteFailed);
+                                    break;
+                                }
                             }
                             Err(HomeError::Closed) => {}
-                            Err(_) => break,
+                            Err(_) => {
+                                carrier.close(CarrierClose::AcceptorRefused);
+                                break;
+                            }
                         }
                     }
                     DriverCommand::Wake => {}
-                    DriverCommand::CloseConnection => break,
+                    DriverCommand::CloseConnection => {
+                        carrier.close(CarrierClose::LocalClose);
+                        break;
+                    }
                 }
             }
         }
@@ -563,9 +698,11 @@ async fn run_driver<S>(
             &accepts,
             &command_tx,
             &mut writer,
+            &carrier,
         )
         .await
         {
+            carrier.close(CarrierClose::WriteFailed);
             break;
         }
     }
@@ -622,6 +759,7 @@ async fn flush_ready<W>(
     accepts: &mpsc::UnboundedSender<HomeStream>,
     command_tx: &mpsc::UnboundedSender<DriverCommand>,
     writer: &mut W,
+    carrier: &CarrierTally,
 ) -> bool
 where
     W: AsyncWrite + Unpin,
@@ -646,7 +784,7 @@ where
                     Err(HomeError::Closed) => continue,
                     Err(_) => return false,
                 };
-                if !deliver_output(output, streams, accepts, command_tx, writer).await {
+                if !deliver_output(output, streams, accepts, command_tx, writer, carrier).await {
                     return false;
                 }
             }
@@ -664,7 +802,7 @@ where
                     Err(HomeError::Closed) => continue,
                     Err(_) => return false,
                 };
-                if !deliver_output(output, streams, accepts, command_tx, writer).await {
+                if !deliver_output(output, streams, accepts, command_tx, writer, carrier).await {
                     return false;
                 }
             }
@@ -673,7 +811,7 @@ where
         let bytes: Vec<u8> = queue.drain(..count).collect();
         match acceptor.try_send_data(stream_id, bytes.clone()) {
             Ok(Some(output)) => {
-                if !deliver_output(output, streams, accepts, command_tx, writer).await {
+                if !deliver_output(output, streams, accepts, command_tx, writer, carrier).await {
                     return false;
                 }
                 if let Some(stream) = streams.get(&stream_id) {
@@ -692,7 +830,8 @@ where
                         Err(HomeError::Closed) => continue,
                         Err(_) => return false,
                     };
-                    if !deliver_output(output, streams, accepts, command_tx, writer).await {
+                    if !deliver_output(output, streams, accepts, command_tx, writer, carrier).await
+                    {
                         return false;
                     }
                 }
@@ -723,23 +862,32 @@ async fn deliver_output<W>(
     accepts: &mpsc::UnboundedSender<HomeStream>,
     command_tx: &mpsc::UnboundedSender<DriverCommand>,
     writer: &mut W,
+    carrier: &CarrierTally,
 ) -> bool
 where
     W: AsyncWrite + Unpin,
 {
     let mut wrote_frame = false;
-    for frame in output.frames {
+    // Counted here and not where the acceptor queued them: `frames` is what the
+    // writer must send, and encode, write or flush can each still fail. An
+    // answer that never reached the wire is not an answer.
+    let mut answered = 0_u64;
+    for frame in &output.frames {
         let Ok(bytes) = frame.encode() else {
             return false;
         };
         if writer.write_all(&bytes).await.is_err() {
             return false;
         }
+        if frame.stream_id == 0 && frame.flags == FLAG_PONG {
+            answered += 1;
+        }
         wrote_frame = true;
     }
     if wrote_frame && writer.flush().await.is_err() {
         return false;
     }
+    carrier.record_answers(answered);
     for event in output.events {
         match event {
             MuxEvent::Opened { stream_id } => {
@@ -756,6 +904,9 @@ where
                     .send(HomeStream::new(stream_id, rx, command_tx.clone(), state))
                     .is_err()
                 {
+                    // The local owner dropped this connection. The opposite
+                    // diagnosis from a dead socket, so it is named separately.
+                    carrier.close(CarrierClose::OwnerGone);
                     return false;
                 }
             }
@@ -828,6 +979,7 @@ mod tests {
                 &accepts,
                 &commands,
                 &mut writer,
+                &CarrierTally::new(),
             )
             .await
         );
@@ -866,6 +1018,7 @@ mod tests {
                 &accepts,
                 &commands,
                 &mut writer,
+                &CarrierTally::new(),
             )
             .await
         );
@@ -912,6 +1065,7 @@ mod tests {
                 &accepts,
                 &commands,
                 &mut writer,
+                &CarrierTally::new(),
             )
             .await
         );
@@ -938,6 +1092,7 @@ mod tests {
                 &accepts,
                 &commands,
                 &mut writer,
+                &CarrierTally::new(),
             )
             .await
         );
@@ -951,6 +1106,7 @@ mod tests {
                 &accepts,
                 &commands,
                 &mut writer,
+                &CarrierTally::new(),
             )
             .await
         );
@@ -1010,6 +1166,7 @@ mod tests {
                 &accepts,
                 &stream.commands,
                 &mut writer,
+                &CarrierTally::new(),
             )
             .await
         );

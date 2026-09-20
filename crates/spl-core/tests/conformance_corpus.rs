@@ -15,7 +15,7 @@ use std::ffi::OsStr;
 use std::fs;
 use std::path::{Component, Path, PathBuf};
 
-const AUTHORITY_COMMIT: &str = "7266d9d91c2eb0867ae512a7ea3f3dd001a9ae45";
+const AUTHORITY_COMMIT: &str = "100c3e343a819ed918ef6a924ef5a45e9ec8c133";
 const AUTHORITY_MANIFEST_SHA256: &str =
     "8e2dc3f9f0eed57bc0f813654f5ff6dac1f5dbbb254c1dd05ee67bf5707202a9";
 const BUNDLE_SEMVER: &str = "8.0.0";

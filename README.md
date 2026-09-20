@@ -1,6 +1,6 @@
 # spl-rust
 
-The SPL (**solstone private link**) library for Rust consumers. Three crates: **`spl-core`** (pure wire), **`spl-transport`** (client sockets and TLS), and **`spl-home`** (listener-side mux).
+The SPL (**solstone private link**) library for Rust consumers. Four crates: **`spl-core`** (pure wire), **`spl-transport`** (client sockets and TLS), **`spl-home`** (listener-side mux), and **`spl-bridge`** (SNI-passthrough MCP relay).
 
 SPL is the encrypted connection between a [solstone](https://solstone.app) client and the owner's journal: mutual TLS with a pairing-minted client certificate, carried over a direct LAN connection or a WebSocket relay when no direct path exists. Neither the relay operator nor sol pbc holds a key that can decrypt what flows inside — the relay authenticates the rendezvous, never the payload.
 

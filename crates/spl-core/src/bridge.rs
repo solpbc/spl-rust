@@ -321,14 +321,14 @@ pub fn check_loopback_host(head: &RequestHead, port: u16) -> Result<(), RejectRe
 /// # Errors
 ///
 /// Returns [`RejectReason::BadMethod`] unless the method is `GET`, `HEAD`, or
-/// `POST`, or `PUT` to the authenticated current-device description route.
+/// `POST`, or `PUT`/`DELETE` to the authenticated current-device route.
 pub fn check_method(head: &RequestHead) -> Result<(), RejectReason> {
-    let self_description_put = head.method == "PUT"
+    let current_device_mutation = matches!(head.method.as_str(), "PUT" | "DELETE")
         && matches!(
             head.path(),
             "/app/network/api/clients/self" | "/app/link/api/clients/self"
         );
-    if !matches!(head.method.as_str(), "GET" | "HEAD" | "POST") && !self_description_put {
+    if !matches!(head.method.as_str(), "GET" | "HEAD" | "POST") && !current_device_mutation {
         return Err(RejectReason::BadMethod);
     }
     Ok(())
@@ -867,43 +867,127 @@ mod tests {
     }
 
     #[test]
-    fn current_device_put_retains_capability_and_caller_auth_checks() {
+    fn current_device_mutations_retain_capability_and_caller_auth_checks() {
         let names = names();
-        for path in [
-            "/app/network/api/clients/self",
-            "/app/link/api/clients/self",
-        ] {
-            for (cookie, expected) in [
-                ("secret", Ok(())),
-                ("wrong", Err(RejectReason::BadCapability)),
+        for method in ["PUT", "DELETE"] {
+            for path in [
+                "/app/network/api/clients/self",
+                "/app/link/api/clients/self",
             ] {
+                for (cookie, expected) in [
+                    ("secret", Ok(())),
+                    ("wrong", Err(RejectReason::BadCapability)),
+                ] {
+                    let head = request(
+                        method,
+                        path,
+                        Some("127.0.0.1:49152"),
+                        &[(
+                            "Cookie",
+                            &format!("{}={cookie}", names.capability_cookie_name),
+                        )],
+                    );
+                    assert_eq!(authorize(&head, b"secret", 49152, &names), expected);
+                }
+                let head = request(method, path, Some("127.0.0.1:49152"), &[]);
+                assert_eq!(
+                    authorize(&head, b"secret", 49152, &names),
+                    Err(RejectReason::BadCapability)
+                );
                 let head = request(
-                    "PUT",
+                    method,
                     path,
                     Some("127.0.0.1:49152"),
-                    &[(
-                        "Cookie",
-                        &format!("{}={cookie}", names.capability_cookie_name),
-                    )],
+                    &[("Authorization", "Bearer caller")],
                 );
-                assert_eq!(authorize(&head, b"secret", 49152, &names), expected);
+                assert_eq!(
+                    authorize(&head, b"secret", 49152, &names),
+                    Err(RejectReason::CallerAuth)
+                );
             }
-            let head = request("PUT", path, Some("127.0.0.1:49152"), &[]);
-            assert_eq!(
-                authorize(&head, b"secret", 49152, &names),
-                Err(RejectReason::BadCapability)
-            );
-            let head = request(
-                "PUT",
-                path,
-                Some("127.0.0.1:49152"),
-                &[("Authorization", "Bearer caller")],
-            );
-            assert_eq!(
-                authorize(&head, b"secret", 49152, &names),
-                Err(RejectReason::CallerAuth)
-            );
         }
+    }
+
+    #[test]
+    fn current_device_mutations_require_exact_paths() {
+        let names = names();
+        for method in ["PUT", "DELETE"] {
+            for path in [
+                "/app/network/api/clients/self/",
+                "/app/network/api/clients/selfish",
+                "/app/network/api/clients/sha256:other",
+                "/app/link/api/clients/self/",
+                "/app/link/api/clients/selfish",
+                "/prefix/app/link/api/clients/self",
+            ] {
+                let head = authed_request(method, Some("127.0.0.1:49152"), "secret", &names);
+                let head = RequestHead {
+                    target: path.to_owned(),
+                    ..head
+                };
+                assert_eq!(
+                    authorize(&head, b"secret", 49152, &names),
+                    Err(RejectReason::BadMethod),
+                    "{method} {path}"
+                );
+            }
+        }
+
+        for method in ["PUT", "DELETE"] {
+            let head = request(
+                method,
+                "/app/network/api/clients/self?source=test",
+                Some("127.0.0.1:49152"),
+                &[("Cookie", "__journal_cap=secret")],
+            );
+            assert_eq!(authorize(&head, b"secret", 49152, &names), Ok(()));
+        }
+    }
+
+    #[test]
+    fn authorize_preserves_rejection_order_for_conflicting_failures() {
+        let names = names();
+        let all_bad = request(
+            "DELETE",
+            "/other",
+            Some("localhost:49152"),
+            &[
+                ("Authorization", "Bearer caller"),
+                ("Cookie", "__journal_cap=wrong"),
+            ],
+        );
+        assert_eq!(
+            authorize(&all_bad, b"secret", 49152, &names),
+            Err(RejectReason::BadHost)
+        );
+
+        let bad_method = request(
+            "DELETE",
+            "/other",
+            Some("127.0.0.1:49152"),
+            &[
+                ("Authorization", "Bearer caller"),
+                ("Cookie", "__journal_cap=wrong"),
+            ],
+        );
+        assert_eq!(
+            authorize(&bad_method, b"secret", 49152, &names),
+            Err(RejectReason::BadMethod)
+        );
+
+        let caller_auth = request(
+            "DELETE",
+            "/app/network/api/clients/self",
+            Some("127.0.0.1:49152"),
+            &[
+                ("Authorization", "Bearer caller"),
+                ("Cookie", "__journal_cap=wrong"),
+            ],
+        );
+        assert_eq!(
+            authorize(&caller_auth, b"secret", 49152, &names),
+            Err(RejectReason::CallerAuth)
+        );
     }
 
     #[test]

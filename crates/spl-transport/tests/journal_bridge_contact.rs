@@ -317,7 +317,7 @@ async fn fixed_port_binds_only_ipv4_loopback() {
 }
 
 #[tokio::test]
-async fn self_description_put_requires_bridge_capability_on_actual_listener() {
+async fn current_device_mutations_require_bridge_capability_on_actual_listener() {
     let calls = Arc::new(AtomicUsize::new(0));
     let observed = calls.clone();
     let handle = journal_bridge::start(JournalBridgeConfig {
@@ -341,34 +341,44 @@ async fn self_description_put_requires_bridge_capability_on_actual_listener() {
     let bootstrap = handle.bootstrap_url().unwrap();
     let capability = bootstrap.split_once("cap=").unwrap().1;
     let cookie = format!("test-journal-cap={capability}");
-    for path in [
-        "/app/network/api/clients/self",
-        "/app/link/api/clients/self",
-    ] {
-        for missing_or_wrong in [None, Some("test-journal-cap=wrong")] {
-            assert_eq!(
-                response_status(
-                    &raw_method_request(handle.port(), "PUT", path, missing_or_wrong).await
-                ),
-                403
-            );
+    for method in ["PUT", "DELETE"] {
+        for path in [
+            "/app/network/api/clients/self",
+            "/app/link/api/clients/self",
+        ] {
+            for missing_or_wrong in [None, Some("test-journal-cap=wrong")] {
+                assert_eq!(
+                    response_status(
+                        &raw_method_request(handle.port(), method, path, missing_or_wrong).await
+                    ),
+                    403
+                );
+            }
         }
     }
     assert_eq!(calls.load(Ordering::SeqCst), 0);
-    for path in [
-        "/app/network/api/clients/self",
-        "/app/link/api/clients/self",
-    ] {
+    for method in ["PUT", "DELETE"] {
+        for path in [
+            "/app/network/api/clients/self",
+            "/app/link/api/clients/self",
+        ] {
+            assert_eq!(
+                response_status(
+                    &raw_method_request(handle.port(), method, path, Some(&cookie)).await
+                ),
+                200
+            );
+        }
+    }
+    assert_eq!(calls.load(Ordering::SeqCst), 4);
+    for method in ["PUT", "DELETE"] {
         assert_eq!(
-            response_status(&raw_method_request(handle.port(), "PUT", path, Some(&cookie)).await),
-            200
+            response_status(
+                &raw_method_request(handle.port(), method, "/other", Some(&cookie)).await
+            ),
+            405
         );
     }
-    assert_eq!(calls.load(Ordering::SeqCst), 2);
-    assert_eq!(
-        response_status(&raw_method_request(handle.port(), "PUT", "/other", Some(&cookie)).await),
-        405
-    );
-    assert_eq!(calls.load(Ordering::SeqCst), 2);
+    assert_eq!(calls.load(Ordering::SeqCst), 4);
     handle.begin_shutdown();
 }

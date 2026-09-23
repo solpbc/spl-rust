@@ -99,7 +99,7 @@ fn protocol_mirror_has_exact_pinned_contents() -> Result<(), Box<dyn Error>> {
         ),
         (
             "pairing.md",
-            "b755d4a385e469dcb9eb8680b05e37515e7c7f6b585589e52b0b0dd8e16123c8",
+            "b1f19a39f08f642ab8021f0b1ed404b4d0ca39b6cdff59d63a8206f59d55bc0a",
         ),
         (
             "session.md",

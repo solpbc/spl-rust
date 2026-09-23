@@ -371,14 +371,15 @@ async fn current_device_mutations_require_bridge_capability_on_actual_listener()
         }
     }
     assert_eq!(calls.load(Ordering::SeqCst), 4);
+    // Holding the capability is the whole check: any path takes any method.
     for method in ["PUT", "DELETE"] {
         assert_eq!(
             response_status(
                 &raw_method_request(handle.port(), method, "/other", Some(&cookie)).await
             ),
-            405
+            200
         );
     }
-    assert_eq!(calls.load(Ordering::SeqCst), 4);
+    assert_eq!(calls.load(Ordering::SeqCst), 6);
     handle.begin_shutdown();
 }

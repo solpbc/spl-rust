@@ -4,10 +4,12 @@
 //! Hand-rolled configurable loopback proxy for consumer HTTP traffic.
 //!
 //! The default policy preserves the paired journal dashboard behavior:
-//! ephemeral port, capability gate, streaming `GET /sse/events`, the existing
-//! request-header allow-list, and an 8 MiB request-body limit. Disabling the
-//! capability gate permits every method, while exact loopback `Host` validation
-//! and bridge-reserved header stripping remain mandatory.
+//! ephemeral port, capability gate, streaming `GET /sse/events`, and an 8 MiB
+//! request-body limit. The capability and the exact loopback `Host` are the
+//! whole admission check: a caller holding the capability is the consumer's own
+//! code, so every method and every header the bridge does not reserve is
+//! forwarded. Disabling the capability gate leaves only the `Host` check, and
+//! bridge-reserved header stripping applies either way.
 //!
 //! Requests use known-length framing: at most one valid `Content-Length` (absent
 //! means no body) and no `Transfer-Encoding`. Request bodies are streamed through
@@ -35,7 +37,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 
 use spl_core::bridge::{
     self, BOOTSTRAP_ROUTE, BridgeNames, FailureCategory, RejectReason, RequestFramingError,
-    RequestHead, RequestHeaderPolicy,
+    RequestHead,
 };
 use spl_core::mux::{StreamEnd, StreamItem};
 use tokio::io::{AsyncReadExt, AsyncWrite, AsyncWriteExt, Interest};
@@ -50,17 +52,6 @@ use crate::journal_bridge_carrier::{BodyTx, MuxCarrier, OpenedStream};
 use crate::{TransportError, transport_error_code};
 
 const READ_BUF_BYTES: usize = 4096;
-
-const DEFAULT_REQUEST_HEADERS: &[&str] = &[
-    "accept",
-    "accept-language",
-    "content-type",
-    "cache-control",
-    "if-none-match",
-    "if-modified-since",
-    "range",
-    "user-agent",
-];
 
 /// Whether local requests must present a bridge capability.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -326,8 +317,6 @@ pub struct BridgePolicy {
     /// caller identity. Consumer code that copies a caller header verbatim
     /// reopens forgery, and this crate cannot prevent that.
     pub attribution_headers: Arc<dyn Fn(&RequestHead) -> Vec<(String, String)> + Send + Sync>,
-    /// Policy for forwarding non-cookie request headers.
-    pub request_headers: RequestHeaderPolicy,
     /// Maximum request body accepted from a local client.
     pub max_request_body_bytes: usize,
 }
@@ -340,12 +329,6 @@ impl Default for BridgePolicy {
             stream_response: Arc::new(|head| head.method == "GET" && head.path() == "/sse/events"),
             local_response: Arc::new(|_, _| None),
             attribution_headers: Arc::new(|_| Vec::new()),
-            request_headers: RequestHeaderPolicy::Allow(
-                DEFAULT_REQUEST_HEADERS
-                    .iter()
-                    .map(|name| (*name).to_string())
-                    .collect(),
-            ),
             max_request_body_bytes: 8 * 1024 * 1024,
         }
     }
@@ -540,7 +523,6 @@ struct BridgeRuntime {
     local_response:
         Arc<dyn Fn(&RequestHead, &JournalBridgeStatus) -> Option<LocalResponse> + Send + Sync>,
     attribution_headers: Arc<dyn Fn(&RequestHead) -> Vec<(String, String)> + Send + Sync>,
-    request_headers: RequestHeaderPolicy,
     max_request_body_bytes: usize,
 }
 
@@ -573,7 +555,6 @@ pub async fn start(config: JournalBridgeConfig) -> Result<JournalBridgeHandle, B
         stream_response,
         local_response,
         attribution_headers,
-        request_headers,
         max_request_body_bytes,
     } = policy;
     let mut journal_hosts = Vec::with_capacity(endpoint_hosts.len() + 1);
@@ -614,7 +595,6 @@ pub async fn start(config: JournalBridgeConfig) -> Result<JournalBridgeHandle, B
         stream_response,
         local_response,
         attribution_headers,
-        request_headers,
         max_request_body_bytes,
     });
     let (shutdown, shutdown_rx) = oneshot::channel();
@@ -761,14 +741,9 @@ async fn handle_conn(
     };
     if let Err(reason) = authorization {
         log_capability_reject(reason);
-        let status = if reason == RejectReason::BadMethod {
-            405
-        } else {
-            403
-        };
         let _ = until_shutdown(
             &mut shutdown,
-            write_local(&mut stream, status, b"forbidden", "text/plain"),
+            write_local(&mut stream, 403, b"forbidden", "text/plain"),
         )
         .await;
         return;
@@ -787,11 +762,8 @@ async fn handle_conn(
     }
 
     log_local_request(&request_head, "upstream");
-    let mut upstream_headers = bridge::upstream_request_headers(
-        &request_head,
-        &runtime.bridge_names,
-        &runtime.request_headers,
-    );
+    let mut upstream_headers =
+        bridge::upstream_request_headers(&request_head, &runtime.bridge_names);
     let attribution_headers = filtered_attribution_headers(
         &request_head,
         &runtime.bridge_names,
@@ -845,7 +817,7 @@ fn filtered_attribution_headers(
         target: request_head.target.clone(),
         headers,
     };
-    bridge::upstream_request_headers(&attribution, bridge_names, &RequestHeaderPolicy::ForwardAll)
+    bridge::upstream_request_headers(&attribution, bridge_names)
 }
 
 fn valid_attribution_header(name: &str, value: &str) -> bool {
@@ -888,11 +860,6 @@ async fn handle_bootstrap(
     if request_head.method != "GET" {
         log_capability_reject(RejectReason::BadMethod);
         write_local(stream, 405, b"forbidden", "text/plain").await;
-        return;
-    }
-    if bridge::check_caller_auth(request_head, bridge_names).is_err() {
-        log_capability_reject(RejectReason::CallerAuth);
-        write_local(stream, 403, b"forbidden", "text/plain").await;
         return;
     }
 
@@ -1759,25 +1726,11 @@ mod tests {
             stream_response,
             local_response,
             attribution_headers,
-            request_headers,
             max_request_body_bytes,
         } = BridgePolicy::default();
 
         assert_eq!(port, 0);
         assert_eq!(capability_gate, CapabilityGate::Enabled);
-        assert_eq!(
-            request_headers,
-            RequestHeaderPolicy::Allow(vec![
-                "accept".to_string(),
-                "accept-language".to_string(),
-                "content-type".to_string(),
-                "cache-control".to_string(),
-                "if-none-match".to_string(),
-                "if-modified-since".to_string(),
-                "range".to_string(),
-                "user-agent".to_string(),
-            ])
-        );
         assert_eq!(max_request_body_bytes, 8 * 1024 * 1024);
 
         let request = |method: &str, target: &str| RequestHead {

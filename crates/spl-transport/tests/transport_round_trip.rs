@@ -32,7 +32,7 @@ use rustls::server::danger::{ClientCertVerified, ClientCertVerifier};
 use rustls::{
     CertificateError, ClientConfig, DigitallySignedStruct, Error, ServerConfig, SignatureScheme,
 };
-use spl_core::bridge::{BridgeNames, RequestHeaderPolicy};
+use spl_core::bridge::BridgeNames;
 use spl_core::frame::{
     FLAG_CLOSE, FLAG_DATA, FLAG_RESET, FLAG_WINDOW, Frame, FrameDecoder, RESET_CANCEL,
 };
@@ -1901,7 +1901,9 @@ async fn journal_bridge_bootstrap_sets_cookie_and_rejects_wrong_cap() {
     assert_eq!(response_status(&wrong_method), 405);
     assert!(!response_text(&wrong_method).contains("Set-Cookie:"));
 
-    let caller_auth = raw_bridge_request(
+    // An Authorization header is the caller's own business; the bootstrap
+    // still answers on the capability alone.
+    let with_authorization = raw_bridge_request(
         port,
         "GET",
         &format!("{}?cap={cap}", spl_core::bridge::BOOTSTRAP_ROUTE),
@@ -1911,8 +1913,8 @@ async fn journal_bridge_bootstrap_sets_cookie_and_rejects_wrong_cap() {
         b"",
     )
     .await;
-    assert_eq!(response_status(&caller_auth), 403);
-    assert!(!response_text(&caller_auth).contains("Set-Cookie:"));
+    assert_eq!(response_status(&with_authorization), 302);
+    assert!(response_text(&with_authorization).contains("Set-Cookie:"));
 
     handle.shutdown_and_wait().await;
     upstream.abort();
@@ -1949,22 +1951,6 @@ async fn journal_bridge_authority_rejects_before_upstream() {
             vec![],
             403,
         ),
-        (
-            "OPTIONS",
-            "/journal",
-            Some(loopback_host(port)),
-            Some(cap_cookie(&cap)),
-            vec![],
-            405,
-        ),
-        (
-            "GET",
-            "/journal",
-            Some(loopback_host(port)),
-            Some(cap_cookie(&cap)),
-            vec![("Authorization", "Bearer x")],
-            403,
-        ),
     ];
 
     for (method, target, host, cookie, headers, expected) in cases {
@@ -1976,6 +1962,56 @@ async fn journal_bridge_authority_rejects_before_upstream() {
     assert_eq!(accepts.load(Ordering::SeqCst), 0);
     handle.shutdown_and_wait().await;
     upstream.abort();
+}
+
+#[tokio::test]
+async fn journal_bridge_forwards_any_method_and_header_once_the_capability_matches() {
+    // The capability is the whole boundary: a caller holding it is the
+    // consumer's own code, so the bridge forwards what it sends and lets the
+    // journal decide. Reserved headers are still stripped, never refused.
+    let (handle, mut server) =
+        start_bridge_with_persistent_server_policy(BridgePolicy::default()).await;
+    let port = handle.port();
+    let cap = capability_from(&handle);
+    for method in ["PUT", "DELETE", "PATCH", "OPTIONS"] {
+        let cookie = cap_cookie(&cap);
+        let host = loopback_host(port);
+        let response = tokio::spawn(async move {
+            raw_bridge_request(
+                port,
+                method,
+                "/objects/7",
+                Some(host),
+                Some(cookie),
+                &[
+                    ("X-Custom", "kept"),
+                    ("If-Match", "\"v1\""),
+                    ("Authorization", "Bearer caller"),
+                ],
+                b"body",
+            )
+            .await
+        });
+
+        let request = server.next_request().await;
+        let request_text = String::from_utf8_lossy(&request.bytes).to_lowercase();
+        assert!(
+            request_text.starts_with(&format!(
+                "{} /objects/7 http/1.1\r\n",
+                method.to_lowercase()
+            )),
+            "{method}: {request_text}"
+        );
+        assert!(request_text.contains("x-custom: kept\r\n"), "{method}");
+        assert!(request_text.contains("if-match: \"v1\"\r\n"), "{method}");
+        assert!(!request_text.contains("bearer caller"), "{method}");
+        server.send_http(request.stream_id, "200 OK", b"done");
+
+        let response = response.await.unwrap();
+        assert_eq!(response_status(&response), 200, "{method}");
+    }
+    handle.shutdown_and_wait().await;
+    server.abort();
 }
 
 #[tokio::test]
@@ -2262,7 +2298,6 @@ async fn journal_bridge_rejects_expect_without_waiting_for_body_or_dialing() {
 async fn journal_bridge_forward_all_forwards_custom_and_strips_reserved_headers() {
     let policy = BridgePolicy {
         capability_gate: CapabilityGate::Disabled,
-        request_headers: RequestHeaderPolicy::ForwardAll,
         ..BridgePolicy::default()
     };
     let (handle, mut server) = start_bridge_with_persistent_server_policy(policy).await;
@@ -2342,7 +2377,8 @@ async fn journal_bridge_attribution_uses_unfiltered_request() {
     let request = server.next_request().await;
     let request_text = String::from_utf8_lossy(&request.bytes).to_ascii_lowercase();
     assert!(request_text.contains("x-upstream-attribution: derived\r\n"));
-    assert!(!request_text.contains("x-caller-context:"));
+    // The caller's own header is forwarded as sent; attribution is added beside it.
+    assert!(request_text.contains("x-caller-context: present\r\n"));
     server.send_http(request.stream_id, "200 OK", b"attributed");
 
     let response = response.await.unwrap();
@@ -2355,7 +2391,6 @@ async fn journal_bridge_attribution_uses_unfiltered_request() {
 async fn journal_bridge_attribution_drops_spoofed_reserved_headers_and_cookies() {
     let policy = BridgePolicy {
         capability_gate: CapabilityGate::Disabled,
-        request_headers: RequestHeaderPolicy::ForwardAll,
         attribution_headers: Arc::new(|_| {
             vec![
                 ("X-Upstream-Attribution".into(), "derived".into()),
@@ -2458,7 +2493,7 @@ async fn journal_bridge_default_policy_preserves_current_forwarding() {
         "/ordinary",
         Some(loopback_host(port)),
         Some(cap_cookie(&capability)),
-        &[("Accept", "text/plain"), ("X-Not-Allowed", "caller")],
+        &[("Accept", "text/plain"), ("X-Caller-Header", "caller")],
         b"",
     ));
 
@@ -2469,6 +2504,7 @@ async fn journal_bridge_default_policy_preserves_current_forwarding() {
             "GET /ordinary HTTP/1.1\r\n",
             "host: spl.local\r\n",
             "accept: text/plain\r\n",
+            "x-caller-header: caller\r\n",
             "x-test-observer: test-handle\r\n",
             "Authorization: Bearer test-handle\r\n",
             "x-test-protocol: 2\r\n",

@@ -526,3 +526,127 @@ async fn ac16_retry_pending_quarantines_corrupt_cert() {
     }
     assert!(quarantined, "Corrupt pending must be quarantined");
 }
+
+/// Serves `before` until `switched` exists, then `after`, like a bridge that
+/// applies a reloaded key some time after the reload signal returns.
+#[derive(Debug)]
+struct DelayedReloadResolver {
+    switched: PathBuf,
+    before: Arc<rustls::sign::CertifiedKey>,
+    after: Arc<rustls::sign::CertifiedKey>,
+}
+
+impl rustls::server::ResolvesServerCert for DelayedReloadResolver {
+    fn resolve(
+        &self,
+        _client_hello: rustls::server::ClientHello<'_>,
+    ) -> Option<Arc<rustls::sign::CertifiedKey>> {
+        if self.switched.exists() {
+            Some(Arc::clone(&self.after))
+        } else {
+            Some(Arc::clone(&self.before))
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ac16_activate_waits_for_the_bridge_to_apply_the_reload() {
+    let temp = TempDir::new("activate-delayed-reload");
+    let (ca_der, ca_key, ca_cert) = generate_ca();
+    let ca_pem_path = temp.path.join("ca.pem");
+    fs::write(&ca_pem_path, ca_cert.pem().as_bytes()).unwrap();
+    let mut roots = rustls::RootCertStore::empty();
+    roots.add(ca_der).unwrap();
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let certified = |cert_pem: &[u8], key_pem: &[u8]| {
+        spl_bridge::control_cert::validate_control_certified_key(
+            &spl_bridge::pem_certificate_chain(cert_pem).unwrap(),
+            &spl_bridge::pem_private_key(key_pem).unwrap(),
+            &roots,
+            now,
+        )
+        .unwrap()
+    };
+
+    let (_, _, gen1_cert_pem, gen1_key_pem) =
+        generate_leaf("bridge.solstone.me", &ca_cert, &ca_key, 2020, 2035);
+    let generations_dir = temp.path.join("generations");
+    let gen1_dir = generations_dir.join("gen_1");
+    fs::create_dir_all(&gen1_dir).unwrap();
+    fs::write(gen1_dir.join("cert.pem"), &gen1_cert_pem).unwrap();
+    fs::write(gen1_dir.join("key.pem"), &gen1_key_pem).unwrap();
+    std::os::unix::fs::symlink(&gen1_dir, generations_dir.join("active")).unwrap();
+
+    let (_, _, gen2_cert_pem, gen2_key_pem) =
+        generate_leaf("bridge.solstone.me", &ca_cert, &ca_key, 2020, 2035);
+    let issued_cert = temp.path.join("issued.crt");
+    let issued_key = temp.path.join("issued.key");
+    fs::write(&issued_cert, &gen2_cert_pem).unwrap();
+    fs::write(&issued_key, &gen2_key_pem).unwrap();
+
+    let switched = temp.path.join("switched");
+    let resolver = Arc::new(DelayedReloadResolver {
+        switched: switched.clone(),
+        before: certified(&gen1_cert_pem, &gen1_key_pem),
+        after: certified(&gen2_cert_pem, &gen2_key_pem),
+    });
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let config = rustls::ServerConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_no_client_auth()
+        .with_cert_resolver(resolver);
+    let acceptor = TlsAcceptor::from(Arc::new(config));
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let verify_addr = listener.local_addr().unwrap();
+    let server_handle = tokio::spawn(async move {
+        while let Ok((stream, _)) = listener.accept().await {
+            let acceptor = acceptor.clone();
+            tokio::spawn(async move {
+                if let Ok(mut tls_stream) = acceptor.accept(stream).await {
+                    let _ = tokio::io::AsyncWriteExt::shutdown(&mut tls_stream).await;
+                }
+            });
+        }
+    });
+
+    // Like `systemctl reload`: returns at once, the new key is served later.
+    let reload_cmd = format!("(sleep 0.3; touch '{}') &", switched.to_string_lossy());
+    let activate_bin = env!("CARGO_BIN_EXE_spl-bridge-activate");
+    let output = tokio::task::spawn_blocking(move || {
+        Command::new(activate_bin)
+            .arg("--issued-cert")
+            .arg(&issued_cert)
+            .arg("--issued-key")
+            .arg(&issued_key)
+            .arg("--generations-dir")
+            .arg(&generations_dir)
+            .arg("--verify-addr")
+            .arg(verify_addr.to_string())
+            .arg("--reload-cmd")
+            .arg(reload_cmd)
+            .arg("--control-tls-roots")
+            .arg(&ca_pem_path)
+            .output()
+            .expect("run activate delayed reload")
+    })
+    .await
+    .unwrap();
+
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let generations_dir = temp.path.join("generations");
+    assert_ne!(
+        fs::read_link(generations_dir.join("active")).unwrap(),
+        gen1_dir
+    );
+    assert!(!generations_dir.join("pending").exists());
+
+    server_handle.abort();
+}

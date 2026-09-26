@@ -26,6 +26,8 @@ use tokio_rustls::TlsConnector;
 
 const OVERALL_DEADLINE: Duration = Duration::from_secs(30);
 const VERIFY_DEADLINE: Duration = Duration::from_secs(10);
+const VERIFY_ATTEMPT_DEADLINE: Duration = Duration::from_secs(2);
+const VERIFY_RETRY_INTERVAL: Duration = Duration::from_millis(200);
 
 fn check_version_flag() -> bool {
     std::env::args_os().skip(1).any(|arg| arg == "--version")
@@ -485,12 +487,23 @@ async fn verify_generation(
     roots: &RootCertStore,
     expected_leaf: &[u8],
 ) -> Result<(), ()> {
-    tokio::time::timeout(
-        VERIFY_DEADLINE,
-        verify_handshake(verify_addr, roots, expected_leaf),
-    )
+    // The reload command only signals the bridge, which applies the new key
+    // asynchronously. Poll until the expected leaf is served or the deadline passes.
+    tokio::time::timeout(VERIFY_DEADLINE, async {
+        loop {
+            let attempt = tokio::time::timeout(
+                VERIFY_ATTEMPT_DEADLINE,
+                verify_handshake(verify_addr, roots, expected_leaf),
+            )
+            .await;
+            if matches!(attempt, Ok(Ok(()))) {
+                return;
+            }
+            tokio::time::sleep(VERIFY_RETRY_INTERVAL).await;
+        }
+    })
     .await
-    .map_err(|_| ())?
+    .map_err(|_| ())
 }
 
 async fn verify_handshake(

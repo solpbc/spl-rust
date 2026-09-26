@@ -281,7 +281,8 @@ fn ac13_systemd_assets_exist_and_contain_hardening_directives() {
     let renew_script = std::fs::read_to_string(deploy_dir.join("spl-bridge-renew")).unwrap();
     assert!(renew_script.contains("set -euo pipefail"));
     assert!(renew_script.contains("flock"));
-    assert!(renew_script.contains("renew --days 30"));
+    assert!(renew_script.contains("RENEW_DAYS:-30"));
+    assert!(renew_script.contains("renew --days \"$RENEW_DAYS\""));
     assert!(renew_script.contains("--renew-hook"));
     assert!(renew_script.contains("127.0.0.1"));
     assert!(renew_script.contains("spl-bridge-activate"));
@@ -308,6 +309,8 @@ fn ac13_systemd_assets_exist_and_contain_hardening_directives() {
     assert!(!runbook.contains("sudo -u root -g spl-bridge spl-bridge-activate"));
     assert!(runbook.contains("acme-staging-v02.api.letsencrypt.org"));
 }
+
+const REGISTERED_EMAIL: &str = "operator@example.test";
 
 struct RenewHarness {
     _temp: TempDir,
@@ -388,7 +391,12 @@ exit 0
             .join("deploy")
             .join("spl-bridge-renew-hook");
         fs::create_dir_all(&generations_dir).unwrap();
-        fs::create_dir_all(&lego_dir).unwrap();
+        let account_dir = lego_dir
+            .join("accounts")
+            .join("acme-v02.api.letsencrypt.org")
+            .join(REGISTERED_EMAIL);
+        fs::create_dir_all(&account_dir).unwrap();
+        fs::write(account_dir.join("account.json"), b"{}").unwrap();
 
         Self {
             script_path: deploy_script.to_string_lossy().to_string(),
@@ -406,6 +414,10 @@ exit 0
     }
 
     fn run(&self, renewed: bool) -> std::process::Output {
+        self.run_as(REGISTERED_EMAIL, renewed)
+    }
+
+    fn run_as(&self, email: &str, renewed: bool) -> std::process::Output {
         Command::new("bash")
             .arg(&self.script_path)
             .env("LEGO", &self.fake_lego)
@@ -414,7 +426,7 @@ exit 0
             .env("LEGO_DIR", &self.lego_dir)
             .env("RENEW_LOCK_FILE", &self.lock_file)
             .env("RENEW_HOOK", &self.renew_hook)
-            .env("EMAIL", "operator@example.test")
+            .env("EMAIL", email)
             .env("FAKE_LEGO_RENEW", if renewed { "1" } else { "0" })
             .output()
             .expect("run renew script")
@@ -474,4 +486,26 @@ fn ac15_spl_bridge_renew_wrapper_lifecycle_branches() {
     let hook_log = fs::read_to_string(&harness.activate_invocations).unwrap();
     assert!(hook_log.contains("--issued-cert"));
     assert!(hook_log.contains("--issued-key"));
+}
+
+#[test]
+fn spl_bridge_renew_refuses_an_email_with_no_registered_account() {
+    let harness = RenewHarness::setup();
+    let accounts = harness
+        .lego_dir
+        .join("accounts")
+        .join("acme-v02.api.letsencrypt.org");
+
+    let out = harness.run_as("operator@example.testn", false);
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("names no registered ACME account"));
+    assert!(
+        !harness.lego_invocations.exists(),
+        "lego must not run for an unregistered account"
+    );
+    assert!(!accounts.join("operator@example.testn").exists());
+
+    let out = harness.run(false);
+    assert!(out.status.success());
+    assert!(harness.lego_invocations.exists());
 }

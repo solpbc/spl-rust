@@ -16,9 +16,9 @@ The bridge uses WebPKI-validated certificates for `bridge.solstone.me`. Certific
 2. It triggers `spl-bridge-renewal.service`, executing `/usr/local/bin/spl-bridge-renew`.
 3. The renew wrapper acquires a non-blocking lock (`flock`) to guarantee single-flight execution.
 4. If a pending generation is present, it retries activation with `spl-bridge-activate --retry-pending`. Corrupted pending generations are quarantined; valid pending generations are promoted without contacting the CA.
-5. If no retryable pending certificate remains, Lego runs `lego renew --days 30` with TLS challenge binding to loopback (`127.0.0.1:8443`).
+5. If no retryable pending certificate remains, the wrapper confirms that `EMAIL` names the registered ACME account under `/etc/spl-bridge/acme-production` and refuses to run otherwise. Lego then runs `lego renew --days 30` (`RENEW_DAYS` overrides the threshold) with TLS challenge binding to loopback (`127.0.0.1:8443`).
 6. Lego's renewal hook runs only when a certificate was actually renewed. A no-op daily check does not install files or signal the bridge.
-7. Upon renewal, `spl-bridge-activate` stages a new generation, validates the certificate chain and private key, performs an atomic symlink swap of `active`, executes `systemctl reload spl-bridge`, and verifies the live TLS handshake. On failure, it rolls back `active` to the prior generation and saves `pending`.
+7. Upon renewal, `spl-bridge-activate` stages a new generation, validates the certificate chain and private key, performs an atomic symlink swap of `active`, executes `systemctl reload spl-bridge`, and polls the live TLS handshake, for up to 10 seconds, until the bridge serves the new leaf (the reload is applied asynchronously after the signal). On failure, it rolls back `active` to the prior generation and saves `pending`.
 
 ## Existing Host Cutover
 
@@ -46,7 +46,21 @@ spl-bridge-activate \
     --reload-cmd true
 ```
 
-3. Create `/etc/spl-bridge/renewal.env` with mode `0640`, owner `root:spl-bridge`, containing the ACME account email as `EMAIL=...`. Install all three units, verify them, reload systemd, and make the one cutover:
+3. Create `/etc/spl-bridge/renewal.env` with mode `0640`, owner `root:spl-bridge`, containing the ACME account email as `EMAIL=...`. Copy the address from the registered account's directory name rather than typing it. The bridge name's CAA record admits only that account, so a mistyped address would register a new account that the CAA record refuses:
+
+```bash
+ACCOUNTS=/etc/spl-bridge/acme-production/accounts/acme-v02.api.letsencrypt.org
+ls "$ACCOUNTS"    # expect exactly one directory
+printf 'EMAIL=%s\n' "$(ls "$ACCOUNTS")" > /etc/spl-bridge/renewal.env
+chown root:spl-bridge /etc/spl-bridge/renewal.env
+chmod 0640 /etc/spl-bridge/renewal.env
+. /etc/spl-bridge/renewal.env
+if test -f "$ACCOUNTS/$EMAIL/account.json"; then echo "account found"; else echo "NO REGISTERED ACCOUNT FOR $EMAIL"; fi
+```
+
+Retire any earlier renewal path before the cutover. A unit that renews into a file the bridge does not read, or that stops the bridge to answer the challenge itself, must not keep running beside `spl-bridge-renewal.timer`: if it renews in the same ACME directory first, the managed path sees a fresh certificate and never activates it. List the timers with `systemctl list-timers --all`, then disable and remove any such unit.
+
+Install all three units, verify them, reload systemd, and make the one cutover:
 
 ```bash
 install -o root -g root -m 0644 crates/spl-bridge/deploy/spl-bridge.service /etc/systemd/system/spl-bridge.service
@@ -67,9 +81,39 @@ openssl s_client -connect bridge.solstone.me:443 -servername bridge.solstone.me 
 systemctl list-timers spl-bridge-renewal.timer
 ```
 
+5. Run the renewal unit once and require it to succeed. With more than 30 days left this is a no-op that places no order, so it is safe on production. It is the only check that the unit, its environment file and the account work together before the first real renewal:
+
+```bash
+systemctl start spl-bridge-renewal.service
+systemctl show spl-bridge-renewal.service -p Result -p ExecMainStatus
+journalctl -u spl-bridge-renewal.service -n 5
+```
+
+A cutover is not complete until this reports `Result=success`.
+
+### Proving Production Activation
+
+The staging rehearsal below proves challenge routing, but it cannot prove activation, because a staging certificate is never activated. Prove the production path once per host, well before the first renewal is due, by forcing one renewal through the real unit:
+
+```bash
+served() { openssl s_client -connect 127.0.0.1:443 -servername bridge.solstone.me </dev/null 2>/dev/null | openssl x509 -noout -serial -enddate; }
+served; systemctl show spl-bridge -p MainPID
+mkdir -p /run/systemd/system/spl-bridge-renewal.service.d
+printf '[Service]\nEnvironment=RENEW_DAYS=90\n' > /run/systemd/system/spl-bridge-renewal.service.d/prove.conf
+systemctl daemon-reload
+systemctl start spl-bridge-renewal.service
+rm -r /run/systemd/system/spl-bridge-renewal.service.d
+systemctl daemon-reload
+served; systemctl show spl-bridge -p MainPID
+readlink /etc/spl-bridge/tls-generations/active
+ls -l /etc/spl-bridge/tls-generations/pending 2>&1
+```
+
+This places one production order. Success means the served serial changed, `active` points at the new generation, no `pending` link remains, and the bridge PID is unchanged. If activation fails, the prior certificate stays live and the new one is kept as `pending` for the next timer run. Let's Encrypt may reuse a recent valid authorization and skip the challenge, so this run proves the account, the CAA record, the hook and activation, while the staging rehearsal proves the challenge route.
+
 ### Staging Directory Rehearsal
 
-Do not test renewal against Let's Encrypt production endpoints. Production issuance is subject to strict Let's Encrypt rate limits and requires real domain validation; iterative proof should always be performed in a dedicated staging directory against the Let's Encrypt ACME staging environment (`https://acme-staging-v02.api.letsencrypt.org/directory`).
+Apart from the single production proof above, do not test renewal against Let's Encrypt production endpoints. Production issuance is subject to strict Let's Encrypt rate limits and requires real domain validation; iterative proof should always be performed in a dedicated staging directory against the Let's Encrypt ACME staging environment (`https://acme-staging-v02.api.letsencrypt.org/directory`).
 
 To rehearse activation or perform manual rotation in a staging directory:
 

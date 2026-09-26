@@ -19,7 +19,9 @@ RELOAD_CMD="${RELOAD_CMD:-systemctl reload spl-bridge}"
 LEGO_DIR="${LEGO_DIR:-/etc/spl-bridge/acme-production}"
 DOMAIN="bridge.solstone.me"
 ACME_PORT="${ACME_PORT:-127.0.0.1:8443}"
+RENEW_DAYS="${RENEW_DAYS:-30}"
 : "${EMAIL:?EMAIL must be configured in /etc/spl-bridge/renewal.env}"
+ACME_ACCOUNT="${LEGO_DIR}/accounts/acme-v02.api.letsencrypt.org/${EMAIL}/account.json"
 RENEW_HOOK="${RENEW_HOOK:-/usr/local/libexec/spl-bridge-renew-hook}"
 ACTIVATE_ARGS=()
 if [ -n "${ACTIVATE_ROOTS:-}" ]; then
@@ -49,11 +51,18 @@ if [ -e "${GENERATIONS_DIR}/pending" ]; then
 fi
 
 if [ "$RUN_LEGO" -eq 1 ]; then
+    # Renewal must reuse the registered account: the bridge name's CAA record
+    # admits only that account, and lego would otherwise create an unregistered
+    # key for a mistyped EMAIL before failing.
+    if [ ! -f "$ACME_ACCOUNT" ]; then
+        echo "spl-bridge-renew: EMAIL in /etc/spl-bridge/renewal.env names no registered ACME account under ${LEGO_DIR}" >&2
+        exit 1
+    fi
     "$LEGO" \
         --email "$EMAIL" \
         --domains "$DOMAIN" \
         --tls \
         --tls.port "$ACME_PORT" \
         --path "$LEGO_DIR" \
-        renew --days 30 --renew-hook "$RENEW_HOOK"
+        renew --days "$RENEW_DAYS" --renew-hook "$RENEW_HOOK"
 fi

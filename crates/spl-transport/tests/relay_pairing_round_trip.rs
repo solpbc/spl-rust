@@ -71,6 +71,11 @@ impl TestCa {
 }
 
 fn leaf_config(signer: &TestCa) -> ServerConfig {
+    leaf_config_presenting(signer, signer)
+}
+
+/// A server whose leaf `signer` signed, presenting `presented_ca` after it.
+fn leaf_config_presenting(signer: &TestCa, presented_ca: &TestCa) -> ServerConfig {
     let key = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).unwrap();
     let mut params = CertificateParams::new(vec!["spl.local".to_string()]).unwrap();
     params.is_ca = IsCa::NoCa;
@@ -85,7 +90,7 @@ fn leaf_config(signer: &TestCa) -> ServerConfig {
         .with_single_cert(
             vec![
                 CertificateDer::from(cert.der().to_vec()),
-                CertificateDer::from(signer.cert.der().to_vec()),
+                CertificateDer::from(presented_ca.cert.der().to_vec()),
             ],
             PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key.serialize_der())),
         )
@@ -104,6 +109,11 @@ enum HomeMode {
 struct MockState {
     json_ca: Arc<TestCa>,
     tls_signer: Arc<TestCa>,
+    /// The CA certificate the inner TLS chain presents after the leaf, when it
+    /// is not the leaf's own signer.
+    tls_presented_ca: Option<Arc<TestCa>>,
+    /// Bytes the home read from the inner TLS stream after the handshake.
+    inner_request_bytes: AtomicUsize,
     home_mode: HomeMode,
     pair_instance_id: Mutex<Option<String>>,
     enroll_status: Mutex<Option<u16>>,
@@ -132,6 +142,8 @@ impl MockState {
         Self {
             json_ca: ca,
             tls_signer: Arc::new(TestCa::new()),
+            tls_presented_ca: None,
+            inner_request_bytes: AtomicUsize::new(0),
             home_mode: HomeMode::Ok,
             pair_instance_id: Mutex::new(None),
             enroll_status: Mutex::new(None),
@@ -383,10 +395,20 @@ where
 }
 
 async fn serve_home_pair(stream: DuplexStream, state: Arc<MockState>) -> io::Result<()> {
-    let acceptor = TlsAcceptor::from(Arc::new(leaf_config(state.tls_signer.as_ref())));
+    let presented_ca = state
+        .tls_presented_ca
+        .as_deref()
+        .unwrap_or(state.tls_signer.as_ref());
+    let acceptor = TlsAcceptor::from(Arc::new(leaf_config_presenting(
+        state.tls_signer.as_ref(),
+        presented_ca,
+    )));
     let mut tls = acceptor.accept(stream).await.map_err(io::Error::other)?;
     state.inner_tls_accepts.fetch_add(1, Ordering::SeqCst);
     let request = read_pl_request(&mut tls).await?;
+    state
+        .inner_request_bytes
+        .fetch_add(request.len(), Ordering::SeqCst);
 
     if let HomeMode::Reject { status, body } = &state.home_mode {
         write_pl_response_bytes(&mut tls, *status, body).await?;
@@ -773,6 +795,54 @@ async fn relay_pairing_rejects_wrong_spki_before_enroll() {
         .await
         .unwrap_err();
     assert!(matches!(err, TransportError::Pairing(_)));
+}
+
+// pair-window.md: the relay carries the inner TLS bytes, so the home CA pin must
+// hold in the handshake, before the request that carries the pairing secret S.
+// Falsified by pinning after the response: each peer below then reads
+// `POST /app/network/pair?token=<S>` and the device's CSR before the check fails.
+#[tokio::test]
+async fn relay_pairing_writes_no_request_byte_to_a_peer_outside_the_pin() {
+    enum Peer {
+        LeafFromAnotherCa,
+        PinnedCaBesideAForeignLeaf,
+        LinkPinsAnotherKey,
+    }
+    for peer in [
+        Peer::LeafFromAnotherCa,
+        Peer::PinnedCaBesideAForeignLeaf,
+        Peer::LinkPinsAnotherKey,
+    ] {
+        let mut state = MockState::normal();
+        let mut pin = state.json_ca.spki_pin();
+        match peer {
+            Peer::LeafFromAnotherCa => {}
+            Peer::PinnedCaBesideAForeignLeaf => {
+                state.tls_presented_ca = Some(state.json_ca.clone());
+            }
+            Peer::LinkPinsAnotherKey => {
+                state = state.with_same_tls_ca();
+                pin = TestCa::new().spki_pin();
+            }
+        }
+        let state = Arc::new(state);
+        let origin = spawn_mock_relay(state.clone()).await;
+        let link = relay_link(origin, pin);
+
+        #[expect(
+            clippy::large_futures,
+            reason = "the copied transport future keeps its established stack layout; this site goes red if a later refactor shrinks it"
+        )]
+        let err = pair_over_relay(&link, "win-test", &serde_json::Map::new())
+            .await
+            .unwrap_err();
+        assert!(matches!(err, TransportError::Pairing(_)), "{err:?}");
+        assert_eq!(transport_error_code(&err), "pairing");
+        assert_eq!(state.inner_tls_accepts.load(Ordering::SeqCst), 0);
+        assert_eq!(state.inner_request_bytes.load(Ordering::SeqCst), 0);
+        assert!(state.pair_request.lock().unwrap().is_none());
+        assert_eq!(state.enroll_hits.load(Ordering::SeqCst), 0);
+    }
 }
 
 #[tokio::test]

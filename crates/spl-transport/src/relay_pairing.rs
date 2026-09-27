@@ -180,7 +180,7 @@ where
     let body = serde_json::to_vec(&request)?;
     let headers = vec![("Content-Type".to_string(), "application/json".to_string())];
     let path = format!("{PAIR_PATH}?token={}", hex_lower(&link.s));
-    let inner_config = Arc::new(tls::trust_all_pairing_config()?);
+    let inner_config = Arc::new(tls::relay_pairing_config(&link.ca_fp_spki)?);
     let (response, peer_leaf) = relay::request_once_over_stream_with_peer_leaf(
         io,
         inner_config,
@@ -209,6 +209,8 @@ where
         .find(|cert| ca::spki_matches_prefix(cert.as_ref(), &link.ca_fp_spki))
         .cloned()
         .ok_or_else(|| TransportError::Pairing("relay pinned ca not found".into()))?;
+    // The handshake already pinned the presented chain. This binds the CA the
+    // home returned, which the credential keeps, to the peer that answered.
     spki_pin::verify_live_peer_binding(&peer_leaf, &pinned_ca)?;
     spki_pin::verify_ca_self_signed(&pinned_ca)?;
 

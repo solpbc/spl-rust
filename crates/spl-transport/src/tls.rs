@@ -32,6 +32,37 @@ pub(crate) struct CaFpPinVerifier {
     pub(crate) provider: Arc<CryptoProvider>,
 }
 
+/// A rustls verifier for relay pairing's inner TLS leg. It pins the home CA by
+/// the SPKI-hash prefix the relay pair link carries, and requires the presented
+/// leaf to be a valid server certificate that CA signed, all inside the
+/// handshake. The request that carries the pairing secret is written only after
+/// the handshake completes, so a peer that is not the home never receives it.
+#[derive(Debug)]
+pub(crate) struct CaSpkiPinVerifier {
+    pub(crate) prefix: Vec<u8>,
+    pub(crate) provider: Arc<CryptoProvider>,
+}
+
+/// Why relay pairing's inner handshake refused the peer, carried out of the
+/// rustls verifier so the ceremony reports it as a pairing failure.
+#[derive(Debug)]
+pub(crate) struct RelayPairingPinRejected(pub(crate) &'static str);
+
+impl std::fmt::Display for RelayPairingPinRejected {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.0)
+    }
+}
+
+impl std::error::Error for RelayPairingPinRejected {}
+
+fn relay_pin_rejected(reason: &'static str) -> RustlsError {
+    RustlsError::InvalidCertificate(CertificateError::Other(rustls::OtherError(Arc::new(
+        RelayPairingPinRejected(reason),
+    ))))
+}
+
+#[cfg(test)]
 #[derive(Debug)]
 struct TrustAllPairingVerifier {
     provider: Arc<CryptoProvider>,
@@ -151,6 +182,62 @@ impl ServerCertVerifier for CaFpPinVerifier {
     }
 }
 
+impl ServerCertVerifier for CaSpkiPinVerifier {
+    fn verify_server_cert(
+        &self,
+        end_entity: &CertificateDer<'_>,
+        intermediates: &[CertificateDer<'_>],
+        _server_name: &ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: UnixTime,
+    ) -> Result<ServerCertVerified, RustlsError> {
+        let pinned_ca = std::iter::once(end_entity)
+            .chain(intermediates.iter())
+            .find(|cert| spl_core::ca::spki_matches_prefix(cert.as_ref(), &self.prefix))
+            .ok_or_else(|| relay_pin_rejected("relay pinned ca not found"))?;
+        crate::spki_pin::verify_ca_self_signed(pinned_ca)
+            .map_err(|_| relay_pin_rejected("relay ca not self signed"))?;
+        crate::spki_pin::verify_live_peer_binding(end_entity, pinned_ca)
+            .map_err(|_| relay_pin_rejected("relay peer leaf not signed by pinned ca"))?;
+        Ok(ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, RustlsError> {
+        verify_tls12_signature(
+            message,
+            cert,
+            dss,
+            &self.provider.signature_verification_algorithms,
+        )
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, RustlsError> {
+        verify_tls13_signature(
+            message,
+            cert,
+            dss,
+            &self.provider.signature_verification_algorithms,
+        )
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        self.provider
+            .signature_verification_algorithms
+            .supported_schemes()
+    }
+}
+
+#[cfg(test)]
 impl ServerCertVerifier for TrustAllPairingVerifier {
     fn verify_server_cert(
         &self,
@@ -223,15 +310,33 @@ pub fn pairing_config(ca_fp_prefix: &[u8]) -> Result<ClientConfig, TransportErro
     Ok(config)
 }
 
-/// Client config for relay pairing's inner TLS leg. It accepts any certificate
-/// chain during the handshake so the ceremony can surface the live peer leaf,
-/// but it still verifies the TLS handshake signature against that leaf through
-/// ring. Safe only when followed immediately by the relay live-peer SPKI binding;
-/// never use this for an established session.
+/// Client config for relay pairing's inner TLS leg: pins the home CA by the
+/// pair link's SPKI-hash prefix inside the handshake and presents no client
+/// certificate. The relay carries these bytes, so the pin must hold before the
+/// pairing secret is written, not after the home answers.
 ///
 /// # Errors
 ///
 /// Returns a TLS configuration error when rustls rejects the provider setup.
+pub(crate) fn relay_pairing_config(ca_fp_spki: &[u8]) -> Result<ClientConfig, TransportError> {
+    let provider = provider();
+    let verifier = Arc::new(CaSpkiPinVerifier {
+        prefix: ca_fp_spki.to_vec(),
+        provider: provider.clone(),
+    });
+    let config = ClientConfig::builder_with_provider(provider)
+        .with_protocol_versions(&[&rustls::version::TLS13])
+        .map_err(|e| TransportError::Tls(e.to_string()))?
+        .dangerous()
+        .with_custom_certificate_verifier(verifier)
+        .with_no_client_auth();
+    Ok(config)
+}
+
+/// Client config that accepts any certificate chain while still verifying the
+/// handshake signature. Test-only: a dial that sends anything the peer must
+/// not read pins the peer in the handshake.
+#[cfg(test)]
 pub(crate) fn trust_all_pairing_config() -> Result<ClientConfig, TransportError> {
     let provider = provider();
     let verifier = Arc::new(TrustAllPairingVerifier {

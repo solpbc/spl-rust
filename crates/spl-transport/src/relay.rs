@@ -459,6 +459,20 @@ pub(crate) async fn dial_relay_carrier(
     })
 }
 
+/// A relay pairing handshake the home-CA pin refused, as the pairing failure it is.
+fn relay_pairing_pin_refusal(error: &io::Error) -> Option<TransportError> {
+    let Some(rustls::Error::InvalidCertificate(rustls::CertificateError::Other(other))) = error
+        .get_ref()
+        .and_then(|source| source.downcast_ref::<rustls::Error>())
+    else {
+        return None;
+    };
+    let rejected = other
+        .0
+        .downcast_ref::<crate::tls::RelayPairingPinRejected>()?;
+    Some(TransportError::Pairing(rejected.0.into()))
+}
+
 fn inner_handshake_error(
     termination: &RelayTerminationHandle,
     error: &io::Error,
@@ -523,7 +537,10 @@ where
     {
         Err(_) => return Err(TransportError::Relay(RelayError::Stalled)),
         Ok(Ok(tls)) => tls,
-        Ok(Err(e)) => return Err(TransportError::Tls(format!("inner relay handshake: {e}"))),
+        Ok(Err(e)) => {
+            return Err(relay_pairing_pin_refusal(&e)
+                .unwrap_or_else(|| TransportError::Tls(format!("inner relay handshake: {e}"))));
+        }
     };
     let peer_leaf = tls
         .get_ref()

@@ -845,6 +845,27 @@ async fn relay_pairing_writes_no_request_byte_to_a_peer_outside_the_pin() {
     }
 }
 
+// Falsified by accepting any prefix length: a one-byte pin matches one key in 256.
+#[tokio::test]
+async fn relay_pairing_refuses_a_pin_shorter_than_the_link_form_before_the_inner_handshake() {
+    let state = Arc::new(MockState::normal().with_same_tls_ca());
+    let origin = spawn_mock_relay(state.clone()).await;
+    let mut pin = state.json_ca.spki_pin();
+    pin.truncate(15);
+    let link = relay_link(origin, pin);
+
+    #[expect(
+        clippy::large_futures,
+        reason = "the copied transport future keeps its established stack layout; this site goes red if a later refactor shrinks it"
+    )]
+    let err = pair_over_relay(&link, "win-test", &serde_json::Map::new())
+        .await
+        .unwrap_err();
+    assert!(matches!(err, TransportError::PairLink(_)), "{err:?}");
+    assert_eq!(state.inner_tls_accepts.load(Ordering::SeqCst), 0);
+    assert_eq!(state.inner_request_bytes.load(Ordering::SeqCst), 0);
+}
+
 #[tokio::test]
 async fn relay_pairing_inner_410_maps_to_http_410() {
     let mut state = MockState::normal().with_same_tls_ca();

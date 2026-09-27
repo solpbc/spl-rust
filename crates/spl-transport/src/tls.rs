@@ -310,6 +310,9 @@ pub fn pairing_config(ca_fp_prefix: &[u8]) -> Result<ClientConfig, TransportErro
     Ok(config)
 }
 
+/// The shortest SPKI-hash prefix relay pairing accepts as a pin.
+const RELAY_PIN_MIN_BYTES: usize = 16;
+
 /// Client config for relay pairing's inner TLS leg: pins the home CA by the
 /// pair link's SPKI-hash prefix inside the handshake and presents no client
 /// certificate. The relay carries these bytes, so the pin must hold before the
@@ -319,6 +322,11 @@ pub fn pairing_config(ca_fp_prefix: &[u8]) -> Result<ClientConfig, TransportErro
 ///
 /// Returns a TLS configuration error when rustls rejects the provider setup.
 pub(crate) fn relay_pairing_config(ca_fp_spki: &[u8]) -> Result<ClientConfig, TransportError> {
+    // A parsed relay link always carries 16 bytes. A shorter pin, built by hand,
+    // is one a peer could grind a key to match.
+    if ca_fp_spki.len() < RELAY_PIN_MIN_BYTES {
+        return Err(TransportError::PairLink("relay pin too short".into()));
+    }
     let provider = provider();
     let verifier = Arc::new(CaSpkiPinVerifier {
         prefix: ca_fp_spki.to_vec(),

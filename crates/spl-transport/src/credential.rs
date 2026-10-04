@@ -42,7 +42,7 @@ pub struct Credential {
     pub ca_fp_prefix: Vec<u8>,
     /// Stable identifier of the paired journal instance.
     pub instance_id: String,
-    /// Human-facing label of the paired journal.
+    /// Compatibility field carrying the journal's mark words. Never shown as a name.
     pub home_label: String,
     /// Direct-network endpoints learned during pairing.
     pub endpoints: Vec<EndpointAddr>,

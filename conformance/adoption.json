@@ -3,10 +3,10 @@
   "adoption_schema_version": 1,
   "consumer_identifier": "solpbc/spl-rust",
   "authority_repository": "https://github.com/solpbc/spl",
-  "authority_commit": "4ad3adedec5c52ea73225af06f0e7b0fa6d86b60",
-  "bundle_semver": "8.0.2",
+  "authority_commit": "f1ddccb4fb0e7eb1e10113aca147f0e6603c9f32",
+  "bundle_semver": "8.0.3",
   "authority_manifest_path": "proto/definition/bundle/manifest.json",
-  "authority_manifest_sha256": "a00344aac514a844794b49b6e1c88ec69ca17a48692449c301705f38e9919744",
+  "authority_manifest_sha256": "dae5a9117d8730e15e0c59f6457836a34d1a89fdba09bf2dffc3e8b12b2249ad",
   "bundle_files": [
     {
       "path": "definition.json",

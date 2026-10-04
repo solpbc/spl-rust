@@ -97,7 +97,7 @@ pub struct PairResponse {
     pub ca_chain: Vec<String>,
     /// Stable identifier of the paired home instance.
     pub instance_id: String,
-    /// Human-facing label of the paired home.
+    /// Compatibility field carrying the journal's mark words. Never shown as a name.
     pub home_label: String,
     /// Required `sha256:<hex>` fingerprint of the returned device certificate.
     pub fingerprint: String,

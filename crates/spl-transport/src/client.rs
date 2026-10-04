@@ -30,6 +30,7 @@ pub enum RelayPermit {
     /// Relay communication is temporarily or administratively disabled.
     Disabled,
     /// The incarnation is retired or obsolete; relay communication is permanently disallowed for this client.
+    /// This retires the client, not the caller's data: resubmit anything still awaiting delivery through the successor client.
     Retired,
 }
 

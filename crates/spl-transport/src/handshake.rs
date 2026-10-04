@@ -74,6 +74,9 @@ impl HandshakeFailure {
 }
 
 /// Why a client stops trying a credential. Both present the unpaired state.
+///
+/// Stopping ends this credential, not the caller's data: keep anything still
+/// awaiting delivery and resubmit it through the client for the next pairing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HandshakeStop {
     /// The journal refused this device with access denied (49): it is not

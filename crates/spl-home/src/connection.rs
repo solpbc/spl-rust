@@ -263,8 +263,31 @@ impl HomeConnection {
     where
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
+        let (connection, driver) = Self::accept_with_driver(io, config).await?;
+        tokio::spawn(driver);
+        Ok(connection)
+    }
+
+    /// Complete TLS and return the connection with its unstarted carrier driver.
+    ///
+    /// The caller must poll the returned future for carrier progress. If it runs
+    /// that future in a task, it owns retaining and joining the actual task.
+    /// Dropping the future before running it releases the carrier.
+    /// [`Self::close`] requests closure; it does not join that task.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same configuration and TLS errors as [`Self::accept`],
+    /// including the same refusal linger before a TLS error returns.
+    pub async fn accept_with_driver<S>(
+        io: S,
+        config: HomeConfig,
+    ) -> Result<(Self, impl std::future::Future<Output = ()> + Send + 'static), HomeError>
+    where
+        S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    {
         let limits = config.mux_limits;
-        Self::accept_with_server_config(io, config.server_config()?, limits).await
+        Self::accept_with_server_config_and_driver(io, config.server_config()?, limits).await
     }
 
     pub(crate) async fn accept_with_server_config<S>(
@@ -272,6 +295,20 @@ impl HomeConnection {
         server_config: ServerConfig,
         limits: MuxLimits,
     ) -> Result<Self, HomeError>
+    where
+        S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    {
+        let (connection, driver) =
+            Self::accept_with_server_config_and_driver(io, server_config, limits).await?;
+        tokio::spawn(driver);
+        Ok(connection)
+    }
+
+    async fn accept_with_server_config_and_driver<S>(
+        io: S,
+        server_config: ServerConfig,
+        limits: MuxLimits,
+    ) -> Result<(Self, impl std::future::Future<Output = ()> + Send + 'static), HomeError>
     where
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
@@ -288,7 +325,7 @@ impl HomeConnection {
         let (command_tx, command_rx) = mpsc::unbounded_channel();
         let refusals = Arc::new(RefusalTally::default());
         let carrier = Arc::new(CarrierTally::new());
-        tokio::spawn(run_driver(
+        let driver = run_driver(
             tls,
             acceptor,
             accept_tx,
@@ -296,13 +333,16 @@ impl HomeConnection {
             command_rx,
             Arc::clone(&refusals),
             Arc::clone(&carrier),
-        ));
-        Ok(Self {
-            accepts: accept_rx,
-            commands: command_tx,
-            refusals,
-            carrier,
-        })
+        );
+        Ok((
+            Self {
+                accepts: accept_rx,
+                commands: command_tx,
+                refusals,
+                carrier,
+            },
+            driver,
+        ))
     }
 
     /// Streams this carrier has refused, by class.
@@ -325,7 +365,9 @@ impl HomeConnection {
     /// [`CarrierClose::Open`] means the driver has not stopped **yet**, not
     /// that it ended cleanly. A caller that has asked for closure should drain
     /// [`Self::accept_stream`] to `Err` first: that channel closes when the
-    /// driver returns, so it is the only join signal this type offers.
+    /// driver drops its stream sender. Channel closure does not join the driver task
+    /// or expose its task failure. Use [`Self::accept_with_driver`] when the
+    /// caller needs to own and join that actual task.
     #[must_use]
     pub fn carrier_counts(&self) -> CarrierCounts {
         self.carrier.snapshot()

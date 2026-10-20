@@ -7,7 +7,7 @@ use spl_core::relay_window;
 use std::error::Error;
 use std::path::{Path, PathBuf};
 
-pub(crate) const PROTOCOL_REVISION: &str = "30ca5a24bf87a30b44f2997d7604c42be3cffc3a";
+pub(crate) const PROTOCOL_REVISION: &str = "6f6559150b118716761342c650b7cb525b533c06";
 const VECTORS_PATH_FROM_MANIFEST: &str = "../../conformance/bundle/vectors.json";
 
 #[derive(Deserialize)]

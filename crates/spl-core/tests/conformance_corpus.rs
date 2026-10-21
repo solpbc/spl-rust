@@ -15,10 +15,10 @@ use std::ffi::OsStr;
 use std::fs;
 use std::path::{Component, Path, PathBuf};
 
-const AUTHORITY_COMMIT: &str = "6f6559150b118716761342c650b7cb525b533c06";
+const AUTHORITY_COMMIT: &str = "f9b0c65d6f0b234aa70d97cfc477e0b6ae35aa65";
 const AUTHORITY_MANIFEST_SHA256: &str =
-    "714a55f4c305937acae6862cbd890a05da9407503d348a0b5f5690e77d350084";
-const BUNDLE_SEMVER: &str = "8.0.6";
+    "012fc87119ad9c831a76862a594f0529eb47bd647da549ca2acf7af1e91e8fce";
+const BUNDLE_SEMVER: &str = "9.0.0";
 const BUNDLE_SCHEMA_IDENTITY: &str = "spl.pair-link-definition-bundle.schema.v1";
 const ADOPTION_SCHEMA_VERSION: u32 = 1;
 const CONSUMER_IDENTIFIER: &str = "solpbc/spl-rust";
@@ -269,11 +269,14 @@ fn validate_adopted_files(adoption: &Adoption, manifest: &Manifest) -> Result<()
 #[test]
 fn vendored_vectors_pin_library_behavior() -> Result<(), Box<dyn Error>> {
     let corpus = read_corpus()?;
+    // [parse_pair_link, decode_crockford, derive_relay_key, derive_jid]
+    let mut executed = [0usize; 4];
     for vector in &corpus.vectors {
         match &vector.case {
             VectorCase::ParsePairLink { input, expected } => {
                 let actual = corpus_observers::observe_pair(input)?;
                 assert_eq!(&actual, expected, "vector {}", vector.id);
+                executed[0] += 1;
             }
             VectorCase::DecodeCrockford {
                 input,
@@ -281,6 +284,7 @@ fn vendored_vectors_pin_library_behavior() -> Result<(), Box<dyn Error>> {
             } => {
                 let actual = corpus_observers::observe_crockford(input)?;
                 assert_eq!(&actual, expected_hex, "vector {}", vector.id);
+                executed[1] += 1;
             }
             VectorCase::DeriveRelayKey {
                 secret_hex,
@@ -288,6 +292,7 @@ fn vendored_vectors_pin_library_behavior() -> Result<(), Box<dyn Error>> {
             } => {
                 let actual = corpus_observers::observe_relay_key(secret_hex)?;
                 assert_eq!(&actual, expected_hex, "vector {}", vector.id);
+                executed[2] += 1;
             }
             VectorCase::DeriveJid {
                 spki_der_hex,
@@ -295,9 +300,11 @@ fn vendored_vectors_pin_library_behavior() -> Result<(), Box<dyn Error>> {
             } => {
                 let actual = corpus_observers::observe_jid(spki_der_hex)?;
                 assert_eq!(&actual, expected, "vector {}", vector.id);
+                executed[3] += 1;
             }
         }
     }
+    assert_eq!(executed, [73, 1, 1, 9], "vectors executed per operation");
     Ok(())
 }
 

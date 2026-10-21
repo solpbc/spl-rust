@@ -95,11 +95,11 @@ fn protocol_mirror_has_exact_pinned_contents() -> Result<(), Box<dyn Error>> {
         ),
         (
             "pair-window.md",
-            "83e0a7ab94a95ae5b7234354754188e80707373c09feeea06fc4fb6591ec4746",
+            "256d6d416129cb420e11d277c159c4e4dbf83043e14a6b8ab39911f609c75e2b",
         ),
         (
             "pairing.md",
-            "d75aab346aa18e8cf002e52b2be9a27111900894baff214a1fca431a84f12448",
+            "727487e7ef5e0ab2f2b71f07b2c25cac38762faf505e9b1e8895c83b94af950e",
         ),
         (
             "session.md",

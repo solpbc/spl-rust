@@ -3,7 +3,7 @@
 
 # Protocol reference mirror
 
-This directory is a read-only mirror of the six protocol documents consumed by `spl-rust` from <https://github.com/solpbc/spl/tree/main/proto>, pinned at commit `6f6559150b118716761342c650b7cb525b533c06`.
+This directory is a read-only mirror of the six protocol documents consumed by `spl-rust` from <https://github.com/solpbc/spl/tree/main/proto>, pinned at commit `f9b0c65d6f0b234aa70d97cfc477e0b6ae35aa65`.
 
 The mirrored documents carry no local SPDX header because they are byte-identical upstream copies; adding one would destroy the byte identity this mirror preserves. This README records the directory's SPDX coverage.
 

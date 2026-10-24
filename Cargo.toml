@@ -54,7 +54,7 @@ getrandom = "0.2"
 hkdf = "0.12"
 indexmap = { version = "2.14", features = ["serde"] }
 jsonwebtoken = { version = "11", default-features = false, features = ["rust_crypto"] }
-p256 = { version = "0.13.2", default-features = false, features = ["arithmetic", "pkcs8", "alloc"] }
+p256 = { version = "0.14.0", default-features = false, features = ["arithmetic", "pkcs8", "alloc"] }
 ppp = "2.3"
 rcgen = { version = "0.13", default-features = false, features = ["ring", "pem"] }
 rustls = { version = ">=0.23.18", default-features = false, features = ["ring", "std", "tls12", "logging"] }

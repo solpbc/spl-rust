@@ -4000,6 +4000,7 @@ async fn open_carrier_fence_stale_incarnation_retires_and_fresh_succeeds() {
 struct RacingFence {
     lock: std::sync::Mutex<()>,
     retired: std::sync::atomic::AtomicBool,
+    resume_publication: std::sync::Mutex<Option<std::sync::mpsc::Receiver<()>>>,
 }
 
 impl spl_transport::RelayFence for RacingFence {
@@ -4011,8 +4012,17 @@ impl spl_transport::RelayFence for RacingFence {
         }
     }
     fn with_publication(&self, f: &mut dyn FnMut()) {
-        let _guard = self.lock.lock().unwrap();
-        f();
+        let resume = {
+            let _guard = self.lock.lock().unwrap();
+            let resume = self.resume_publication.lock().unwrap().take();
+            f();
+            resume
+        };
+        if let Some(resume) = resume {
+            resume
+                .recv_timeout(std::time::Duration::from_secs(30))
+                .expect("retirement barrier timed out");
+        }
     }
 }
 
@@ -4051,6 +4061,7 @@ async fn open_carrier_publication_wins_race_updates_token_and_aborts_on_retired_
 
     let (enter_tx, enter_rx) = std::sync::mpsc::channel();
     let (rel_tx, rel_rx) = std::sync::mpsc::channel();
+    let (resume_tx, resume_rx) = std::sync::mpsc::channel();
     let tx = Arc::new(CapturingTx {
         entered: enter_tx,
         release: std::sync::Mutex::new(rel_rx),
@@ -4059,6 +4070,7 @@ async fn open_carrier_publication_wins_race_updates_token_and_aborts_on_retired_
     let fence = Arc::new(RacingFence {
         lock: std::sync::Mutex::new(()),
         retired: std::sync::atomic::AtomicBool::new(false),
+        resume_publication: std::sync::Mutex::new(Some(resume_rx)),
     });
     let pub_cfg = spl_transport::TokenPublication {
         transaction: tx.clone(),
@@ -4087,6 +4099,9 @@ async fn open_carrier_publication_wins_race_updates_token_and_aborts_on_retired_
     // Release commit so publication completes
     rel_tx.send(()).unwrap();
     retire_task.await.unwrap();
+    // The caller must observe retirement before retrying the dial; scheduling the
+    // retirement task alone does not establish that ordering.
+    resume_tx.send(()).unwrap();
 
     let res = open_task.await.unwrap();
     let Err(err) = res else {

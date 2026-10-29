@@ -7,6 +7,8 @@
 2. **Control TLS Handshakes**: SNI `bridge.solstone.me` without ALPN `acme-tls/1` -> internal control listener for PoP registration and lease renewal.
 3. **ACME TLS-ALPN-01 Challenges**: SNI `bridge.solstone.me` with ALPN `acme-tls/1` -> local loopback target (`--acme-tls-alpn-target 127.0.0.1:8443`).
 
+A journal name with no usable registration is not closed at once: the connection is held for the routed first-response deadline (10 seconds), its bytes read and discarded, and then closed the same way as a client of a registered journal that never answers. Journal names are public, so this keeps a stranger from telling a sleeping journal from an unregistered one. Expect such connections to linger for those 10 seconds in socket listings; at most 1024 are held at once, and refusals beyond that are closed immediately.
+
 ## Certificate Management
 
 The bridge uses WebPKI-validated certificates for `bridge.solstone.me`. Certificates are dynamically reloaded via `SIGHUP` without restarting the daemon or dropping active journal/client connections.

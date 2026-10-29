@@ -1,13 +1,18 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (c) 2026 sol pbc
 
-//! Liveness witness for one routed client connection.
+//! Liveness witness for one routed client connection, and the stand-in a
+//! refused client is spliced to instead.
 //!
 //! A journal whose host has slept, lost its network, or frozen leaves its
 //! carrier socket open with no FIN, so carrier EOF never arrives and the
-//! registry keeps routing to it until its lease expires. This wrapper records
-//! whether the journal has produced any byte for a routed client so the
+//! registry keeps routing to it until its lease expires. [`FirstByteWitness`]
+//! records whether the journal has produced any byte for a routed client so the
 //! router can bound that wait instead of splicing into a black hole.
+//!
+//! [`UnansweredRoute`] behaves, from the client's side, like a journal stream
+//! that never answers, so a label with no usable registration can be refused
+//! in a way the client cannot tell apart from a sleeping journal.
 
 use std::pin::Pin;
 use std::sync::Arc;
@@ -87,6 +92,66 @@ where
         context: &mut Context<'_>,
     ) -> Poll<std::io::Result<()>> {
         Pin::new(&mut self.inner).poll_shutdown(context)
+    }
+}
+
+/// A journal stream that accepts a bounded number of bytes and never answers.
+///
+/// This mirrors what a routed client's splice meets when the journal host is
+/// asleep: writes are accepted until the stream's initial send credit is spent,
+/// after which they wait for a window grant that never comes; reads never
+/// complete; flush and shutdown complete. Splicing a refused client to this
+/// under the routed deadline makes the bridge read, stall, and close that
+/// client exactly as it does a client of a sleeping journal. Accepted bytes are
+/// discarded without being inspected or retained.
+pub(crate) struct UnansweredRoute {
+    remaining_credit: usize,
+}
+
+impl UnansweredRoute {
+    /// Accept up to `send_credit` bytes before stalling every further write.
+    pub(crate) fn new(send_credit: usize) -> Self {
+        Self {
+            remaining_credit: send_credit,
+        }
+    }
+}
+
+impl AsyncRead for UnansweredRoute {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        _context: &mut Context<'_>,
+        _buffer: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        // The caller's deadline is the only thing that ends this wait.
+        Poll::Pending
+    }
+}
+
+impl AsyncWrite for UnansweredRoute {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        _context: &mut Context<'_>,
+        bytes: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        // Like a journal stream's send credit: a write that does not fit in
+        // what remains waits whole rather than being split.
+        if bytes.len() > self.remaining_credit {
+            return Poll::Pending;
+        }
+        self.remaining_credit -= bytes.len();
+        Poll::Ready(Ok(bytes.len()))
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, _context: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn poll_shutdown(
+        self: Pin<&mut Self>,
+        _context: &mut Context<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        Poll::Ready(Ok(()))
     }
 }
 

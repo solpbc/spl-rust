@@ -124,7 +124,24 @@ const CONTROL_SPLICE_CONNECT_DEADLINE: Duration = Duration::from_secs(3);
 /// It is deliberately far above any healthy handshake (measured 0.25s
 /// end to end against the live endpoint, 2026-09-02) so a busy journal is
 /// never mistaken for an absent one.
+///
+/// The same deadline also governs a client whose label has no usable
+/// registration. Labels are public, so a refusal that differed from a sleeping
+/// journal would tell anyone which journals are registered but asleep. Both
+/// are measured from the moment the `ClientHello` has been parsed, and in both
+/// the bridge reads the client's bytes, never writes one, and closes the
+/// connection at the deadline. Only an answering journal looks different,
+/// which any reachable HTTPS endpoint does.
 pub const ROUTED_FIRST_RESPONSE_DEADLINE: Duration = Duration::from_secs(10);
+
+/// Most refused clients held open at once until [`ROUTED_FIRST_RESPONSE_DEADLINE`].
+///
+/// Every refused label is held for the full deadline, so a flood of made-up
+/// labels would otherwise pin one task and socket per connection for that
+/// long. Past this bound a refused client is closed at once. That is
+/// distinguishable from a sleeping journal, but only while the bridge is
+/// already flooded with refusals.
+const MAX_HELD_REFUSALS: usize = 1024;
 
 const CLIENT_KEEPALIVE_IDLE: Duration = Duration::from_secs(30);
 const CLIENT_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(10);
@@ -225,6 +242,8 @@ pub enum BridgeLogEvent {
     ClientRejectedProxyHeaderBuild,
     /// Writing PROXY v1 header failed.
     ClientRejectedProxyHeaderWrite,
+    /// Refused client closed at once because too many refusals are held open.
+    ClientRefusalHoldCapacity,
     /// Client rejected because journal is unresponsive.
     ClientRejectedJournalUnresponsive,
     /// Journal retired because unresponsive.
@@ -351,6 +370,9 @@ impl BridgeLogEvent {
             }
             Self::ClientRejectedProxyHeaderWrite => {
                 tracing::warn!("client rejected because PROXY header could not be written");
+            }
+            Self::ClientRefusalHoldCapacity => {
+                tracing::warn!("refused client closed early: refusal hold capacity exceeded");
             }
             Self::ClientRejectedJournalUnresponsive => {
                 tracing::warn!("client rejected because the journal never answered");
@@ -594,6 +616,7 @@ pub async fn run_client_listener<A, C, AC>(
     let mut join_set = tokio::task::JoinSet::new();
     BridgeLogEvent::ClientListenerStarted.emit();
     let sni_admission = Arc::new(Semaphore::new(MAX_SNI_ADMISSION_SLOTS));
+    let held_refusals = Arc::new(Semaphore::new(MAX_HELD_REFUSALS));
     let mut backoff = INITIAL_ACCEPT_BACKOFF;
     loop {
         while join_set.try_join_next().is_some() {}
@@ -622,6 +645,7 @@ pub async fn run_client_listener<A, C, AC>(
         hold_accepted_flow_open(&stream);
         let registry = registry.clone();
         let sni_admission = Arc::clone(&sni_admission);
+        let held_refusals = Arc::clone(&held_refusals);
         let control_connector = control_connector.clone();
         let acme_connector = acme_connector.clone();
 
@@ -634,6 +658,7 @@ pub async fn run_client_listener<A, C, AC>(
                 acme_target,
                 sni_deadline,
                 sni_admission,
+                held_refusals,
                 control_connector,
                 acme_connector,
             )
@@ -655,9 +680,13 @@ pub async fn run_client_listener<A, C, AC>(
 }
 
 /// Route one client TLS connection.
+///
+/// A journal label with no usable registration is refused the way a sleeping
+/// journal's client is closed; see [`ROUTED_FIRST_RESPONSE_DEADLINE`].
+/// `held_refusals` bounds how many such refusals are held open at once.
 #[expect(
     clippy::too_many_arguments,
-    reason = "client handler parameters include connectors, targets, deadlines, and permit"
+    reason = "client handler parameters include connectors, targets, deadlines, and permits"
 )]
 pub async fn handle_client<C, AC>(
     mut client: TcpStream,
@@ -667,6 +696,7 @@ pub async fn handle_client<C, AC>(
     acme_target: Option<SocketAddr>,
     sni_deadline: Duration,
     sni_admission: Arc<Semaphore>,
+    held_refusals: Arc<Semaphore>,
     control_connector: C,
     acme_connector: AC,
 ) where
@@ -684,6 +714,7 @@ pub async fn handle_client<C, AC>(
         };
         routing
     };
+    let route_deadline = tokio::time::Instant::now() + ROUTED_FIRST_RESPONSE_DEADLINE;
 
     if let Some(target) = acme_target
         && routing.hostname == RESERVED_CONTROL_SNI
@@ -733,82 +764,155 @@ pub async fn handle_client<C, AC>(
         BridgeLogEvent::ClientRejectedInvalidHostname.emit();
         return;
     }
-    let Some(journal) = registry.lookup(&routing.hostname).await else {
-        BridgeLogEvent::ClientRejectedWithoutJournalRegistration.emit();
-        return;
-    };
-    let Ok(stream) = journal.open_stream().await else {
-        BridgeLogEvent::ClientRejectedJournalStreamOpen.emit();
-        return;
-    };
     let Ok(source) = client.peer_addr() else {
         return;
     };
     let Ok(destination) = client.local_addr() else {
         return;
     };
-    let Ok(header) = proxy_protocol::v1_header(source, destination) else {
+    let header = proxy_protocol::v1_header(source, destination);
+    // A routed stream spends this much of its send credit on the PROXY header
+    // before the client's first byte.
+    let header_len = header.as_ref().map_or(0, Vec::len);
+    let route = route_to_journal(
+        &mut client,
+        &registry,
+        &routing.hostname,
+        header,
+        route_deadline,
+    );
+    if route.await == JournalRoute::Refused {
+        hold_like_an_unanswered_route(&mut client, header_len, route_deadline, &held_refusals)
+            .await;
+    }
+}
+
+/// Whether a journal-label client was handled or must still be refused.
+#[derive(PartialEq, Eq)]
+enum JournalRoute {
+    /// The client was spliced to its journal, or closed as unanswered.
+    Done,
+    /// No usable journal stream exists for the label; nothing was written to
+    /// the client and its bytes are still unread.
+    Refused,
+}
+
+/// Splice a client to the journal registered for `hostname`.
+///
+/// Every journal handle is released before this returns, so a refused client
+/// is held without keeping its label's registration alive.
+async fn route_to_journal(
+    client: &mut TcpStream,
+    registry: &registry::Registry,
+    hostname: &str,
+    header: Result<Vec<u8>, proxy_protocol::ProxyProtocolError>,
+    route_deadline: tokio::time::Instant,
+) -> JournalRoute {
+    let Some(journal) = registry.lookup(hostname).await else {
+        BridgeLogEvent::ClientRejectedWithoutJournalRegistration.emit();
+        return JournalRoute::Refused;
+    };
+    let Ok(stream) = journal.open_stream().await else {
+        BridgeLogEvent::ClientRejectedJournalStreamOpen.emit();
+        return JournalRoute::Refused;
+    };
+    let Ok(header) = header else {
         BridgeLogEvent::ClientRejectedProxyHeaderBuild.emit();
-        return;
+        return JournalRoute::Refused;
     };
     let flag = routed::FirstByteFlag::default();
     let mut stream = routed::FirstByteWitness::new(stream, flag.clone());
-    if stream.write_all(&header).await.is_err() || stream.flush().await.is_err() {
-        BridgeLogEvent::ClientRejectedProxyHeaderWrite.emit();
-        return;
+    let header_written = tokio::time::timeout_at(route_deadline, async {
+        stream.write_all(&header).await?;
+        stream.flush().await
+    })
+    .await;
+    match header_written {
+        Ok(Ok(())) => {}
+        Ok(Err(_)) => {
+            BridgeLogEvent::ClientRejectedProxyHeaderWrite.emit();
+            return JournalRoute::Refused;
+        }
+        Err(_) => {
+            // The journal's carrier could not take even the header before the
+            // deadline. The client's bytes are still unread here, so this close
+            // is a reset; it needs a carrier already backed up for the whole
+            // deadline.
+            BridgeLogEvent::ClientRejectedJournalUnresponsive.emit();
+            registry.retire_unresponsive(hostname, &journal).await;
+            return JournalRoute::Done;
+        }
     }
 
     BridgeLogEvent::ClientRoutedToJournal.emit();
-    splice_until_journal_answers_or_deadline(
-        &mut client,
-        &mut stream,
-        &flag,
-        &registry,
-        &routing.hostname,
-        &journal,
-    )
-    .await;
+    match splice_until_answer_or_deadline(client, &mut stream, &flag, route_deadline).await {
+        SpliceEnd::Closed(Ok(_)) => BridgeLogEvent::ClientSpliceClosed.emit(),
+        SpliceEnd::Closed(Err(_)) => BridgeLogEvent::ClientSpliceClosedWithIoError.emit(),
+        SpliceEnd::Unanswered => {
+            BridgeLogEvent::ClientRejectedJournalUnresponsive.emit();
+            registry.retire_unresponsive(hostname, &journal).await;
+        }
+    }
+    JournalRoute::Done
 }
 
-/// Splice a routed client, closing it if the journal never answers.
-async fn splice_until_journal_answers_or_deadline<S>(
+/// How a splice bounded by [`ROUTED_FIRST_RESPONSE_DEADLINE`] ended.
+enum SpliceEnd {
+    /// Both directions finished, or one failed, with this result.
+    Closed(io::Result<(u64, u64)>),
+    /// The deadline passed before the journal side produced a byte.
+    Unanswered,
+}
+
+/// Splice a client to `stream` until both sides finish, or until `deadline`
+/// if `stream` has not produced a byte by then.
+///
+/// Returning drops the splice; the caller closes the client by dropping it.
+async fn splice_until_answer_or_deadline<S>(
     client: &mut TcpStream,
     stream: &mut S,
     flag: &routed::FirstByteFlag,
-    registry: &registry::Registry,
-    hostname: &str,
-    journal: &Arc<registry::RegisteredJournal>,
-) where
-    S: tokio::io::AsyncRead + AsyncWriteExt + Unpin,
+    deadline: tokio::time::Instant,
+) -> SpliceEnd
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
     let splice = tokio::io::copy_bidirectional(client, stream);
     tokio::pin!(splice);
-    let mut armed = true;
-    loop {
-        if !armed {
-            match (&mut splice).await {
-                Ok(_) => BridgeLogEvent::ClientSpliceClosed.emit(),
-                Err(_) => BridgeLogEvent::ClientSpliceClosedWithIoError.emit(),
-            }
-            return;
-        }
-        match tokio::time::timeout(ROUTED_FIRST_RESPONSE_DEADLINE, &mut splice).await {
-            Ok(Ok(_)) => {
-                BridgeLogEvent::ClientSpliceClosed.emit();
-                return;
-            }
-            Ok(Err(_)) => {
-                BridgeLogEvent::ClientSpliceClosedWithIoError.emit();
-                return;
-            }
-            Err(_) if flag.observed() => armed = false,
-            Err(_) => {
-                BridgeLogEvent::ClientRejectedJournalUnresponsive.emit();
-                registry.retire_unresponsive(hostname, journal).await;
-                return;
-            }
-        }
+    match tokio::time::timeout_at(deadline, &mut splice).await {
+        Ok(result) => SpliceEnd::Closed(result),
+        Err(_) if flag.observed() => SpliceEnd::Closed(splice.await),
+        Err(_) => SpliceEnd::Unanswered,
     }
+}
+
+/// Refuse a client the way a client of a sleeping journal is closed.
+///
+/// The client is spliced, under the same deadline and through the same splice,
+/// to a stand-in that takes bytes as a freshly opened journal stream would and
+/// never answers. At the TCP level that reproduces the sleeping-journal path:
+/// the client's bytes are read and discarded, nothing is written to it, an
+/// early half-close keeps the connection until the deadline, and the final
+/// close is a FIN, or a reset when the client sent more than the stream would
+/// accept and the bridge drops unread bytes.
+///
+/// A sleeping journal's carrier can stop taking bytes before the stream's send
+/// credit is spent, so a client that sends far more than a TLS client would
+/// before any reply may still see the two stall at different byte counts.
+async fn hold_like_an_unanswered_route(
+    client: &mut TcpStream,
+    header_len: usize,
+    deadline: tokio::time::Instant,
+    held_refusals: &Semaphore,
+) {
+    let Ok(_held) = held_refusals.try_acquire() else {
+        BridgeLogEvent::ClientRefusalHoldCapacity.emit();
+        return;
+    };
+    let mut route =
+        routed::UnansweredRoute::new(spl_core::mux::INITIAL_WINDOW.saturating_sub(header_len));
+    let never_answers = routed::FirstByteFlag::default();
+    let _ = splice_until_answer_or_deadline(client, &mut route, &never_answers, deadline).await;
 }
 
 #[cfg(test)]
@@ -928,6 +1032,7 @@ mod tests {
             None,
             Duration::from_secs(1),
             Arc::clone(&permits),
+            Arc::new(Semaphore::new(MAX_HELD_REFUSALS)),
             NeverReadyControlConnector(Arc::clone(&connect_entered)),
             TokioControlConnector,
         ));
@@ -969,6 +1074,7 @@ mod tests {
                 None,
                 Duration::from_mins(1),
                 Arc::clone(&permits),
+                Arc::new(Semaphore::new(MAX_HELD_REFUSALS)),
                 NeverReadyControlConnector(Arc::new(Notify::new())),
                 TokioControlConnector,
             )));
@@ -993,6 +1099,7 @@ mod tests {
             None,
             Duration::from_mins(1),
             Arc::clone(&permits),
+            Arc::new(Semaphore::new(MAX_HELD_REFUSALS)),
             NeverReadyControlConnector(Arc::new(Notify::new())),
             TokioControlConnector,
         )
@@ -1037,6 +1144,7 @@ mod tests {
             None,
             Duration::from_millis(50),
             Arc::clone(&permits),
+            Arc::new(Semaphore::new(MAX_HELD_REFUSALS)),
             TokioControlConnector,
             TokioControlConnector,
         )
@@ -1060,6 +1168,7 @@ mod tests {
             None,
             Duration::from_millis(50),
             Arc::clone(&permits),
+            Arc::new(Semaphore::new(MAX_HELD_REFUSALS)),
             TokioControlConnector,
             TokioControlConnector,
         )
@@ -1111,6 +1220,7 @@ mod tests {
             None,
             Duration::from_secs(1),
             Arc::new(Semaphore::new(MAX_SNI_ADMISSION_SLOTS)),
+            Arc::new(Semaphore::new(MAX_HELD_REFUSALS)),
             NeverReadyControlConnector(Arc::new(Notify::new())),
             TokioControlConnector,
         ))
@@ -1178,6 +1288,159 @@ mod tests {
         assert!(!task.is_finished());
         assert!(registry.lookup(UNRESPONSIVE_TEST_HOSTNAME).await.is_some());
         task.abort();
+        Ok(())
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    enum ClientClose {
+        Fin,
+        Reset,
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    struct ClientObservation {
+        held: Duration,
+        bytes: Vec<u8>,
+        close: ClientClose,
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum ClientSends {
+        /// A `ClientHello`, then nothing, as a real TLS client does.
+        Hello,
+        /// A `ClientHello`, then the client's write half is shut down.
+        HelloThenHalfClose,
+        /// A `ClientHello`, then more than one journal stream accepts.
+        HelloThenFlood,
+    }
+
+    /// Drive one client to `hostname` and record what that client can see of
+    /// the bridge: how long it is held, what it is sent, and how it is closed.
+    async fn observe_routed_client(
+        registry: registry::Registry,
+        hostname: &str,
+        sends: ClientSends,
+        held_refusals: Arc<Semaphore>,
+    ) -> Result<ClientObservation, io::Error> {
+        let (mut client, server) = tcp_pair().await?;
+        client.write_all(&client_hello_for(hostname)).await?;
+        let started = tokio::time::Instant::now();
+        let task = tokio::spawn(handle_client(
+            server,
+            SocketAddr::from(([127, 0, 0, 1], 0)),
+            registry,
+            SocketAddr::from(([127, 0, 0, 1], 0)),
+            None,
+            Duration::from_secs(1),
+            Arc::new(Semaphore::new(MAX_SNI_ADMISSION_SLOTS)),
+            held_refusals,
+            NeverReadyControlConnector(Arc::new(Notify::new())),
+            TokioControlConnector,
+        ));
+        let (mut reader, mut writer) = client.into_split();
+        let flood = match sends {
+            ClientSends::Hello => None,
+            ClientSends::HelloThenHalfClose => {
+                writer.shutdown().await?;
+                None
+            }
+            ClientSends::HelloThenFlood => Some(tokio::spawn(async move {
+                let filler = vec![0x17_u8; 64 * 1024];
+                for _ in 0..(4 * spl_core::mux::INITIAL_WINDOW / filler.len()) {
+                    if writer.write_all(&filler).await.is_err() {
+                        break;
+                    }
+                }
+            })),
+        };
+        task.await.map_err(io::Error::other)?;
+        let held = started.elapsed();
+        let mut bytes = Vec::new();
+        let close = loop {
+            let mut chunk = [0_u8; 1024];
+            match reader.read(&mut chunk).await {
+                Ok(0) => break ClientClose::Fin,
+                Ok(read) => bytes.extend_from_slice(&chunk[..read]),
+                Err(error) if error.kind() == io::ErrorKind::ConnectionReset => {
+                    break ClientClose::Reset;
+                }
+                Err(error) => return Err(error),
+            }
+        };
+        if let Some(flood) = flood {
+            flood.await.map_err(io::Error::other)?;
+        }
+        Ok(ClientObservation { held, bytes, close })
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_label_without_a_usable_registration_looks_like_a_sleeping_journal()
+    -> Result<(), io::Error> {
+        for (sends, close) in [
+            (ClientSends::Hello, ClientClose::Fin),
+            (ClientSends::HelloThenHalfClose, ClientClose::Fin),
+            (ClientSends::HelloThenFlood, ClientClose::Reset),
+        ] {
+            let expected = ClientObservation {
+                held: ROUTED_FIRST_RESPONSE_DEADLINE,
+                bytes: Vec::new(),
+                close,
+            };
+            let held_refusals = || Arc::new(Semaphore::new(MAX_HELD_REFUSALS));
+
+            let (asleep, _journal, _peer, _control) = registry_with_silent_journal().await?;
+            let asleep =
+                observe_routed_client(asleep, UNRESPONSIVE_TEST_HOSTNAME, sends, held_refusals())
+                    .await?;
+            assert_eq!(asleep, expected, "asleep, {sends:?}");
+
+            let not_parked = observe_routed_client(
+                registry::Registry::default(),
+                UNRESPONSIVE_TEST_HOSTNAME,
+                sends,
+                held_refusals(),
+            )
+            .await?;
+            assert_eq!(not_parked, expected, "not parked, {sends:?}");
+
+            // A registration that is still listed but can no longer open a
+            // stream is refused the same way.
+            let (unopenable, journal, _peer, _control) = registry_with_silent_journal().await?;
+            journal.retire();
+            let unopenable = observe_routed_client(
+                unopenable,
+                UNRESPONSIVE_TEST_HOSTNAME,
+                sends,
+                held_refusals(),
+            )
+            .await?;
+            assert_eq!(unopenable, expected, "stream open failed, {sends:?}");
+        }
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn refusals_past_the_hold_bound_are_closed_at_once() -> Result<(), io::Error> {
+        let logs = LogBuffer(Arc::new(Mutex::new(Vec::new())));
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .without_time()
+            .with_writer(logs.clone())
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let observed = observe_routed_client(
+            registry::Registry::default(),
+            UNRESPONSIVE_TEST_HOSTNAME,
+            ClientSends::Hello,
+            Arc::new(Semaphore::new(0)),
+        )
+        .await?;
+        assert_eq!(observed.held, Duration::ZERO);
+        assert!(observed.bytes.is_empty());
+
+        let output = String::from_utf8(logs.0.lock().unwrap().clone()).unwrap();
+        assert!(output.contains("refusal hold capacity exceeded"));
         Ok(())
     }
 
@@ -1270,6 +1533,7 @@ mod tests {
             BridgeLogEvent::ClientRejectedInvalidClientHello,
             BridgeLogEvent::ClientRejectedInvalidHostname,
             BridgeLogEvent::ClientAcmeForwardFailed,
+            BridgeLogEvent::ClientRefusalHoldCapacity,
             BridgeLogEvent::AcmeTargetRejected,
             BridgeLogEvent::BridgeShutdownReceived,
             BridgeLogEvent::BridgeDrainTimedOut,

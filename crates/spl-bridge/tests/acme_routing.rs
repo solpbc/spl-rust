@@ -238,7 +238,7 @@ async fn ac5_acme_routing_rules_and_panic_connectors() {
     let owner_hello = build_client_hello(Some("aaaqeaye.solstone.me"), &[b"acme-tls/1"]);
     client2.write_all(&owner_hello).await.unwrap();
 
-    // Unregistered owner journal closes client without dialing ACME or control
+    // Unregistered owner journal is held, then closed, without dialing ACME or control
     let mut close_buf = [0u8; 1];
     let res = client2.read(&mut close_buf).await;
     assert_closed(&res);

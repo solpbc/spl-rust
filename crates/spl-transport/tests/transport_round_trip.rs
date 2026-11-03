@@ -65,7 +65,6 @@ const TEST_OBSERVER_KEY: &str = "test-handle";
 // keeping this crate independent of the consumer contract bundle.
 const PAIR_EXAMPLE_NONCE: &str = "5f0d8c8b9f1e48b0a5f80b98f3d5e9b0";
 const PAIR_EXAMPLE_DEVICE_LABEL: &str = "Jer iPhone";
-const PAIR_EXAMPLE_INSTANCE_ID: &str = "4d1f3d57-4f39-4930-b8f8-5e6f2a84d51a";
 const PAIR_EXAMPLE_HOME_LABEL: &str = "home";
 const PAIR_EXAMPLE_HOME_ATTESTATION: &str = "eyJhbGciOi...";
 
@@ -76,6 +75,43 @@ fn self_signed() -> (CertificateDer<'static>, PrivateKeyDer<'static>) {
     let cert_der = CertificateDer::from(cert.der().to_vec());
     let key_der = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key.serialize_der()));
     (cert_der, key_der)
+}
+
+/// A journal's door: a leaf its CA signed, presented with that CA, and the
+/// pair link pin that names the CA.
+fn journal_door(ca: &rcgen::Certificate, ca_key: &KeyPair) -> (TlsAcceptor, Vec<u8>) {
+    let leaf_key = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).unwrap();
+    let leaf = CertificateParams::new(vec!["spl.local".to_string()])
+        .unwrap()
+        .signed_by(&leaf_key, ca, ca_key)
+        .unwrap();
+    let config =
+        ServerConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_no_client_auth()
+            .with_single_cert(
+                vec![
+                    CertificateDer::from(leaf.der().to_vec()),
+                    CertificateDer::from(ca.der().to_vec()),
+                ],
+                PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(leaf_key.serialize_der())),
+            )
+            .unwrap();
+    (
+        TlsAcceptor::from(Arc::new(config)),
+        spl_core::ca::sha256(ca.der())[..16].to_vec(),
+    )
+}
+
+fn journal_ca() -> (rcgen::Certificate, KeyPair) {
+    let mut ca_params = CertificateParams::new(Vec::<String>::new()).unwrap();
+    ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+    ca_params.key_usages.push(KeyUsagePurpose::DigitalSignature);
+    ca_params.key_usages.push(KeyUsagePurpose::KeyCertSign);
+    let key = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).unwrap();
+    let cert = ca_params.self_signed(&key).unwrap();
+    (cert, key)
 }
 
 fn server_config(cert: CertificateDer<'static>, key: PrivateKeyDer<'static>) -> ServerConfig {
@@ -444,7 +480,7 @@ fn pair_response_body(
     serde_json::to_vec(&serde_json::json!({
         "client_cert": client_cert.pem(),
         "ca_chain": [signing_cert.pem()],
-        "instance_id": PAIR_EXAMPLE_INSTANCE_ID,
+        "instance_id": jid_of(signing_cert.der()),
         "home_label": PAIR_EXAMPLE_HOME_LABEL,
         "fingerprint": format!("sha256:{}", spl_core::ca::sha256_hex(client_cert.der())),
         "home_attestation": PAIR_EXAMPLE_HOME_ATTESTATION,
@@ -521,7 +557,10 @@ async fn serve_one_custom_pair_response_counted(
     request
 }
 
-struct ConsumerDirectPairingSeam;
+struct ConsumerDirectPairingSeam {
+    signing_cert: Arc<rcgen::Certificate>,
+    signing_key: Arc<KeyPair>,
+}
 
 impl DirectPairingSeam for ConsumerDirectPairingSeam {
     fn prepare<'a>(
@@ -529,14 +568,18 @@ impl DirectPairingSeam for ConsumerDirectPairingSeam {
         _config: Arc<ClientConfig>,
         _endpoint: &'a Endpoint,
     ) -> DirectPairPrepareFuture<'a> {
-        Box::pin(async {
-            Ok(Box::new(ConsumerPreparedDirectPairConnection)
-                as Box<dyn PreparedDirectPairConnection>)
-        })
+        let connection = ConsumerPreparedDirectPairConnection {
+            signing_cert: self.signing_cert.clone(),
+            signing_key: self.signing_key.clone(),
+        };
+        Box::pin(async move { Ok(Box::new(connection) as Box<dyn PreparedDirectPairConnection>) })
     }
 }
 
-struct ConsumerPreparedDirectPairConnection;
+struct ConsumerPreparedDirectPairConnection {
+    signing_cert: Arc<rcgen::Certificate>,
+    signing_key: Arc<KeyPair>,
+}
 
 impl PreparedDirectPairConnection for ConsumerPreparedDirectPairConnection {
     fn send<'a>(
@@ -548,21 +591,13 @@ impl PreparedDirectPairConnection for ConsumerPreparedDirectPairConnection {
     ) -> DirectPairSendFuture<'a> {
         let response = (|| {
             let pair_request: spl_core::PairRequest = serde_json::from_slice(body)?;
-            let signing_key = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).unwrap();
-            let mut signing_params = CertificateParams::new(Vec::<String>::new()).unwrap();
-            signing_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
-            signing_params
-                .key_usages
-                .push(KeyUsagePurpose::DigitalSignature);
-            signing_params.key_usages.push(KeyUsagePurpose::KeyCertSign);
-            let signing_cert = signing_params.self_signed(&signing_key).unwrap();
             Ok(HttpResponse {
                 status: 200,
                 headers: Vec::new(),
                 body: pair_response_body(
                     &pair_request,
-                    &signing_cert,
-                    &signing_key,
+                    &self.signing_cert,
+                    &self.signing_key,
                     PairCertificateMode::SubmittedCsr,
                 ),
             })
@@ -1623,16 +1658,9 @@ async fn round_trips_request_over_real_tls_and_framing() {
 
 #[tokio::test]
 async fn observer_contract_authority_direct_pairing_uses_real_crypto_and_request_path() {
-    let mut ca_params = CertificateParams::new(Vec::<String>::new()).unwrap();
-    ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
-    ca_params.key_usages.push(KeyUsagePurpose::DigitalSignature);
-    ca_params.key_usages.push(KeyUsagePurpose::KeyCertSign);
-    let signing_key = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).unwrap();
-    let signing_cert = ca_params.self_signed(&signing_key).unwrap();
-
-    let (server_cert, server_key) = self_signed();
-    let server_pin = spl_core::ca::sha256(server_cert.as_ref())[..16].to_vec();
-    let acceptor = TlsAcceptor::from(Arc::new(server_config(server_cert, server_key)));
+    let (signing_cert, signing_key) = journal_ca();
+    let (acceptor, server_pin) = journal_door(&signing_cert, &signing_key);
+    let expected_jid = jid_of(signing_cert.der());
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
     let server = tokio::spawn(serve_one_pair_response(
@@ -1658,7 +1686,7 @@ async fn observer_contract_authority_direct_pairing_uses_real_crypto_and_request
     )
     .await
     .unwrap();
-    assert_eq!(credential.instance_id, PAIR_EXAMPLE_INSTANCE_ID);
+    assert_eq!(credential.instance_id, expected_jid);
     assert_eq!(credential.home_label, PAIR_EXAMPLE_HOME_LABEL);
     assert_eq!(
         credential.home_attestation.as_deref(),
@@ -1697,16 +1725,8 @@ async fn observer_contract_authority_direct_pairing_uses_real_crypto_and_request
 
 #[tokio::test]
 async fn linked_system_pair_additional_fields_reach_direct_wire() {
-    let mut ca_params = CertificateParams::new(Vec::<String>::new()).unwrap();
-    ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
-    ca_params.key_usages.push(KeyUsagePurpose::DigitalSignature);
-    ca_params.key_usages.push(KeyUsagePurpose::KeyCertSign);
-    let signing_key = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).unwrap();
-    let signing_cert = ca_params.self_signed(&signing_key).unwrap();
-
-    let (server_cert, server_key) = self_signed();
-    let server_pin = spl_core::ca::sha256(server_cert.as_ref())[..16].to_vec();
-    let acceptor = TlsAcceptor::from(Arc::new(server_config(server_cert, server_key)));
+    let (signing_cert, signing_key) = journal_ca();
+    let (acceptor, server_pin) = journal_door(&signing_cert, &signing_key);
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
     let server = tokio::spawn(serve_one_pair_response(
@@ -1757,34 +1777,138 @@ async fn linked_system_can_implement_public_direct_pairing_seam() {
         host: "consumer-transport.invalid".into(),
         port: 7657,
     }];
+    let (signing_cert, signing_key) = journal_ca();
+    let pin = spl_core::ca::sha256(signing_cert.der())[..16].to_vec();
+    let expected_jid = jid_of(signing_cert.der());
 
     let credential = spl_transport::pairing::pair_with_seam(
         &endpoints,
         PAIR_EXAMPLE_NONCE,
-        &[0x22; 16],
+        &pin,
         PAIR_EXAMPLE_DEVICE_LABEL,
-        Arc::new(ConsumerDirectPairingSeam),
+        Arc::new(ConsumerDirectPairingSeam {
+            signing_cert: Arc::new(signing_cert),
+            signing_key: Arc::new(signing_key),
+        }),
         &serde_json::Map::new(),
     )
     .await
     .unwrap();
 
-    assert_eq!(credential.instance_id, PAIR_EXAMPLE_INSTANCE_ID);
+    assert_eq!(credential.instance_id, expected_jid);
     assert!(credential.client_cert_pem.contains("BEGIN CERTIFICATE"));
+}
+
+/// What a forged pair link's peer returns: everything its own CA can honestly
+/// sign, naming the journal it impersonates, with that journal's mark words in
+/// the only place a pair response has for them.
+fn forged_pair_response_body(
+    pair_request: &spl_core::PairRequest,
+    own_cert: &rcgen::Certificate,
+    own_key: &KeyPair,
+    claimed_jid: &str,
+) -> Vec<u8> {
+    let client_cert = CertificateSigningRequestParams::from_pem(&pair_request.csr)
+        .unwrap()
+        .signed_by(own_cert, own_key)
+        .unwrap();
+    let spec = spl_core::mark::mark_from_jid(claimed_jid)
+        .unwrap()
+        .to_render_spec();
+    serde_json::to_vec(&serde_json::json!({
+        "client_cert": client_cert.pem(),
+        "ca_chain": [own_cert.pem()],
+        "instance_id": claimed_jid,
+        "home_label": format!("{}\u{b7}{}", spec.words[0], spec.words[1]),
+        "fingerprint": format!("sha256:{}", spl_core::ca::sha256_hex(client_cert.der())),
+        "home_attestation": PAIR_EXAMPLE_HOME_ATTESTATION,
+    }))
+    .unwrap()
+}
+
+#[tokio::test]
+async fn direct_pairing_refuses_a_peer_claiming_another_journals_id_and_pairs_a_genuine_one() {
+    let (genuine_cert, genuine_key) = journal_ca();
+    let genuine_jid = jid_of(genuine_cert.der());
+
+    // The forger's door holds its own CA, and its link pins that CA, so the
+    // handshake succeeds and the one request is written.
+    let (forger_cert, forger_key) = journal_ca();
+    let (acceptor, forger_pin) = journal_door(&forger_cert, &forger_key);
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let claimed = genuine_jid.clone();
+    let forger = tokio::spawn(async move {
+        let (tcp, _) = listener.accept().await.unwrap();
+        let mut tls = acceptor.accept(tcp).await.unwrap();
+        let (stream_id, request) = read_framed_request(&mut tls).await;
+        let pair_request: spl_core::PairRequest =
+            serde_json::from_value(request_body(&request)).unwrap();
+        let body = forged_pair_response_body(&pair_request, &forger_cert, &forger_key, &claimed);
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+            body.len(),
+            String::from_utf8_lossy(&body)
+        );
+        let frame = Frame::new(stream_id, FLAG_DATA | FLAG_CLOSE, response.into_bytes());
+        tls.write_all(&frame.encode().unwrap()).await.unwrap();
+        tls.flush().await.unwrap();
+        let _ = tls.shutdown().await;
+    });
+    let endpoints = [Endpoint {
+        host: "127.0.0.1".to_owned(),
+        port,
+    }];
+    let result = spl_transport::pairing::pair(
+        &endpoints,
+        PAIR_EXAMPLE_NONCE,
+        &forger_pin,
+        PAIR_EXAMPLE_DEVICE_LABEL,
+        &serde_json::Map::new(),
+    )
+    .await;
+    assert!(
+        matches!(
+            &result,
+            Err(TransportError::Pairing(message)) if message == "direct instance mismatch"
+        ),
+        "the forged id was not refused: {:?}",
+        result.map(|credential| credential.instance_id)
+    );
+    forger.await.unwrap();
+
+    // The journal it impersonated pairs the same way.
+    let (acceptor, genuine_pin) = journal_door(&genuine_cert, &genuine_key);
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let genuine = tokio::spawn(serve_one_pair_response(
+        listener,
+        acceptor,
+        genuine_cert,
+        genuine_key,
+        PairCertificateMode::SubmittedCsr,
+    ));
+    let endpoints = [Endpoint {
+        host: "127.0.0.1".to_owned(),
+        port,
+    }];
+    let credential = spl_transport::pairing::pair(
+        &endpoints,
+        PAIR_EXAMPLE_NONCE,
+        &genuine_pin,
+        PAIR_EXAMPLE_DEVICE_LABEL,
+        &serde_json::Map::new(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(credential.instance_id, genuine_jid);
+    genuine.await.unwrap();
 }
 
 #[tokio::test]
 async fn direct_pairing_key_mismatch_is_terminal_after_first_written_request() {
-    let mut ca_params = CertificateParams::new(Vec::<String>::new()).unwrap();
-    ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
-    ca_params.key_usages.push(KeyUsagePurpose::DigitalSignature);
-    ca_params.key_usages.push(KeyUsagePurpose::KeyCertSign);
-    let signing_key = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).unwrap();
-    let signing_cert = ca_params.self_signed(&signing_key).unwrap();
-
-    let (server_cert, server_key) = self_signed();
-    let server_pin = spl_core::ca::sha256(server_cert.as_ref())[..16].to_vec();
-    let acceptor = TlsAcceptor::from(Arc::new(server_config(server_cert, server_key)));
+    let (signing_cert, signing_key) = journal_ca();
+    let (acceptor, server_pin) = journal_door(&signing_cert, &signing_key);
     let first_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let first_port = first_listener.local_addr().unwrap().port();
     let first_server = tokio::spawn(serve_one_pair_response(
@@ -4891,16 +5015,9 @@ async fn transport_client_request_http_404_and_500_select_path() {
 
 #[tokio::test]
 async fn direct_pair_observed_multiple_candidates_records_attempts_and_path() {
-    let mut ca_params = CertificateParams::new(Vec::<String>::new()).unwrap();
-    ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
-    ca_params.key_usages.push(KeyUsagePurpose::DigitalSignature);
-    ca_params.key_usages.push(KeyUsagePurpose::KeyCertSign);
-    let signing_key = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).unwrap();
-    let signing_cert = ca_params.self_signed(&signing_key).unwrap();
-
-    let (server_cert, server_key) = self_signed();
-    let server_pin = spl_core::ca::sha256(server_cert.as_ref())[..16].to_vec();
-    let acceptor = TlsAcceptor::from(Arc::new(server_config(server_cert, server_key)));
+    let (signing_cert, signing_key) = journal_ca();
+    let (acceptor, server_pin) = journal_door(&signing_cert, &signing_key);
+    let expected_jid = jid_of(signing_cert.der());
 
     // Closed port for first candidate
     let unused_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -4946,7 +5063,7 @@ async fn direct_pair_observed_multiple_candidates_records_attempts_and_path() {
     .await
     .unwrap();
 
-    assert_eq!(credential.instance_id, PAIR_EXAMPLE_INSTANCE_ID);
+    assert_eq!(credential.instance_id, expected_jid);
     assert_eq!(accepts.load(Ordering::SeqCst), 1);
     assert_eq!(obs.dial_attempts(), 2);
     assert_eq!(obs.direct_successes(), 1);
@@ -5069,16 +5186,8 @@ async fn direct_pair_observed_malformed_body_sets_success_not_path() {
 
 #[tokio::test]
 async fn direct_pair_observed_unrelated_key_sets_success_not_path() {
-    let mut ca_params = CertificateParams::new(Vec::<String>::new()).unwrap();
-    ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
-    ca_params.key_usages.push(KeyUsagePurpose::DigitalSignature);
-    ca_params.key_usages.push(KeyUsagePurpose::KeyCertSign);
-    let signing_key = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).unwrap();
-    let signing_cert = ca_params.self_signed(&signing_key).unwrap();
-
-    let (server_cert, server_key) = self_signed();
-    let server_pin = spl_core::ca::sha256(server_cert.as_ref())[..16].to_vec();
-    let acceptor = TlsAcceptor::from(Arc::new(server_config(server_cert, server_key)));
+    let (signing_cert, signing_key) = journal_ca();
+    let (acceptor, server_pin) = journal_door(&signing_cert, &signing_key);
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
 

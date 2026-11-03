@@ -7,9 +7,12 @@
 //! `/app/network/pair?token=<nonce>`; the journal signs it and returns the client
 //! cert + CA chain + its identity. We verify the returned `fingerprint` equals
 //! `sha256:<hex>` of the signed client cert (the integrity check the Android/iOS
-//! clients also do) before trusting the credential. One key/CSR and request body
-//! are generated per ceremony; consumer-defined additional fields are flattened
-//! into that request without changing the generated CSR or device label.
+//! clients also do) and that the returned `instance_id` is the journal ID of the
+//! pinned CA before trusting the credential. A pair link pins whichever CA it
+//! names, so the ID the peer claims is worth nothing until tied to that key.
+//! One key/CSR and request body are generated per ceremony; consumer-defined
+//! additional fields are flattened into that request without changing the
+//! generated CSR or device label.
 //! Candidates are prepared in order, but only a pre-write preparation failure
 //! advances to the next candidate: the first prepared connection receives the
 //! sole request and its outcome is terminal.
@@ -28,7 +31,7 @@ use tokio_rustls::client::TlsStream;
 use crate::connection::{dial_tls, run_request_over_stream};
 use crate::credential::{Credential, EndpointAddr, GeneratedKey, generate_csr};
 use crate::relay_pairing;
-use crate::{TransportError, tls};
+use crate::{TransportError, spki_pin, tls};
 
 /// Boxed future returned while preparing a direct-pairing connection.
 pub type DirectPairPrepareFuture<'a> = Pin<
@@ -380,6 +383,33 @@ pub(crate) fn verify_client_cert_key_binding(
     Ok(())
 }
 
+/// Refuse a pair response whose `instance_id` is not the journal ID of the CA
+/// the link pinned, read from the certificate in the returned chain that the
+/// pin itself names. The relay path makes the same check in `relay_pairing`.
+fn verify_instance_binds_pinned_ca(
+    pair: &PairResponse,
+    ca_fp_prefix: &[u8],
+) -> Result<(), TransportError> {
+    let mut chain = Vec::new();
+    for pem in &pair.ca_chain {
+        chain.extend(tls::parse_certs(pem)?);
+    }
+    let pinned_ca = chain
+        .iter()
+        .find(|cert| ca::cert_matches_prefix(cert.as_ref(), ca_fp_prefix))
+        .ok_or_else(|| TransportError::Pairing("direct pinned ca not found".into()))?;
+    spki_pin::verify_ca_self_signed(pinned_ca)
+        .map_err(|_| TransportError::Pairing("direct ca not self signed".into()))?;
+    let spki = ca::extract_spki_der(pinned_ca.as_ref())
+        .map_err(|_| TransportError::Pairing("direct ca spki".into()))?;
+    let expected = spl_core::relay_window::jid_from_spki(&spki)
+        .map_err(|_| TransportError::Pairing("direct ca SPKI has no journal id".into()))?;
+    if pair.instance_id != expected {
+        return Err(TransportError::Pairing("direct instance mismatch".into()));
+    }
+    Ok(())
+}
+
 #[expect(
     clippy::needless_pass_by_value,
     reason = "the pairing response is consumed into the resulting credential after verification"
@@ -399,6 +429,7 @@ fn credential_from_direct_pair_response(
 
     let pair: PairResponse = serde_json::from_slice(&response.body)
         .map_err(|_| TransportError::Pairing("pair response malformed".into()))?;
+    verify_instance_binds_pinned_ca(&pair, ca_fp_prefix)?;
     let cert_der = tls::parse_certs(&pair.client_cert)?
         .into_iter()
         .next()
@@ -549,26 +580,54 @@ mod tests {
         UnrelatedKey,
     }
 
+    struct TestJournal {
+        ca_cert: rcgen::Certificate,
+        ca_key: KeyPair,
+    }
+
+    impl TestJournal {
+        fn new() -> Self {
+            let ca_key = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).unwrap();
+            let mut ca_params = CertificateParams::new(Vec::<String>::new()).unwrap();
+            ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+            ca_params.key_usages.push(KeyUsagePurpose::DigitalSignature);
+            ca_params.key_usages.push(KeyUsagePurpose::KeyCertSign);
+            let ca_cert = ca_params.self_signed(&ca_key).unwrap();
+            Self { ca_cert, ca_key }
+        }
+
+        fn pin(&self) -> Vec<u8> {
+            ca::sha256(self.ca_cert.der())[..16].to_vec()
+        }
+
+        fn jid(&self) -> String {
+            let spki = ca::extract_spki_der(self.ca_cert.der()).unwrap();
+            spl_core::relay_window::jid_from_spki(&spki).unwrap()
+        }
+    }
+
+    /// The journal every scripted peer in this module answers as.
+    fn test_journal() -> &'static TestJournal {
+        static JOURNAL: std::sync::OnceLock<TestJournal> = std::sync::OnceLock::new();
+        JOURNAL.get_or_init(TestJournal::new)
+    }
+
     fn pair_response(request_body: &[u8], mode: TestCertificateMode) -> PairResponse {
         let request: PairRequest = serde_json::from_slice(request_body).unwrap();
-        let ca_key = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).unwrap();
-        let mut ca_params = CertificateParams::new(Vec::<String>::new()).unwrap();
-        ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
-        ca_params.key_usages.push(KeyUsagePurpose::DigitalSignature);
-        ca_params.key_usages.push(KeyUsagePurpose::KeyCertSign);
-        let ca_cert = ca_params.self_signed(&ca_key).unwrap();
+        let journal = test_journal();
+        let (ca_cert, ca_key) = (&journal.ca_cert, &journal.ca_key);
         let client_cert = match mode {
             TestCertificateMode::SubmittedCsr => {
                 CertificateSigningRequestParams::from_pem(&request.csr)
                     .unwrap()
-                    .signed_by(&ca_cert, &ca_key)
+                    .signed_by(ca_cert, ca_key)
                     .unwrap()
             }
             TestCertificateMode::UnrelatedKey => {
                 let unrelated_key = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).unwrap();
                 CertificateParams::new(Vec::<String>::new())
                     .unwrap()
-                    .signed_by(&unrelated_key, &ca_cert, &ca_key)
+                    .signed_by(&unrelated_key, ca_cert, ca_key)
                     .unwrap()
             }
         };
@@ -576,7 +635,7 @@ mod tests {
             relay_access: None,
             client_cert: client_cert.pem(),
             ca_chain: vec![ca_cert.pem()],
-            instance_id: "test-instance".into(),
+            instance_id: journal.jid(),
             home_label: "Home".into(),
             fingerprint: format!("sha256:{}", ca::sha256_hex(client_cert.der())),
             home_attestation: None,
@@ -692,7 +751,7 @@ mod tests {
         let credential = pair_with_seam(
             &endpoints,
             "00112233445566778899aabbccddeeff",
-            &[0x22; 16],
+            &test_journal().pin(),
             "test-device",
             seam,
             &additional_fields,
@@ -727,7 +786,7 @@ mod tests {
         let error = pair_with_seam(
             &endpoints,
             "00112233445566778899aabbccddeeff",
-            &[0x22; 16],
+            &test_journal().pin(),
             "test-device",
             seam,
             &additional_fields,
@@ -958,7 +1017,7 @@ mod tests {
             let error = pair_with_seam(
                 &test_endpoints(),
                 "00112233445566778899aabbccddeeff",
-                &[0x22; 16],
+                &test_journal().pin(),
                 "test-device",
                 seam,
                 &additional_fields,
@@ -1052,7 +1111,7 @@ mod tests {
             let credential = pair_with_seam(
                 &test_endpoints(),
                 "00112233445566778899aabbccddeeff",
-                &[0x22; 16],
+                &test_journal().pin(),
                 "test-device",
                 seam,
                 &serde_json::Map::new(),
@@ -1068,8 +1127,9 @@ mod tests {
     #[tokio::test]
     async fn direct_pairing_accepts_ready_access_without_an_enrollment_leg() {
         use base64::Engine as _;
-        let claims = serde_json::json!({"iss":"independent-issuer","sub":"instance:test-instance",
-            "aud":"spl-relay","scope":"session.dial","ver":2,"instance_id":"test-instance",
+        let jid = test_journal().jid();
+        let claims = serde_json::json!({"iss":"independent-issuer","sub":format!("instance:{jid}"),
+            "aud":"spl-relay","scope":"session.dial","ver":2,"instance_id":jid,
             "iat":100,"exp":4_102_444_800_i64,"jti":"fresh"});
         let token = format!(
             "e30.{}.sig",
@@ -1082,7 +1142,7 @@ mod tests {
                 let mut response = pair_response(request_body, TestCertificateMode::SubmittedCsr);
                 response.relay_access = Some(
                     serde_json::json!({"protocol_version":2,"status":"ready",
-                "relay_origin":"http://127.0.0.1:1","instance_id":"test-instance","device_token":token,
+                "relay_origin":"http://127.0.0.1:1","instance_id":test_journal().jid(),"device_token":token,
                 "expires_at":"2100-01-01T00:00:00Z"}),
                 );
                 Ok(http_response(200, serde_json::to_vec(&response).unwrap()))
@@ -1091,7 +1151,7 @@ mod tests {
         let credential = pair_with_seam(
             &test_endpoints(),
             "00112233445566778899aabbccddeeff",
-            &[0x22; 16],
+            &test_journal().pin(),
             "test-device",
             seam,
             &serde_json::Map::new(),
@@ -1104,5 +1164,92 @@ mod tests {
             Some("http://127.0.0.1:1")
         );
         assert_eq!(credential.endpoints.len(), 3);
+    }
+
+    async fn direct_pair_with_response(
+        pin: &[u8],
+        edit: impl FnOnce(&mut PairResponse) + Send + 'static,
+    ) -> Result<Credential, TransportError> {
+        let seam = FakeDirectPairingSeam::new(
+            vec![Ok(())],
+            Box::new(move |request_body| {
+                let mut response = pair_response(request_body, TestCertificateMode::SubmittedCsr);
+                edit(&mut response);
+                Ok(http_response(200, serde_json::to_vec(&response).unwrap()))
+            }),
+        );
+        pair_with_seam(
+            &test_endpoints(),
+            "00112233445566778899aabbccddeeff",
+            pin,
+            "test-device",
+            seam,
+            &serde_json::Map::new(),
+        )
+        .await
+    }
+
+    fn refusal_message(result: Result<Credential, TransportError>) -> String {
+        match result {
+            Err(TransportError::Pairing(message)) => message,
+            other => panic!("expected a pairing refusal, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn direct_pairing_refuses_an_id_that_is_not_the_pinned_cas() {
+        let other = TestJournal::new().jid();
+        let result = direct_pair_with_response(&test_journal().pin(), move |response| {
+            response.instance_id = other;
+        })
+        .await;
+        assert_eq!(refusal_message(result), "direct instance mismatch");
+    }
+
+    #[tokio::test]
+    async fn direct_pairing_reads_the_id_from_the_certificate_the_pin_names() {
+        // Another journal's CA leading the chain doesn't lend its id to the
+        // peer the pin accepted.
+        let other = TestJournal::new();
+        let other_jid = other.jid();
+        let other_pem = other.ca_cert.pem();
+        let result = direct_pair_with_response(&test_journal().pin(), move |response| {
+            response.ca_chain.insert(0, other_pem);
+            response.instance_id = other_jid;
+        })
+        .await;
+        assert_eq!(refusal_message(result), "direct instance mismatch");
+
+        // A chain that leaves out the pinned CA has nothing to bind the id to.
+        let other = TestJournal::new();
+        let other_jid = other.jid();
+        let other_pem = other.ca_cert.pem();
+        let result = direct_pair_with_response(&test_journal().pin(), move |response| {
+            response.ca_chain = vec![other_pem];
+            response.instance_id = other_jid;
+        })
+        .await;
+        assert_eq!(refusal_message(result), "direct pinned ca not found");
+    }
+
+    #[tokio::test]
+    async fn direct_pairing_refuses_a_pin_that_names_a_certificate_no_ca_signed_itself() {
+        let journal = test_journal();
+        let leaf_key = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).unwrap();
+        let leaf = CertificateParams::new(Vec::<String>::new())
+            .unwrap()
+            .signed_by(&leaf_key, &journal.ca_cert, &journal.ca_key)
+            .unwrap();
+        let pin = ca::sha256(leaf.der())[..16].to_vec();
+        let leaf_jid =
+            spl_core::relay_window::jid_from_spki(&ca::extract_spki_der(leaf.der()).unwrap())
+                .unwrap();
+        let leaf_pem = leaf.pem();
+        let result = direct_pair_with_response(&pin, move |response| {
+            response.ca_chain.push(leaf_pem);
+            response.instance_id = leaf_jid;
+        })
+        .await;
+        assert_eq!(refusal_message(result), "direct ca not self signed");
     }
 }

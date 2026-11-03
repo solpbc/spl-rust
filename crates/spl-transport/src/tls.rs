@@ -390,6 +390,25 @@ pub fn mtls_config(
     Ok(config)
 }
 
+/// The journal ID of the CA a stored pairing pins on every later dial, worked out
+/// from the stored chain and pin alone. `None` unless the chain's head is the
+/// certificate the pin names and carries its own signature: the pin holds a hash,
+/// so a certificate anywhere else in the chain, or one that merely copies a public
+/// key, says nothing about what a dial accepts.
+#[must_use]
+pub fn pinned_ca_jid(ca_chain_pem: &[String], ca_fp_prefix: &[u8]) -> Option<String> {
+    let head = parse_certs(ca_chain_pem.first()?)
+        .ok()?
+        .into_iter()
+        .next()?;
+    if !spl_core::ca::cert_matches_prefix(head.as_ref(), ca_fp_prefix) {
+        return None;
+    }
+    crate::spki_pin::verify_ca_self_signed(&head).ok()?;
+    let spki = spl_core::ca::extract_spki_der(head.as_ref()).ok()?;
+    spl_core::relay_window::jid_from_spki(&spki).ok()
+}
+
 /// Parse PEM certificate text into rustls DER certs. Uses the PEM parser in
 /// `rustls-pki-types` directly (the maintained replacement for `rustls-pemfile`).
 ///

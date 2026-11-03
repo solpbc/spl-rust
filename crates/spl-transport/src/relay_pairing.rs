@@ -205,8 +205,8 @@ where
         .map_err(|_| TransportError::Pairing("pair response malformed".into()))?;
     let ca_chain_der = parse_ca_chain(&pair.ca_chain)?;
     let pinned_ca = ca_chain_der
-        .iter()
-        .find(|cert| ca::spki_matches_prefix(cert.as_ref(), &link.ca_fp_spki))
+        .first()
+        .filter(|cert| ca::spki_matches_prefix(cert.as_ref(), &link.ca_fp_spki))
         .cloned()
         .ok_or_else(|| TransportError::Pairing("relay pinned ca not found".into()))?;
     // The handshake already pinned the presented chain. This binds the CA the

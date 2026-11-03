@@ -384,8 +384,9 @@ pub(crate) fn verify_client_cert_key_binding(
 }
 
 /// Refuse a pair response whose `instance_id` is not the journal ID of the CA
-/// the link pinned, read from the certificate in the returned chain that the
-/// pin itself names. The relay path makes the same check in `relay_pairing`.
+/// the link pinned, read from the head of the returned chain, which the pin must
+/// name and which every later read of the stored pairing takes as the CA. The
+/// relay path makes the same check in `relay_pairing`.
 fn verify_instance_binds_pinned_ca(
     pair: &PairResponse,
     ca_fp_prefix: &[u8],
@@ -395,8 +396,8 @@ fn verify_instance_binds_pinned_ca(
         chain.extend(tls::parse_certs(pem)?);
     }
     let pinned_ca = chain
-        .iter()
-        .find(|cert| ca::cert_matches_prefix(cert.as_ref(), ca_fp_prefix))
+        .first()
+        .filter(|cert| ca::cert_matches_prefix(cert.as_ref(), ca_fp_prefix))
         .ok_or_else(|| TransportError::Pairing("direct pinned ca not found".into()))?;
     spki_pin::verify_ca_self_signed(pinned_ca)
         .map_err(|_| TransportError::Pairing("direct ca not self signed".into()))?;
@@ -1208,8 +1209,7 @@ mod tests {
 
     #[tokio::test]
     async fn direct_pairing_reads_the_id_from_the_certificate_the_pin_names() {
-        // Another journal's CA leading the chain doesn't lend its id to the
-        // peer the pin accepted.
+        // Another journal's CA leading the chain isn't the CA the pin names.
         let other = TestJournal::new();
         let other_jid = other.jid();
         let other_pem = other.ca_cert.pem();
@@ -1218,7 +1218,7 @@ mod tests {
             response.instance_id = other_jid;
         })
         .await;
-        assert_eq!(refusal_message(result), "direct instance mismatch");
+        assert_eq!(refusal_message(result), "direct pinned ca not found");
 
         // A chain that leaves out the pinned CA has nothing to bind the id to.
         let other = TestJournal::new();
@@ -1246,7 +1246,7 @@ mod tests {
                 .unwrap();
         let leaf_pem = leaf.pem();
         let result = direct_pair_with_response(&pin, move |response| {
-            response.ca_chain.push(leaf_pem);
+            response.ca_chain = vec![leaf_pem];
             response.instance_id = leaf_jid;
         })
         .await;
@@ -1285,5 +1285,35 @@ mod tests {
         })
         .await;
         assert_eq!(refusal_message(result), "direct ca not self signed");
+    }
+
+    #[test]
+    fn a_stored_pairing_has_a_pinned_ca_id_only_from_the_head_the_pin_names() {
+        let genuine = test_journal();
+        let genuine_pem = genuine.ca_cert.pem();
+        assert_eq!(
+            tls::pinned_ca_jid(std::slice::from_ref(&genuine_pem), &genuine.pin()),
+            Some(genuine.jid())
+        );
+
+        // Nothing stored, or nothing the pin names at the head.
+        assert_eq!(tls::pinned_ca_jid(&[], &genuine.pin()), None);
+        let other = TestJournal::new();
+        let other_pem = other.ca_cert.pem();
+        assert_eq!(
+            tls::pinned_ca_jid(std::slice::from_ref(&other_pem), &genuine.pin()),
+            None
+        );
+        assert_eq!(
+            tls::pinned_ca_jid(&[other_pem, genuine_pem], &genuine.pin()),
+            None
+        );
+
+        // A copy of the owner's public key that the owner's key didn't sign.
+        let copied = certificate_copying_key_of(&other.ca_key, genuine);
+        assert_eq!(
+            tls::pinned_ca_jid(&[copied.pem()], &ca::sha256(copied.der())[..16]),
+            None
+        );
     }
 }

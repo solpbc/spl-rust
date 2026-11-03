@@ -64,7 +64,7 @@ const TEST_OBSERVER_KEY: &str = "test-handle";
 // Synthetic pairing values preserve the source fixture's asserted values while
 // keeping this crate independent of the consumer contract bundle.
 const PAIR_EXAMPLE_NONCE: &str = "5f0d8c8b9f1e48b0a5f80b98f3d5e9b0";
-const PAIR_EXAMPLE_DEVICE_LABEL: &str = "Jer iPhone";
+const PAIR_EXAMPLE_DEVICE_LABEL: &str = "Owner iPhone";
 const PAIR_EXAMPLE_HOME_LABEL: &str = "home";
 const PAIR_EXAMPLE_HOME_ATTESTATION: &str = "eyJhbGciOi...";
 

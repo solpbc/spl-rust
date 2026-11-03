@@ -39,7 +39,7 @@ const PAIR_SECRET: [u8; 8] = [0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef];
 const PAIR_SECRET_HEX: &str = "0123456789abcdef";
 // Exemplar request values from `.proto-ref/pairing.md` §5.
 const PAIR_EXAMPLE_NONCE: &str = "5f0d8c8b9f1e48b0a5f80b98f3d5e9b0";
-const PAIR_EXAMPLE_DEVICE_LABEL: &str = "Jer iPhone";
+const PAIR_EXAMPLE_DEVICE_LABEL: &str = "Owner iPhone";
 const CURRENT_TOKEN: &str = "e30.eyJpc3MiOiJyZWxheS50ZXN0Iiwic3ViIjoiZGV2aWNlOmxlZ2FjeSIsImF1ZCI6InNwbC1yZWxheSIsInNjb3BlIjoic2Vzc2lvbi5kaWFsIiwiaW5zdGFuY2VfaWQiOiJob21lIiwiZGV2aWNlX2ZwIjoic2hhMjU2OmFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWEiLCJpYXQiOjEwMCwiZXhwIjoyMDAsImp0aSI6ImxlZ2FjeSJ9.sig";
 const NEW_TOKEN: &str = "e30.eyJpc3MiOiJyZWxheS50ZXN0Iiwic3ViIjoiZGV2aWNlOmxlZ2FjeSIsImF1ZCI6InNwbC1yZWxheSIsInNjb3BlIjoic2Vzc2lvbi5kaWFsIiwiaW5zdGFuY2VfaWQiOiJob21lIiwiZGV2aWNlX2ZwIjoic2hhMjU2OmFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWEiLCJpYXQiOjEwMCwiZXhwIjo0MTAyNDQ0ODAwLCJqdGkiOiJsZWdhY3kifQ.sig";
 

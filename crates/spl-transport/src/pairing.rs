@@ -1252,4 +1252,38 @@ mod tests {
         .await;
         assert_eq!(refusal_message(result), "direct ca not self signed");
     }
+
+    /// A certificate carrying `owner`'s public key, which is public, under a
+    /// signature only `forger` could make: the shape of a journal's CA without
+    /// its private key.
+    fn certificate_copying_key_of(owner: &KeyPair, forger: &TestJournal) -> rcgen::Certificate {
+        let mut params = CertificateParams::new(Vec::<String>::new()).unwrap();
+        params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        params.key_usages.push(KeyUsagePurpose::DigitalSignature);
+        params.key_usages.push(KeyUsagePurpose::KeyCertSign);
+        params
+            .signed_by(owner, &forger.ca_cert, &forger.ca_key)
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn direct_pairing_refuses_the_owners_key_under_a_signature_it_did_not_make() {
+        let owner = TestJournal::new();
+        let copied = certificate_copying_key_of(&owner.ca_key, test_journal());
+        let pin = ca::sha256(copied.der())[..16].to_vec();
+        let copied_pem = copied.pem();
+        let owner_jid = owner.jid();
+        // The id really is the one this certificate's key derives.
+        assert_eq!(
+            spl_core::relay_window::jid_from_spki(&ca::extract_spki_der(copied.der()).unwrap())
+                .unwrap(),
+            owner_jid
+        );
+        let result = direct_pair_with_response(&pin, move |response| {
+            response.ca_chain = vec![copied_pem];
+            response.instance_id = owner_jid;
+        })
+        .await;
+        assert_eq!(refusal_message(result), "direct ca not self signed");
+    }
 }

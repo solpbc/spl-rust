@@ -782,6 +782,42 @@ async fn relay_pairing_rejects_anti_pin_theater_leaf() {
 }
 
 #[tokio::test]
+async fn relay_pairing_refuses_the_owners_key_under_a_signature_it_did_not_make() {
+    // The relay pin names a key, not a certificate, so a certificate copying the
+    // owner's public key matches it. Its signature and its leaf's can't be made
+    // without that key's private half.
+    let owner = TestCa::new();
+    let forger = TestCa::new();
+    let mut params = CertificateParams::new(Vec::<String>::new()).unwrap();
+    params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+    params.key_usages.push(KeyUsagePurpose::DigitalSignature);
+    params.key_usages.push(KeyUsagePurpose::KeyCertSign);
+    let copied = params
+        .signed_by(&owner.key, &forger.cert, &forger.key)
+        .unwrap();
+    let copied_ca = Arc::new(TestCa {
+        cert: copied,
+        key: forger.key,
+    });
+    assert_eq!(copied_ca.spki_pin(), owner.spki_pin());
+    let mut mock = MockState::normal();
+    mock.json_ca = copied_ca.clone();
+    mock.tls_signer = copied_ca;
+    let state = Arc::new(mock);
+    let origin = spawn_mock_relay(state.clone()).await;
+    let link = relay_link(origin, owner.spki_pin());
+
+    #[expect(
+        clippy::large_futures,
+        reason = "the copied transport future keeps its established stack layout; this site goes red if a later refactor shrinks it"
+    )]
+    let result = pair_over_relay(&link, "win-test", &serde_json::Map::new()).await;
+
+    assert!(result.is_err(), "the copied key paired over the relay");
+    assert_eq!(state.inner_request_bytes.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
 async fn relay_pairing_rejects_wrong_spki_before_enroll() {
     let state = Arc::new(MockState::normal().with_same_tls_ca());
     let origin = spawn_mock_relay(state.clone()).await;

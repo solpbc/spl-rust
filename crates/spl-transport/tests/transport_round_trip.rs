@@ -1905,6 +1905,122 @@ async fn direct_pairing_refuses_a_peer_claiming_another_journals_id_and_pairs_a_
     genuine.await.unwrap();
 }
 
+/// Serve a door presenting `chain`, and report whether any request byte arrived
+/// after the handshake. The peer stands in for a journal whose CA key it lacks.
+async fn direct_pair_against_presented_chain(
+    chain: Vec<CertificateDer<'static>>,
+    leaf_key: &KeyPair,
+    pin: &[u8],
+) -> (
+    Result<spl_transport::credential::Credential, TransportError>,
+    usize,
+) {
+    let config =
+        ServerConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_no_client_auth()
+            .with_single_cert(
+                chain,
+                PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(leaf_key.serialize_der())),
+            )
+            .unwrap();
+    let acceptor = TlsAcceptor::from(Arc::new(config));
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let bytes_read = Arc::new(AtomicUsize::new(0));
+    let seen = bytes_read.clone();
+    let server = tokio::spawn(async move {
+        let (tcp, _) = listener.accept().await.unwrap();
+        let Ok(mut tls) = acceptor.accept(tcp).await else {
+            return;
+        };
+        let mut buf = [0u8; 1024];
+        // One read is enough to prove the request went out; answer nothing.
+        if let Ok(count) = tls.read(&mut buf).await {
+            seen.fetch_add(count, Ordering::SeqCst);
+        }
+        let _ = tls.shutdown().await;
+    });
+    let endpoints = [Endpoint {
+        host: "127.0.0.1".to_owned(),
+        port,
+    }];
+    let result = spl_transport::pairing::pair(
+        &endpoints,
+        PAIR_EXAMPLE_NONCE,
+        pin,
+        PAIR_EXAMPLE_DEVICE_LABEL,
+        &serde_json::Map::new(),
+    )
+    .await;
+    server.await.unwrap();
+    (result, bytes_read.load(Ordering::SeqCst))
+}
+
+fn server_leaf_signed_by(
+    issuer: &rcgen::Certificate,
+    issuer_key: &KeyPair,
+) -> (rcgen::Certificate, KeyPair) {
+    let leaf_key = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).unwrap();
+    let leaf = CertificateParams::new(vec!["spl.local".to_string()])
+        .unwrap()
+        .signed_by(&leaf_key, issuer, issuer_key)
+        .unwrap();
+    (leaf, leaf_key)
+}
+
+#[tokio::test]
+async fn direct_handshake_refuses_the_owners_key_under_a_signature_it_did_not_make() {
+    let (_owner_cert, owner_key) = journal_ca();
+    let (forger_cert, forger_key) = journal_ca();
+    let mut params = CertificateParams::new(Vec::<String>::new()).unwrap();
+    params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+    params.key_usages.push(KeyUsagePurpose::DigitalSignature);
+    params.key_usages.push(KeyUsagePurpose::KeyCertSign);
+    let copied = params
+        .signed_by(&owner_key, &forger_cert, &forger_key)
+        .unwrap();
+    let pin = spl_core::ca::sha256(copied.der())[..16].to_vec();
+    let (leaf, leaf_key) = server_leaf_signed_by(&copied, &forger_key);
+
+    let (result, bytes_read) = direct_pair_against_presented_chain(
+        vec![
+            CertificateDer::from(leaf.der().to_vec()),
+            CertificateDer::from(copied.der().to_vec()),
+        ],
+        &leaf_key,
+        &pin,
+    )
+    .await;
+
+    assert!(result.is_err(), "the copied key paired");
+    assert_eq!(bytes_read, 0, "the pairing request reached the peer");
+}
+
+#[tokio::test]
+async fn direct_handshake_refuses_a_leaf_the_pinned_ca_did_not_sign() {
+    // The owner's real CA certificate is public, and its self-signature is good.
+    // Presenting it proves nothing without a leaf it signed.
+    let (owner_cert, _owner_key) = journal_ca();
+    let (forger_cert, forger_key) = journal_ca();
+    let pin = spl_core::ca::sha256(owner_cert.der())[..16].to_vec();
+    let (leaf, leaf_key) = server_leaf_signed_by(&forger_cert, &forger_key);
+
+    let (result, bytes_read) = direct_pair_against_presented_chain(
+        vec![
+            CertificateDer::from(leaf.der().to_vec()),
+            CertificateDer::from(owner_cert.der().to_vec()),
+        ],
+        &leaf_key,
+        &pin,
+    )
+    .await;
+
+    assert!(result.is_err(), "a stranger's leaf paired");
+    assert_eq!(bytes_read, 0, "the pairing request reached the peer");
+}
+
 #[tokio::test]
 async fn direct_pairing_key_mismatch_is_terminal_after_first_written_request() {
     let (signing_cert, signing_key) = journal_ca();

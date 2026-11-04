@@ -34,6 +34,7 @@ use std::future::Future;
 use std::ops::{Deref, DerefMut};
 use std::pin::Pin;
 use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::Instant;
 
 use spl_core::bridge::{
     self, BOOTSTRAP_ROUTE, BridgeNames, FailureCategory, RejectReason, RequestFramingError,
@@ -60,6 +61,50 @@ pub enum CapabilityGate {
     Enabled,
     /// Do not mint or compare a capability.
     Disabled,
+}
+
+/// How browser requests obtain the existing bridge capability cookie.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum BootstrapMode {
+    /// Preserve the reusable capability URL for consumers that have not opted in.
+    #[default]
+    StaticCapability,
+    /// Accept only fresh, single-use, thirty-second browser authorization tokens.
+    OneTimeToken,
+}
+
+/// Cloneable in-process authority to issue browser authorization links.
+/// It carries no reusable capability URL and deliberately has no Debug output.
+#[derive(Clone)]
+pub struct BrowserAuthorizer {
+    port: u16,
+    started: Instant,
+    tokens: Arc<Mutex<bridge::BootstrapTokens>>,
+}
+
+impl BrowserAuthorizer {
+    /// Mint a new single-use browser link. Never log or persist the result.
+    ///
+    /// # Errors
+    /// Returns an error if secure random generation fails.
+    pub fn issue_url(&self) -> Result<String, BridgeStartError> {
+        let token = mint_capability()?;
+        self.tokens
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .issue(token.clone(), self.started.elapsed().as_millis());
+        Ok(format!(
+            "http://127.0.0.1:{}{}?token={token}",
+            self.port, BOOTSTRAP_ROUTE
+        ))
+    }
+
+    fn consume(&self, token: &str) -> bool {
+        self.tokens
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .consume(token, self.started.elapsed().as_millis())
+    }
 }
 
 /// Complete response returned locally without opening an upstream stream.
@@ -297,6 +342,8 @@ pub struct BridgePolicy {
     pub port: u16,
     /// Whether requests require a minted capability.
     pub capability_gate: CapabilityGate,
+    /// Browser bootstrap behavior; ignored when the capability gate is disabled.
+    pub bootstrap_mode: BootstrapMode,
     /// Predicate selecting responses that are delivered incrementally.
     /// Selected requests forward their real method and body; the default
     /// bodyless `GET /sse/events` is unchanged, while a GET with a body forwards it.
@@ -326,6 +373,7 @@ impl Default for BridgePolicy {
         Self {
             port: 0,
             capability_gate: CapabilityGate::Enabled,
+            bootstrap_mode: BootstrapMode::StaticCapability,
             stream_response: Arc::new(|head| head.method == "GET" && head.path() == "/sse/events"),
             local_response: Arc::new(|_, _| None),
             attribution_headers: Arc::new(|_| Vec::new()),
@@ -372,6 +420,8 @@ pub struct JournalBridgeConfig {
 pub struct JournalBridgeHandle {
     port: u16,
     capability: CapabilityState,
+    capability_cookie_name: String,
+    browser_authorizer: Option<BrowserAuthorizer>,
     status: SharedStatus,
     shutdown: oneshot::Sender<()>,
     join: JoinHandle<JournalBridgeStatus>,
@@ -452,12 +502,32 @@ impl JournalBridgeHandle {
         status_subscription(&self.status)
     }
 
-    /// Return the bootstrap URL when capability authorization is enabled.
+    /// Return the reusable URL only for the static bootstrap mode.
     pub fn bootstrap_url(&self) -> Option<String> {
+        if self.browser_authorizer.is_some() {
+            return None;
+        }
         self.capability.value().map(|capability| {
             format!(
                 "http://127.0.0.1:{}{}?cap={capability}",
                 self.port, BOOTSTRAP_ROUTE
+            )
+        })
+    }
+
+    /// Return the issuer when this bridge opted into one-time browser links.
+    pub fn browser_authorizer(&self) -> Option<BrowserAuthorizer> {
+        self.browser_authorizer.clone()
+    }
+
+    /// Get the capability cookie for a trusted in-process client's cookie jar.
+    /// Never put this value into a URL, log, or persistent state.
+    pub fn capability_cookie(&self) -> Option<String> {
+        self.capability.value().map(|cap| {
+            format!(
+                "{}={cap}; {}",
+                self.capability_cookie_name,
+                bridge::bootstrap_cookie_attributes()
             )
         })
     }
@@ -515,6 +585,7 @@ struct BridgeRuntime {
     carrier: Arc<MuxCarrier>,
     status: SharedStatus,
     capability: CapabilityState,
+    browser_authorizer: Option<BrowserAuthorizer>,
     port: u16,
     journal_hosts: Vec<String>,
     loopback_origin: String,
@@ -552,6 +623,7 @@ pub async fn start(config: JournalBridgeConfig) -> Result<JournalBridgeHandle, B
     let BridgePolicy {
         port: requested_port,
         capability_gate,
+        bootstrap_mode,
         stream_response,
         local_response,
         attribution_headers,
@@ -584,10 +656,19 @@ pub async fn start(config: JournalBridgeConfig) -> Result<JournalBridgeHandle, B
         .local_addr()
         .map_err(BridgeStartError::Bind)?
         .port();
+    let browser_authorizer = (capability.value().is_some()
+        && bootstrap_mode == BootstrapMode::OneTimeToken)
+        .then(|| BrowserAuthorizer {
+            port,
+            started: Instant::now(),
+            tokens: Arc::new(Mutex::new(bridge::BootstrapTokens::default())),
+        });
+    let capability_cookie_name = bridge_names.capability_cookie_name.clone();
     let runtime = Arc::new(BridgeRuntime {
         carrier,
         status: status.clone(),
         capability: capability.clone(),
+        browser_authorizer: browser_authorizer.clone(),
         port,
         journal_hosts,
         loopback_origin: format!("http://127.0.0.1:{port}"),
@@ -613,6 +694,8 @@ pub async fn start(config: JournalBridgeConfig) -> Result<JournalBridgeHandle, B
     Ok(JournalBridgeHandle {
         port,
         capability,
+        capability_cookie_name,
+        browser_authorizer,
         status,
         shutdown,
         join,
@@ -720,6 +803,7 @@ async fn handle_conn(
                 capability,
                 runtime.port,
                 &runtime.bridge_names,
+                runtime.browser_authorizer.as_ref(),
             ),
         )
         .await;
@@ -851,6 +935,7 @@ async fn handle_bootstrap(
     capability: &str,
     port: u16,
     bridge_names: &BridgeNames,
+    browser_authorizer: Option<&BrowserAuthorizer>,
 ) {
     if bridge::check_loopback_host(request_head, port).is_err() {
         log_capability_reject(RejectReason::BadHost);
@@ -863,13 +948,18 @@ async fn handle_bootstrap(
         return;
     }
 
-    #[expect(
-        clippy::map_unwrap_or,
-        reason = "the mapped capability comparison keeps absence and mismatch visibly equivalent"
-    )]
-    let cap_ok = bridge::bootstrap_cap(&request_head.target)
-        .map(|presented| bridge::ct_eq(presented.as_bytes(), capability.as_bytes()))
-        .unwrap_or(false);
+    // Spend a presented token even when this browser already has the cookie.
+    // History replays with a valid cookie still go home after expiry or first use.
+    let cap_ok = if let Some(authorizer) = browser_authorizer {
+        let redeemed = bridge::bootstrap_token(&request_head.target)
+            .is_some_and(|token| authorizer.consume(token));
+        redeemed
+            || bridge::check_capability_cookie(request_head, capability.as_bytes(), bridge_names)
+                .is_ok()
+    } else {
+        bridge::bootstrap_cap(&request_head.target)
+            .is_some_and(|presented| bridge::ct_eq(presented.as_bytes(), capability.as_bytes()))
+    };
     if !cap_ok {
         log_capability_reject(RejectReason::BadCapability);
         write_local(stream, 403, b"forbidden", "text/plain").await;
@@ -877,7 +967,7 @@ async fn handle_bootstrap(
     }
 
     let response = format!(
-        "HTTP/1.1 302 Found\r\nSet-Cookie: {}={capability}; {}\r\nLocation: /\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        "HTTP/1.1 302 Found\r\nSet-Cookie: {}={capability}; {}\r\nLocation: /\r\nCache-Control: no-store\r\nReferrer-Policy: no-referrer\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
         bridge_names.capability_cookie_name,
         bridge::bootstrap_cookie_attributes()
     );
@@ -1723,6 +1813,7 @@ mod tests {
         let BridgePolicy {
             port,
             capability_gate,
+            bootstrap_mode,
             stream_response,
             local_response,
             attribution_headers,
@@ -1731,6 +1822,7 @@ mod tests {
 
         assert_eq!(port, 0);
         assert_eq!(capability_gate, CapabilityGate::Enabled);
+        assert_eq!(bootstrap_mode, BootstrapMode::StaticCapability);
         assert_eq!(max_request_body_bytes, 8 * 1024 * 1024);
 
         let request = |method: &str, target: &str| RequestHead {

@@ -383,3 +383,102 @@ async fn current_device_mutations_require_bridge_capability_on_actual_listener()
     assert_eq!(calls.load(Ordering::SeqCst), 6);
     handle.begin_shutdown();
 }
+
+#[tokio::test]
+async fn one_time_browser_links_exchange_once_and_cookie_replays_go_home() {
+    let handle = journal_bridge::start(JournalBridgeConfig {
+        opener: Arc::new(InertOpener),
+        bridge_names: neutral_bridge_names(),
+        endpoint_hosts: vec![],
+        policy: BridgePolicy {
+            bootstrap_mode: journal_bridge::BootstrapMode::OneTimeToken,
+            local_response: Arc::new(|_, _| {
+                Some(LocalResponse {
+                    status: 200,
+                    content_type: "text/plain".into(),
+                    body: b"journal".to_vec(),
+                })
+            }),
+            ..BridgePolicy::default()
+        },
+    })
+    .await
+    .unwrap();
+    assert!(handle.bootstrap_url().is_none());
+    let issuer = handle.browser_authorizer().unwrap();
+    let first = issuer.issue_url().unwrap();
+    let second = issuer.issue_url().unwrap();
+    assert_ne!(first, second);
+    let origin = format!("http://127.0.0.1:{}", handle.port());
+    let first = first.strip_prefix(&origin).unwrap();
+    let second = second.strip_prefix(&origin).unwrap();
+    let cookie = handle.capability_cookie().unwrap();
+    let cookie = cookie.split(';').next().unwrap();
+    let cap = cookie.split_once('=').unwrap().1;
+    assert!(!first.contains(cap));
+    let legacy = format!("/_bridge/bootstrap?cap={cap}");
+    assert_eq!(
+        response_status(&raw_request(handle.port(), &legacy, None).await),
+        403
+    );
+    assert_eq!(
+        response_status(&raw_method_request(handle.port(), "POST", first, None).await),
+        405
+    );
+    let (a, b) = tokio::join!(
+        raw_request(handle.port(), first, None),
+        raw_request(handle.port(), first, None)
+    );
+    let mut statuses = [response_status(&a), response_status(&b)];
+    statuses.sort_unstable();
+    assert_eq!(statuses, [302, 403]);
+    let response = if response_status(&a) == 302 { a } else { b };
+    let response = String::from_utf8(response).unwrap();
+    assert!(response.contains(&format!(
+        "Set-Cookie: {cookie}; Path=/; HttpOnly; SameSite=Strict"
+    )));
+    assert!(response.contains("Cache-Control: no-store"));
+    assert!(response.contains("Referrer-Policy: no-referrer"));
+    assert_eq!(
+        response_status(&raw_request(handle.port(), first, Some(cookie)).await),
+        302
+    );
+    assert_eq!(
+        response_status(
+            &raw_request(
+                handle.port(),
+                "/_bridge/bootstrap?token=expired",
+                Some(cookie)
+            )
+            .await
+        ),
+        302
+    );
+    assert_eq!(
+        response_status(&raw_request(handle.port(), second, None).await),
+        302
+    );
+    assert_eq!(
+        response_status(&raw_request(handle.port(), second, None).await),
+        403
+    );
+    assert_eq!(
+        response_status(&raw_request(handle.port(), "/", Some(cookie)).await),
+        200
+    );
+    assert_eq!(
+        response_status(&raw_request(handle.port(), "/", None).await),
+        403
+    );
+    let warm = issuer.issue_url().unwrap();
+    let warm = warm.strip_prefix(&origin).unwrap();
+    assert_eq!(
+        response_status(&raw_request(handle.port(), warm, Some(cookie)).await),
+        302
+    );
+    assert_eq!(
+        response_status(&raw_request(handle.port(), warm, None).await),
+        403
+    );
+    handle.shutdown_and_wait().await;
+}

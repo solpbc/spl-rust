@@ -482,3 +482,60 @@ async fn one_time_browser_links_exchange_once_and_cookie_replays_go_home() {
     );
     handle.shutdown_and_wait().await;
 }
+
+#[tokio::test]
+async fn browser_link_destinations_are_bound_to_the_token_not_the_request() {
+    let handle = journal_bridge::start(JournalBridgeConfig {
+        opener: Arc::new(InertOpener),
+        bridge_names: neutral_bridge_names(),
+        endpoint_hosts: vec![],
+        policy: BridgePolicy {
+            bootstrap_mode: journal_bridge::BootstrapMode::OneTimeToken,
+            ..BridgePolicy::default()
+        },
+    })
+    .await
+    .unwrap();
+    let issuer = handle.browser_authorizer().unwrap();
+    for invalid in [
+        "",
+        "https://other.example/",
+        "//other.example/",
+        "/\\other.example/",
+        "/ok\r\nLocation: https://other.example/",
+        "/has space",
+        "/non-ascii/é",
+    ] {
+        assert!(issuer.issue_url_for_path(invalid).is_err());
+    }
+    let origin = format!("http://127.0.0.1:{}", handle.port());
+    let cookie = handle.capability_cookie().unwrap();
+    let cookie = cookie.split(';').next().unwrap();
+    let first = issuer
+        .issue_url_for_path("/app/open/opaque~123456")
+        .unwrap();
+    let second = issuer.issue_url_for_path("/app/open/another").unwrap();
+    assert!(!first.contains("opaque"));
+    for (url, destination, browser_cookie) in [
+        (&first, "/app/open/opaque~123456", None),
+        (&second, "/app/open/another", Some(cookie)),
+    ] {
+        let target = format!(
+            "{}&path=//other.example/&destination=/wrong",
+            url.strip_prefix(&origin).unwrap()
+        );
+        let response =
+            String::from_utf8(raw_request(handle.port(), &target, browser_cookie).await).unwrap();
+        assert!(response.starts_with("HTTP/1.1 302 "));
+        assert!(response.contains(&format!("\r\nLocation: {destination}\r\n")));
+        // A replay with the cookie keeps the legacy root behavior, not the spent destination.
+        let replay =
+            String::from_utf8(raw_request(handle.port(), &target, Some(cookie)).await).unwrap();
+        assert!(replay.contains("\r\nLocation: /\r\n"));
+        assert_eq!(
+            response_status(&raw_request(handle.port(), &target, None).await),
+            403
+        );
+    }
+    handle.shutdown_and_wait().await;
+}

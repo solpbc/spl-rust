@@ -480,29 +480,25 @@ fn bootstrap_query_value<'a>(target: &'a str, key: &str) -> Option<&'a str> {
 /// milliseconds; this type performs no I/O and reads no clock.
 #[derive(Default)]
 pub struct BootstrapTokens {
-    pending: Vec<(String, u128)>,
+    pending: Vec<(String, u128, String)>,
 }
 
 impl BootstrapTokens {
     /// Keep a token valid for thirty seconds, pruning expired unused tokens.
-    pub fn issue(&mut self, token: String, now_millis: u128) {
-        self.pending.retain(|(_, expires)| now_millis < *expires);
-        self.pending.push((token, now_millis + 30_000));
+    pub fn issue(&mut self, token: String, now_millis: u128, path: String) {
+        self.pending.retain(|(_, expires, _)| now_millis < *expires);
+        self.pending.push((token, now_millis + 30_000, path));
     }
 
     /// Spend a matching unexpired token. The caller serializes this operation
     /// with issuance and other redemptions.
-    pub fn consume(&mut self, token: &str, now_millis: u128) -> bool {
-        self.pending.retain(|(_, expires)| now_millis < *expires);
-        let Some(index) = self
+    pub fn consume(&mut self, token: &str, now_millis: u128) -> Option<String> {
+        self.pending.retain(|(_, expires, _)| now_millis < *expires);
+        let index = self
             .pending
             .iter()
-            .position(|(value, _)| ct_eq(value.as_bytes(), token.as_bytes()))
-        else {
-            return false;
-        };
-        self.pending.swap_remove(index);
-        true
+            .position(|(value, _, _)| ct_eq(value.as_bytes(), token.as_bytes()))?;
+        Some(self.pending.swap_remove(index).2)
     }
 }
 
@@ -1133,14 +1129,14 @@ mod tests {
     #[test]
     fn browser_tokens_are_independent_once_only_and_expire_at_thirty_seconds() {
         let mut tokens = BootstrapTokens::default();
-        tokens.issue("first".into(), 0);
-        tokens.issue("second".into(), 1_000);
-        assert!(!tokens.consume("wrong", 1_000));
-        assert!(tokens.consume("first", 2_000));
-        assert!(!tokens.consume("first", 2_000));
-        assert!(!tokens.consume("second", 31_000));
-        tokens.issue("third".into(), 31_000);
-        assert!(tokens.consume("third", 60_000));
+        tokens.issue("first".into(), 0, "/first".into());
+        tokens.issue("second".into(), 1_000, "/second".into());
+        assert_eq!(tokens.consume("wrong", 1_000), None);
+        assert_eq!(tokens.consume("first", 2_000).as_deref(), Some("/first"));
+        assert_eq!(tokens.consume("first", 2_000), None);
+        assert_eq!(tokens.consume("second", 31_000), None);
+        tokens.issue("third".into(), 31_000, "/third".into());
+        assert_eq!(tokens.consume("third", 60_000).as_deref(), Some("/third"));
         assert_eq!(
             bootstrap_token("/_bridge/bootstrap?token=fresh"),
             Some("fresh")

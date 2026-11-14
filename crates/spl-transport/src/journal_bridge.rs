@@ -82,24 +82,59 @@ pub struct BrowserAuthorizer {
     tokens: Arc<Mutex<bridge::BootstrapTokens>>,
 }
 
+/// Failure to issue a path-carrying browser link. It never includes the destination.
+#[derive(Debug)]
+pub enum BrowserAuthorizationError {
+    /// The destination is not a safe origin-relative path.
+    InvalidPath,
+    /// Secure random generation failed.
+    Capability(BridgeStartError),
+}
+
 impl BrowserAuthorizer {
     /// Mint a new single-use browser link. Never log or persist the result.
     ///
     /// # Errors
     /// Returns an error if secure random generation fails.
     pub fn issue_url(&self) -> Result<String, BridgeStartError> {
+        self.issue_validated_url("/")
+    }
+
+    /// Mint a single-use link that opens an origin-relative destination.
+    /// The destination stays in memory and never appears in the authorization URL.
+    ///
+    /// # Errors
+    /// Returns an error for an unsafe destination or failed secure random generation.
+    pub fn issue_url_for_path(&self, path: &str) -> Result<String, BrowserAuthorizationError> {
+        if !path.starts_with('/')
+            || path.starts_with("//")
+            || !path
+                .bytes()
+                .all(|byte| (b'!'..=b'~').contains(&byte) && byte != b'\\')
+        {
+            return Err(BrowserAuthorizationError::InvalidPath);
+        }
+        self.issue_validated_url(path)
+            .map_err(BrowserAuthorizationError::Capability)
+    }
+
+    fn issue_validated_url(&self, path: &str) -> Result<String, BridgeStartError> {
         let token = mint_capability()?;
         self.tokens
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .issue(token.clone(), self.started.elapsed().as_millis());
+            .issue(
+                token.clone(),
+                self.started.elapsed().as_millis(),
+                path.to_owned(),
+            );
         Ok(format!(
             "http://127.0.0.1:{}{}?token={token}",
             self.port, BOOTSTRAP_ROUTE
         ))
     }
 
-    fn consume(&self, token: &str) -> bool {
+    fn consume(&self, token: &str) -> Option<String> {
         self.tokens
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -950,12 +985,17 @@ async fn handle_bootstrap(
 
     // Spend a presented token even when this browser already has the cookie.
     // History replays with a valid cookie still go home after expiry or first use.
+    let mut destination = "/".to_owned();
     let cap_ok = if let Some(authorizer) = browser_authorizer {
         let redeemed = bridge::bootstrap_token(&request_head.target)
-            .is_some_and(|token| authorizer.consume(token));
-        redeemed
-            || bridge::check_capability_cookie(request_head, capability.as_bytes(), bridge_names)
+            .and_then(|token| authorizer.consume(token));
+        if let Some(path) = redeemed {
+            destination = path;
+            true
+        } else {
+            bridge::check_capability_cookie(request_head, capability.as_bytes(), bridge_names)
                 .is_ok()
+        }
     } else {
         bridge::bootstrap_cap(&request_head.target)
             .is_some_and(|presented| bridge::ct_eq(presented.as_bytes(), capability.as_bytes()))
@@ -967,7 +1007,7 @@ async fn handle_bootstrap(
     }
 
     let response = format!(
-        "HTTP/1.1 302 Found\r\nSet-Cookie: {}={capability}; {}\r\nLocation: /\r\nCache-Control: no-store\r\nReferrer-Policy: no-referrer\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        "HTTP/1.1 302 Found\r\nSet-Cookie: {}={capability}; {}\r\nLocation: {destination}\r\nCache-Control: no-store\r\nReferrer-Policy: no-referrer\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
         bridge_names.capability_cookie_name,
         bridge::bootstrap_cookie_attributes()
     );
